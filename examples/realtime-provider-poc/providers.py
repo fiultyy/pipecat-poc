@@ -31,6 +31,37 @@ class RealtimeProvider(StrEnum):
     QWEN = "qwen"
 
 
+class RealtimeProtocol(StrEnum):
+    """Protocol generation selector (Codex's RealtimeEventParser pattern).
+
+    A protocol generation is a client-side parser/adapter choice, not a
+    model choice: the same provider may expose more than one wire dialect,
+    and the harness picks which one to speak.
+
+    OPENAI_RT: standard OpenAI Realtime events (nested audio config,
+        ``response.output_audio.delta`` names).
+    DASHSCOPE_RT: the DashScope dialect of the same protocol (flat
+        session fields, short event names) — what
+        QwenOmniRealtimeLLMService adapts.
+    """
+
+    OPENAI_RT = "openai-rt"
+    DASHSCOPE_RT = "dashscope-rt"
+
+
+_PROVIDER_PROTOCOLS = {
+    RealtimeProvider.OPENAI: RealtimeProtocol.OPENAI_RT,
+    RealtimeProvider.GEMINI: RealtimeProtocol.OPENAI_RT,  # SDK-managed wire
+    RealtimeProvider.QWEN: RealtimeProtocol.DASHSCOPE_RT,
+}
+
+_PROVIDER_CLASSES: dict[tuple[RealtimeProvider, RealtimeProtocol], str] = {
+    (RealtimeProvider.OPENAI, RealtimeProtocol.OPENAI_RT): "OpenAIRealtimeLLMService",
+    (RealtimeProvider.GEMINI, RealtimeProtocol.OPENAI_RT): "GeminiLiveLLMService",
+    (RealtimeProvider.QWEN, RealtimeProtocol.DASHSCOPE_RT): "QwenOmniRealtimeLLMService",
+}
+
+
 _PROVIDER_ENV_KEYS = {
     RealtimeProvider.OPENAI: "OPENAI_API_KEY",
     RealtimeProvider.GEMINI: "GOOGLE_API_KEY",
@@ -65,6 +96,7 @@ class RealtimeHeadConfig:
 
     provider: RealtimeProvider
     model: str | None = None
+    protocol: RealtimeProtocol | None = None  # None = provider default
     api_key: str | None = None
     system_instruction: str | None = None
     voice: str | None = None
@@ -91,12 +123,23 @@ class RealtimeHeadConfig:
 def create_realtime_head(config: RealtimeHeadConfig) -> LLMService:
     """Instantiate the pipecat realtime service for the configured provider.
 
+    Protocol generation is resolved before dispatch: the provider's
+    default applies unless ``config.protocol`` overrides it, and the
+    (provider, protocol) pair must be a known combination.
+
     Args:
         config: Unified head configuration.
 
     Returns:
         A realtime LLM service instance ready to drop into a pipeline.
     """
+    protocol = config.protocol or _PROVIDER_PROTOCOLS[config.provider]
+    if (config.provider, protocol) not in _PROVIDER_CLASSES:
+        raise ValueError(
+            f"Unsupported combination: provider={config.provider.value} "
+            f"protocol={protocol.value}. Known: "
+            f"{[(p.value, q.value) for p, q in _PROVIDER_CLASSES]}"
+        )
     match config.provider:
         case RealtimeProvider.OPENAI:
             return _create_openai(config)
