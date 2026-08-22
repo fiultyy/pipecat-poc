@@ -335,4 +335,22 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             alias = _SERVER_EVENT_ALIASES.get(evt_type)
             if alias:
                 data["type"] = alias
+            # response.created/.done: DashScope names usage details with a
+            # trailing s and omits status_details/output; rename/fill so the
+            # parent's pydantic model validates (live-probe-verified
+            # 2026-08-22).
+            if evt_type in ("response.created", "response.done") and isinstance(
+                data.get("response"), dict
+            ):
+                resp = data["response"]
+                resp.setdefault("status_details", {})
+                resp.setdefault("output", [])
+                usage = resp.get("usage")
+                if isinstance(usage, dict):
+                    for src, dst in (
+                        ("input_tokens_details", "input_token_details"),
+                        ("output_tokens_details", "output_token_details"),
+                    ):
+                        if src in usage:
+                            usage[dst] = usage.pop(src)
         return json.dumps(data)
