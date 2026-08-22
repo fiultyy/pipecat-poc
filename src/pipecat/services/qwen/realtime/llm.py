@@ -8,6 +8,7 @@ import json
 
 from loguru import logger
 
+from pipecat.frames.frames import LLMFullResponseStartFrame
 from pipecat.services.openai import realtime as openai_realtime
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.utils.types import is_given
@@ -31,6 +32,20 @@ _SERVER_EVENT_ALIASES = {
     "response.audio_transcript.done": "response.output_audio_transcript.done",
     "response.text.delta": "response.output_text.delta",
     "response.text.done": "response.output_text.done",
+    # DashScope acknowledges seeded conversation items with
+    # conversation.item.created (probe-verified 2026-08-22); the parent's
+    # dispatch handles the equivalent conversation.item.added.
+    "conversation.item.created": "conversation.item.added",
+}
+
+# Events the parent's whitelist parser would reject (killing the receive
+# loop) that carry nothing the parent acts on — dropped instead.
+# - response.function_call_arguments.delta: the parent only acts on .done.
+# - session.finished: sent by some DashScope endpoints on teardown; the
+#   socket closes right after, ending the receive loop naturally.
+_SERVER_EVENT_DROPS = {
+    "response.function_call_arguments.delta",
+    "session.finished",
 }
 
 
@@ -109,21 +124,22 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
 
     async def _disconnect(self):
         try:
-            # Graceful teardown: ask the server to finish the session before
-            # closing the socket. Best-effort; teardown must not hang.
-            if self._websocket and not self._disconnecting:
-                try:
-                    await self._websocket.send(
-                        json.dumps({"event_id": "event_session_finish", "type": "session.finish"})
-                    )
-                except Exception:
-                    pass
+            # Teardown for qwen3.5-omni endpoints is a plain socket close:
+            # session.finish is rejected there ("Invalid value", probe-verified
+            # 2026-08-22) even after a completed turn, and the error reply it
+            # provokes would surface as a spurious ErrorFrame. The Model
+            # Studio docs allow direct disconnect for Qwen-Omni-Realtime.
             await super()._disconnect()
         except Exception as e:
             await self.push_error(error_msg=f"Error disconnecting: {e}", exception=e)
 
     async def send_client_event(self, event: openai_realtime.events.ClientEvent):
-        """Send a client event, rewriting ``session.update`` to the DashScope dialect.
+        """Send a client event, rewriting dialect differences to DashScope's form.
+
+        ``session.update``: fields flattened (see ``_rewrite_session_update``).
+        ``response.create``: ``response.output_modalities`` renamed to
+        ``modalities`` (same difference as in session.update; without this
+        the server ignores the modality override).
 
         Args:
             event: The client event (Pydantic model) to send.
@@ -131,6 +147,12 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
         if isinstance(event, openai_realtime.events.SessionUpdateEvent):
             payload = event.model_dump(exclude_none=True)
             self._rewrite_session_update(payload)
+            await self._ws_send(payload)
+        elif isinstance(event, openai_realtime.events.ResponseCreateEvent):
+            payload = event.model_dump(exclude_none=True)
+            response = payload.get("response")
+            if isinstance(response, dict) and "output_modalities" in response:
+                response["modalities"] = response.pop("output_modalities")
             await self._ws_send(payload)
         else:
             await super().send_client_event(event)
@@ -179,23 +201,87 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
         for field in ("type", "object", "id", "expires_at", "tracing", "prompt", "include"):
             session.pop(field, None)
 
+        # Tools: OpenAI nests the declaration under a "function" key; DashScope
+        # takes it flat (probe-verified 2026-08-22: flat declarations are
+        # accepted and invoked, nested ones are silently ignored).
+        tools = session.get("tools")
+        if isinstance(tools, list):
+            session["tools"] = [QwenOmniRealtimeLLMService._flatten_tool(t) for t in tools]
+
+    @staticmethod
+    def _flatten_tool(tool: dict) -> dict:
+        """Convert an OpenAI-style tool declaration to DashScope's flat form."""
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            flat = {"type": "function", **fn}
+            return flat
+        return tool
+
+    async def _create_response(self):
+        # Same as the parent, except the session update (carrying tools) is
+        # sent BEFORE seeding conversation items: DashScope only honors
+        # tools registered before the items exist (probe-verified 2026-08-22;
+        # updates after seeding leave the model text-mimicking the call).
+        if not self._api_session_ready:
+            self._run_llm_when_api_session_ready = True
+            return
+
+        assert self._context is not None
+
+        adapter = self.get_llm_adapter()
+
+        if self._llm_needs_conversation_setup:
+            logger.debug(
+                f"Setting up conversation on {self} with initial messages: "
+                f"{adapter.get_messages_for_logging(self._context)}"
+            )
+
+            # Send new settings (incl. tools) first — see method docstring.
+            await self._send_session_update()
+
+            # Then seed the initial messages.
+            llm_invocation_params = adapter.get_llm_invocation_params(self._context)
+            messages = llm_invocation_params["messages"]
+            for item in messages:
+                evt = openai_realtime.events.ConversationItemCreateEvent(item=item)
+                self._messages_added_manually[evt.item.id] = True
+                await self.send_client_event(evt)
+
+            self._llm_needs_conversation_setup = False
+
+        logger.debug("Creating response")
+
+        await self.push_frame(LLMFullResponseStartFrame())
+        await self.start_processing_metrics()
+        await self.start_ttfb_metrics()
+        await self.send_client_event(
+            openai_realtime.events.ResponseCreateEvent(
+                response=openai_realtime.events.ResponseProperties(
+                    output_modalities=self._get_enabled_modalities()
+                )
+            )
+        )
+
     async def _receive_task_handler(self):
-        # Copied from OpenAIRealtimeLLMService: the parent loop has no
-        # per-message hook, and DashScope renames the audio delta events and
-        # adds session.finished. Event names are normalized before parsing so
-        # the parent handlers are reused as-is.
+        # Copied from OpenAIRealtimeLLMService with two DashScope-specific
+        # guards: names are normalized/dropped before parsing, and a parse
+        # failure on an unknown event logs and continues instead of killing
+        # the receive loop (the parent's parser is a whitelist that raises).
         assert self._websocket is not None
 
         async for message in self._websocket:
             normalized = self._normalize_server_message(message)
-            evt = openai_realtime.events.parse_server_event(normalized)
+            if normalized is None:
+                continue
+            try:
+                evt = openai_realtime.events.parse_server_event(normalized)
+            except Exception as e:
+                logger.warning(f"{self} skipped unparseable server event: {e}")
+                continue
             if evt.type == "session.created":
                 await self._handle_evt_session_created(evt)
             elif evt.type == "session.updated":
                 await self._handle_evt_session_updated(evt)
-            elif evt.type == "session.finished":
-                logger.info(f"{self} session finished")
-                return
             elif evt.type == "response.output_audio.delta":
                 await self._handle_evt_audio_delta(evt)
             elif evt.type == "conversation.item.added":
@@ -232,14 +318,21 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
                         return
 
     @staticmethod
-    def _normalize_server_message(message: str | bytes) -> str:
-        """Rewrite DashScope server event names to OpenAI's, when they differ."""
+    def _normalize_server_message(message: str | bytes) -> str | None:
+        """Rewrite DashScope server event names to OpenAI's; None to drop.
+
+        Events in ``_SERVER_EVENT_DROPS`` return None (the receive loop
+        skips them); aliased names are rewritten in place.
+        """
         try:
             data = json.loads(message)
         except (TypeError, json.JSONDecodeError):
-            return message
+            return message if isinstance(message, str) else None
         if isinstance(data, dict):
-            alias = _SERVER_EVENT_ALIASES.get(data.get("type"))
+            evt_type = data.get("type")
+            if evt_type in _SERVER_EVENT_DROPS:
+                return None
+            alias = _SERVER_EVENT_ALIASES.get(evt_type)
             if alias:
                 data["type"] = alias
         return json.dumps(data)
