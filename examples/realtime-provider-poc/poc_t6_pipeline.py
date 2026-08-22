@@ -169,7 +169,6 @@ async def main():
 
     print("\n== T6 PIPELINE E2E RESULTS ==")
     ack = "".join(tap.texts)
-    creds_in_orch = [r.canary for h in orch.history for r in []]  # history stores findings
     print("  prompt:", PROMPT)
     print("  subtasks:", [s["agent"] for h in orch.history for s in h["subtasks"]])
     print("  ack:", ack[:180])
@@ -178,7 +177,6 @@ async def main():
     # Layered verdict per architecture contract: credentials live in the
     # orchestrator's tool output (machine channel); the head ack is the
     # spoken summary — canary content required, credential delimiters soft.
-    orch_creds = [h for h in orch.history]
     ack_ok = len(ack) > 30  # substantive spoken summary present
     layer_ok = bool(orch.history) and any(
         "【凭证" in json.dumps(h["results"], ensure_ascii=False) for h in orch.history

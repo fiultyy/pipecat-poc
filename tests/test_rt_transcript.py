@@ -4,6 +4,7 @@
 
 """Unit tests for the client-side transcript state machine."""
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -61,11 +62,11 @@ def test_byte_budget_truncation():
 def test_take_tail_drains():
     st = TranscriptState()
     st.seed("user", "hello")
-    # drain via snapshot semantics: take_tail is async; emulate with direct check
-    entries = st.entries
-    st.entries = []
-    assert [(e.role, e.text) for e in entries] == [("user", "hello")]
+    drained = asyncio.run(st.take_tail())
+    assert [(e.role, e.text) for e in drained] == [("user", "hello")]
     assert st.entries == []
+    # A second drain returns nothing: the swap is destructive.
+    assert asyncio.run(st.take_tail()) == []
 
 
 def test_oversized_single_entry_gets_prefixed():
@@ -73,6 +74,14 @@ def test_oversized_single_entry_gets_prefixed():
     st.seed("user", "z" * 400)
     assert st.entries[0].text.startswith("[truncated] ")
     assert len(st.entries[0].text.encode()) <= 100
+
+
+def test_tiny_budget_does_not_reverse_slice():
+    # budget < len("[truncated] "): the keep count must clamp to 0, not go
+    # negative (a negative slice keeps the TAIL and bypasses truncation).
+    st = TranscriptState(max_bytes=10)
+    st.seed("user", "z" * 400)
+    assert st.entries[0].text == "[truncated] "
 
 
 def test_reseed_text_form():

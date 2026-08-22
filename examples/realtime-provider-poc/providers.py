@@ -166,6 +166,9 @@ def _create_openai(config: RealtimeHeadConfig) -> LLMService:
         sp_kwargs["audio"] = events.AudioConfiguration(**audio_kwargs)
     if config.text_only:
         sp_kwargs["output_modalities"] = ["text"]
+    if config.tools:
+        # Fallback until an LLMContext arrives; context tools override these.
+        sp_kwargs["tools"] = config.tools
 
     sp_kwargs.update(config.extra.get("openai", {}))
 
@@ -226,6 +229,9 @@ def _create_qwen(config: RealtimeHeadConfig) -> LLMService:
         sp_kwargs["audio"] = events.AudioConfiguration(**audio_kwargs)
     if config.text_only:
         sp_kwargs["output_modalities"] = ["text"]
+    if config.tools:
+        # Fallback until an LLMContext arrives; context tools override these.
+        sp_kwargs["tools"] = config.tools
 
     sp_kwargs.update(config.extra.get("qwen", {}))
 

@@ -139,7 +139,7 @@ class TranscriptState:
         encoded = entry.text.encode()
         if len(encoded) <= budget:
             return
-        keep = budget - len(TRUNCATED_PREFIX.encode())
+        keep = max(budget - len(TRUNCATED_PREFIX.encode()), 0)
         # Walk back to a char boundary.
         while keep > 0 and not (len(encoded[:keep].decode(errors="ignore")) == keep):
             keep -= 1

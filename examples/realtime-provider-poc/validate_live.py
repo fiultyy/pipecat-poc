@@ -207,8 +207,11 @@ async def v4_full_loop(head: HeadSession, orch: Orchestrator):
     await asyncio.sleep(0.3)
     ack, _ = await head.respond()
     ack_creds = extract_credentials(ack)
-    ok_all &= verdict("23%" in ack or creds[0] in ack or ack_creds,
-                      "head ack 回显凭证/结论", f"ack={ack[:90]!r}")
+    ok_all &= verdict(
+        "23%" in ack or any(c in ack for c in creds) or bool(ack_creds),
+        "head ack 回显凭证/结论",
+        f"ack={ack[:90]!r}",
+    )
     # remain_silent exposure: tool listed; behavior check is soft (needs a
     # control-message scenario; presence + schema validity is the contract)
     ok_all &= verdict(True, "remain_silent 工具已注册（双工具契约）", soft=True)

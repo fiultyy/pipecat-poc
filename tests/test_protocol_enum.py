@@ -61,3 +61,21 @@ def test_qwen_explicit_protocol_still_builds(monkeypatch):
         )
     )
     assert type(svc).__name__ == "QwenOmniRealtimeLLMService"
+
+
+def test_tools_honored_for_every_provider(monkeypatch):
+    """The unified config surface advertises tools on all providers."""
+
+    async def a_tool(params):
+        """demo"""
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-x")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    monkeypatch.setenv("GOOGLE_API_KEY", "sk-x")
+    for provider in RealtimeProvider:
+        svc = create_realtime_head(RealtimeHeadConfig(provider=provider, tools=[a_tool]))
+        if provider is RealtimeProvider.GEMINI:
+            tools = svc._tools_from_init
+        else:
+            tools = svc._settings.session_properties.tools
+        assert tools, f"{provider.value}: config.tools silently dropped"
