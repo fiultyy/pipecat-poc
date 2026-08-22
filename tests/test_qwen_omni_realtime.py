@@ -215,6 +215,29 @@ async def test_qwen_omni_realtime_end_to_end():
     assert server.finish_sent.is_set(), "teardown did not send session.finish"
 
 
+def test_server_event_aliases_cover_documented_events():
+    """DashScope server event names (Model Studio docs + SDK) normalize to OpenAI's."""
+    from pipecat.services.qwen.realtime.llm import _SERVER_EVENT_ALIASES
+
+    for dashscope_name in (
+        "response.audio.delta",
+        "response.audio_transcript.delta",
+        "response.text.delta",  # text-only modality output (docs)
+        "response.audio.done",
+    ):
+        assert dashscope_name in _SERVER_EVENT_ALIASES
+
+    assert (
+        QwenOmniRealtimeLLMService._normalize_server_message('{"type":"response.text.delta","delta":"hi"}')
+        .count("response.output_text.delta")
+        == 1
+    )
+    # Unknown events pass through untouched.
+    assert QwenOmniRealtimeLLMService._normalize_server_message('{"type":"whatever.thing"}').count(
+        "whatever.thing"
+    ) == 1
+
+
 def test_url_and_model_defaults():
     svc = QwenOmniRealtimeLLMService(api_key="sk-test")
     assert svc.base_url == (
