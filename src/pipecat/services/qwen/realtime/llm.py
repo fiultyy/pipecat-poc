@@ -21,10 +21,17 @@ DEFAULT_QWEN_OMNI_REALTIME_MODEL = "qwen3.5-omni-flash-realtime"
 # Server event names emitted by DashScope that differ from OpenAI's. Maps the
 # DashScope name to the OpenAI name the parent service dispatches on.
 # Sources: dashscope SDK 1.27.0 omni_realtime.py + Model Studio docs
-# (help.aliyun.com/zh/model-studio/server-events):
+# (help.aliyun.com/zh/model-studio/server-events) + live probing.
 # - response.audio.delta / .done          (audio-modality output)
 # - response.audio_transcript.delta/.done (text transcript of spoken output)
 # - response.text.delta / .done           (text-only modality output)
+#
+# NOTE on input transcription: qwen3.5-omni models are end-to-end — the
+# separate input_audio_transcription pipeline (which qwen3-omni /
+# qwen-omni-turbo support via session.input_audio_transcription) does not
+# emit transcript content on these endpoints (docs: "各环节无法独立")， so
+# no user-voice TranscriptionFrames should be expected from them. The
+# aliases below are kept for the older models that do.
 _SERVER_EVENT_ALIASES = {
     "response.audio.delta": "response.output_audio.delta",
     "response.audio_transcript.delta": "response.output_audio_transcript.delta",
