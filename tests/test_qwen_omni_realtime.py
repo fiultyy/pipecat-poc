@@ -211,8 +211,10 @@ async def test_qwen_omni_realtime_end_to_end():
     assert LLMFullResponseEndFrame in types
     assert ProposedUserStartedSpeakingFrame in types
 
-    # --- graceful teardown ---
-    assert server.finish_sent.is_set(), "teardown did not send session.finish"
+    # --- teardown: plain socket close (session.finish is rejected by
+    # qwen3.5 endpoints; live-probe-verified 2026-08-22) ---
+    client_types = {m.get("type") for m in server.received}
+    assert "session.finish" not in client_types, "session.finish must not be sent"
 
 
 def test_server_event_aliases_cover_documented_events():
