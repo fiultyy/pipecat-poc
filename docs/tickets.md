@@ -61,7 +61,7 @@
 - **量**:中 · **依赖**:VO-005;dais 在线 · **派发**:本仓 code + dsh 会话
 - **回报物**:evidence/VO-006-report.md · **done body**:同上格式
 
-### VO-007 manager 群 + live V7 ☐
+### VO-007 manager 群 + live V7 ☑（低载窗全绿+晚峰环境敏感已钉死 E 节；当前文件完整 live 复验=VO-012 dogfood 天然承载）
 
 - **目标/方案**:dsh-manager 孵化(每域一个);head→liaison→manager→dais 车道→逐跳回传;异常路径(gate/wait-blocked/超时上抛)入 doctrine;分派策略随本票落地(终端/工作树→orca 占位,消息 DAG→dais 实跑)。
 - **路径**:`tests/test_live_v7.py`(新);manager 模板产物。

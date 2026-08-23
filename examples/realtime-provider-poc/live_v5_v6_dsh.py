@@ -70,6 +70,42 @@ from rt_orchestrator import FINAL_PREFIX
 #      三过滤/FINAL_PREFIX/凭证格式等协议常量原样（KG 06 §3.1 四项对照）。
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Doctrine — manager 群与逐跳回传（VO-007；KG 06 §4 V7 六步场景）
+# ---------------------------------------------------------------------------
+# 链路与本票固化（head 侧依旧零改动，全部编排落在 liaison/manager 真身）：
+#   head --F4(邮箱正文+DSHMSG 唤醒)--> liaison --F6--> manager×N
+#     --F7(选车道派发)--> worker --(worker_done)--> manager --F9--> liaison
+#     --F10--> head phase-2 收割（两阶段时序；ref 逐跳透传；凭证逐字）。
+#   F6 = router agents/send 推唤醒（session-send 固定信封，轻载 push 路径）
+#        + dais 邮箱正文（status 型投递；与 VO-005 双投递对拍同语义）。
+#   分派策略（manager 模板 + 本票 doctrine 落地）：终端/工作树类任务走
+#        orca 车道（占位，实跑见 VO-008/009）；消息 DAG/轻量 fan-out 走
+#        dais 车道实跑（create-run/create-task/start-worker + 邮箱回投
+#        + worker_done 回收）。
+#   异常路径三形态（manager 处理循环，KG 06 §4；亦写入 manager 通信规约）：
+#     1. gate 阻塞    → resolve-gate <gate_id> <resolution>（解除决策门）；
+#     2. wait-blocked → scan-wait-blocked <ctx>（分类卡死；可 answer 自愈，
+#        无法自愈才上抛）；
+#     3. 超时         → 上抛 supervisor（role 预留）：以 [ref:] 信封向
+#        agent_liaison 发 subject=escalation 报文，不静默吞掉、不无限重试。
+#   live 事实（2026-08-23 本票探针钉死）：
+#     - dais GUI 已退出且红线禁 spawn dais：new-terminal/inject-prompt 不可用，
+#       worker 改用 fleet 原生 session-spawn 工厂（standard 预设，VO-005 已验
+#       headless 可用）；单行命令经 session-send DSHMSG 唤醒注入，worker 回合
+#       真实执行并回投（穿衣排练 45s 全绿，WITNESS 时间戳为真执行凭证）。
+#     - start-worker 无 --command 亦可建 dispatch（ctx_…）；worker 以
+#       send-message --message-type worker_done --subject done --body
+#       {"task_id","dispatch_id","outcome"} 手工回投；GUI 侧结算 watcher 缺席时
+#       状态机迁移延迟，check-messages <ctx> --type worker_done 的消息行本身即
+#       回收凭证（dais 侧观察项，同 impl-specs 环境注记）。
+#     - router 重载路径（agents/send >256B/多行 → dais --message-type direct）
+#       live 断裂：现行 dais CLI 仅接受 status 型（VO-005 C.1 留痕；插件目录
+#       本票只读不可修）——故 F6 邮箱正文走 dais CLI 直投（status），推唤醒走
+#       router agents/send 轻载 push 路径（session-send 底座，live 可用）。
+#
+# ---------------------------------------------------------------------------
+
 LIAISON_MAILBOX = "agent_liaison"       # 真身配置值（原替身: session_vhlive）
 LIAISON_PROFILE = "vh-liaison"
 HEAD = "voice-head"
@@ -302,6 +338,205 @@ async def wakeup(code: str, ref: str, run_id: str) -> None:
     out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
     if proc.returncode != 0 or b"accepted=True" not in out:
         raise RuntimeError(f"session-send wakeup failed: {out.decode(errors='replace')!r}")
+
+
+# ---------------------------------------------------------------------------
+# VO-007 exports — manager 场景复用接口（纯增量；V5/V6 逻辑与函数零改动）
+# ---------------------------------------------------------------------------
+
+def rpc_jsonrpc(port: int, method: str, params: dict) -> dict:
+    """One JSON-RPC call against a loopback harness (proxy-stripped urllib,
+    same discipline as _rpc_incubate — the host NO_PROXY CIDR entries are
+    not honored by urllib)."""
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/",
+        data=json.dumps(payload, ensure_ascii=False).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with opener.open(req, timeout=60) as resp:
+        out = json.loads(resp.read())
+    if "error" in out:
+        raise RuntimeError(f"{method} RPC error: {out['error']}")
+    return out["result"]
+
+
+def boot_router_harness(grants: list | None = None,
+                        state_name: str = "live-vo007",
+                        port: int = 0) -> tuple[subprocess.Popen, int]:
+    """Boot the a2a-profile-server HTTP face with the ROUTER wired over the
+    REAL fleet (registry reattach via the dsh loopback) and the REAL delivery
+    bins (session-send / dais CLI). Kept alive by the caller; used by the V7
+    chain for F6 push wakeups (agents/send light path)."""
+    state_rel = json.dumps(f".dsh/plugins/a2a-profile-server/state/{state_name}")
+    grants_js = json.dumps(grants or [])
+    script = (
+        "(async () => {"
+        "const { createHttpServer, createRouter } = await import('./http-server.js');"
+        "const { createRegistry } = await import('./registry.js');"
+        "const { readFile, mkdir } = await import('node:fs/promises');"
+        "const { homedir } = await import('node:os');"
+        "const { join } = await import('node:path');"
+        "const fleetPath = join(homedir(), '.dsh/maestro/fleet.json');"
+        "const fleet = JSON.parse(await readFile(fleetPath, 'utf8'));"
+        "const port = String(fleet.port ?? 3080);"
+        "const loopback = async (m, p) => {"
+        "  const res = await fetch('http://127.0.0.1:' + port + '/api/' + m, {"
+        "    method: 'POST', headers: { 'content-type': 'application/json' },"
+        "    body: JSON.stringify({ type: 'client-request', rpcId: String(Date.now()), method: m, payload: p ?? {} }),"
+        "  });"
+        "  const body = await res.json();"
+        "  const result = body.result ?? body;"
+        "  if (!result.ok) throw new Error(m + ' failed: ' + JSON.stringify(result.error ?? result));"
+        "  return result.value;"
+        "};"
+        f"const state = join(homedir(), {state_rel});"
+        "await mkdir(state, { recursive: true });"
+        "const journalPath = join(state, 'router-journal.jsonl');"
+        "const registry = createRegistry({ fleetPath, journalPath, loopback });"
+        "await registry.reattach();"
+        f"const router = createRouter({{ registry, journalPath, grants: {grants_js} }});"
+        "const http = createHttpServer({"
+        "  tasks: null,"
+        "  profiles: { list: async () => [] },"
+        "  router,"
+        "});"
+        f"console.log('READY ' + await http.start({port}));"
+        "})().catch(e => { console.error('BOOTFAIL ' + (e?.stack ?? e)); process.exit(1); })"
+    )
+    proc = subprocess.Popen(
+        ["node", "--input-type=module", "-e", script],
+        cwd=PLUGIN_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True,
+    )
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        line = proc.stdout.readline()
+        if "READY" in line:
+            return proc, int(line.split()[-1])
+        if "BOOTFAIL" in line or proc.poll() is not None:
+            break
+    proc.kill()
+    raise RuntimeError("router harness did not become ready")
+
+
+async def incubate_agent(*, profile: str, targets: list[str], role: str,
+                         project: str, mailbox: str, scenario: str,
+                         appendix: str, description: str,
+                         agents_md: str | None = None) -> dict:
+    """Generalized real incubation (VO-006 incubate_liaison 的参数化推广，
+    供 manager 群/V7 场景复用；行为同形：真投影过三门 → incubate RPC →
+    回执校验）。``agents_md`` 直通预投影产物（与 scenario 互斥使用），
+    供多域投影并行、RPC 串行的预算优化路径（fleet 写不可并行）。"""
+    from rt_projection_gates import run_gates
+
+    if agents_md is None:
+        from rt_projector import Projector
+
+        proj = await Projector().project(scenario, role=role)
+        agents_md = proj.agents_md.rstrip() + "\n" + appendix
+    else:
+        agents_md = agents_md.rstrip() + "\n" + appendix
+    report = run_gates(agents_md)
+    if not report.passed:
+        raise RuntimeError(f"{profile} agents_md gate violations: {report.violations}")
+
+    import urllib.request
+
+    proc, port = _boot_incubator()
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        payload = {
+            "jsonrpc": "2.0", "id": 1, "method": "incubate",
+            "params": {
+                "name": profile,
+                "targets": targets,
+                "role": role,
+                "project": project,
+                "mailbox": mailbox,
+                "projection": {
+                    "agents_md": agents_md,
+                    "profile_json": {"agent_role": role, "scenario": scenario[:60]},
+                    "description": description,
+                },
+            },
+        }
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/",
+            data=json.dumps(payload, ensure_ascii=False).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with opener.open(req, timeout=180) as resp:
+            out = json.loads(resp.read())
+        if "error" in out:
+            raise RuntimeError(f"incubate RPC error: {out['error']}")
+        result = out["result"]
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    receipts = result["receipts"]
+    bad = [r for r in receipts if r.get("error")]
+    if bad:
+        raise RuntimeError(f"incubate receipts failed: {bad}")
+    receipt = receipts[0]
+    assert receipt["target"] == f"dsh-{role}", receipt
+    return receipt
+
+
+def session_events(session_id: str) -> list[dict]:
+    """Raw session.history events over the dsh loopback (proxy-stripped);
+    VO-007 chain inspection face (turn structure + tool calls/results)."""
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    port = str(json.loads(FLEET_PATH.read_text()).get("port", 3080))
+    wire = json.dumps({
+        "type": "client-request", "rpcId": str(time.time_ns()),
+        "method": "session.history",
+        "payload": {"sessionId": session_id, "maxMessages": 4000},
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/session.history",
+        data=wire, headers={"content-type": "application/json"},
+    )
+    with opener.open(req, timeout=60) as resp:
+        result = json.loads(resp.read())["result"]
+    if not result.get("ok"):
+        raise RuntimeError(f"session.history failed: {result.get('error')}")
+    return [e.get("event", e) for e in result["value"]["events"]]
+
+
+def bash_trace(session_id: str) -> list[dict]:
+    """Tool-call trace of a session: [{turn, name, arguments, result}] where
+    arguments is the raw JSON string and result the tool output text (empty
+    when the event stream carries no result). Turn attribution follows the
+    turn/start counters, same approach as _wakeup_turn_actions."""
+    trace, results = [], {}
+    cur_turn = 0
+    for ev in session_events(session_id):
+        t, d = ev.get("type"), ev.get("data", {})
+        if t == "turn/start":
+            cur_turn = d.get("turn", cur_turn)
+        elif t == "tool/call":
+            trace.append({"turn": cur_turn, "name": d.get("name"),
+                          "arguments": d.get("arguments", ""), "result": ""})
+            results[d.get("callId")] = trace[-1]
+        elif t == "tool/result":
+            entry = results.get((d.get("message") or {}).get("source", {}).get("callId"))
+            if entry is not None:
+                texts = []
+                for part in (d.get("message") or {}).get("content") or []:
+                    for c in part.get("content") or []:
+                        if isinstance(c, dict) and c.get("text"):
+                            texts.append(c["text"])
+                entry["result"] = "\n".join(texts)
+    return trace
 
 
 async def dispatch_intent_live(params, raw_intent: str):

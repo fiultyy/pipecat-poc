@@ -8,7 +8,7 @@
 
 | 线 | 状态 | 下一个事件 | 完成时动作 |
 |---|---|---|---|
-| **VO-007** manager群+V7 | **三连跑稳定性验证中**（agent 自驱：bg_5 串 sleep240→purge f0a3→timeout900 pytest，"等三跑"=连跑 3 轮防单跑侥幸；22:49 第 2 轮）。报告仍 21:37 旧版勿合并 | 三跑全绿 → 报告更新 → relay 唤醒 | 门禁(timeout 900 壳复跑)→ merge→☑→派 VO-012 |
+| **VO-007** manager群+V7 | **三连跑第 2 轮完成（22:59），清理阶段中**（bg_2=sleep300→purge 残留 3dbc/0944；终端 verdict 被 TUI 滚出视野，以 agent 最终报告为准）。报告仍 21:37 旧版勿合并 | 清理完→第 3 轮或收报告→报告更新→relay 唤醒 | 门禁(timeout 900 壳复跑)→ merge→☑→派 VO-012 |
 | **W6 规划** | **☑ 已验收合入 `b51bf05`**（09 方案 227 行 9 票 + INDEX N9 由 e858 自注 + 缺陷台账 08 + handoff 使命书 + orch-index）。e858 会话可 retire | — | 次波执行按 09 §9：VO-012 前只做 Wave 0 + OF-009 docs |
 | **relay <seat>** 第二期 | 值守中（22/40 轮） | VO-007 报告更新/merge 回投；40 轮到期 | 到期若 VO-007 未完 → re-arm |
 | VO-012 | 待派（前置=VO-007☑） | — | 派发主区 omp（收口 dogfood 票） |
