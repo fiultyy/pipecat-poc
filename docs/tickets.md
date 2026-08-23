@@ -25,7 +25,7 @@
 - **量**:中 · **依赖**:VO-001 · **派发**:本仓 code(插件 js)
 - **回报物**:evidence/VO-002-report.md · **done body**:同上格式
 
-### VO-003 fleet 扩展 + registry/reattach + 生命周期 ☐
+### VO-003 fleet 扩展 + registry/reattach + 生命周期 ☑
 
 - **目标/方案**:新 `registry.js`——fleet 登记项扩五键(role/project/mailbox/profile_version/spawned_at);`reattach()`(loopback session.list 比对,孤儿→retired+journal);状态机 spawn→arm→ready→serving→retire。**唤醒模型钉死**:dsh 会话非常驻轮询者;推唤醒(DSHMSG 注入触发回合)+回合首拉取(邮箱快照排空);探活一律 router 侧驱动。
 - **路径**:`~/.dsh/plugins/a2a-profile-server/registry.js`(新);`tests/test_rt_fleet_registry.py`(新)。
