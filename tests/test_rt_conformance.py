@@ -30,6 +30,7 @@ import sys
 import time
 import urllib.request
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,7 @@ from rt_dsh_backend import DshBackend  # noqa: E402
 from rt_dsh_lane import DaisLane  # noqa: E402
 import rt_dsh_lane as rt_dsh_lane_module  # noqa: E402
 from rt_event_bus import EventBus  # noqa: E402
+from rt_orca_lane import OrcaLane, OrcaLaneError  # noqa: E402
 from rt_orchestrator import FINAL_PREFIX  # noqa: E402
 
 PLUGIN_DIR = Path("~/.dsh/plugins/a2a-profile-server").expanduser()
@@ -363,3 +365,287 @@ async def test_dual_delivery_parity(tmp_path):
     finally:
         # best-effort cleanup: purge refuses sessions written <5min ago (busy gate)
         subprocess.run([SESSION_PURGE, code], capture_output=True, timeout=30)
+
+
+# ---- VO-009: lane B live smoke + A/B lane-factory final conformance ----
+#
+# Live-probed facts baked in (2026-08-23, orca app 1.4.185; agent claude
+# 2.1.179 on the GLM anthropic proxy, global effortLevel=high):
+#
+# - orca launches the agent with ``--dangerously-skip-permissions``, the
+#   prompt as argv, and the worktree root as cwd.
+# - ``terminal wait --for tui-idle`` has three terminal shapes: satisfied
+#   → exit 0 + ok:true + result.wait.satisfied=true; unsatisfied slice →
+#   exit 1 + ok:true (satisfied:false, blockedReason e.g.
+#   "codex-trust-workspace"); slice timeout → exit 1 + ok:false
+#   code=timeout. OrcaLane raises OrcaLaneError for both exit-1 shapes
+#   before parsing the envelope; both mean "keep waiting within budget".
+# - ``terminal read --cursor 0`` pages FROM THE OLDEST retained line; the
+#   agent's ANSWER TEXT NEVER ENTERS the scrollback ring (spinner frames
+#   only — verified across 141s of incremental paging) — a render-proof
+#   completion signal is mandatory: the worker writes its final to
+#   ``final.txt`` in the worktree (13.5s end-to-end observed), and only
+#   an exact content match completes (partial writes never satisfy).
+# - a fresh worktree can stall on a trust/confirm dialog ("Enter to
+#   confirm" / "2. No, exit"); sending "1" answers it (bounded count).
+# - tui-idle can flash satisfied EARLY — completion is decided by the
+#   artifact, never by a satisfied wait.
+# - high-effort thinking runs minutes on even a trivial task; the worker
+#   runner interrupts the spawned turn after its settle window, drops to
+#   ``/effort low`` and resends the task once (27s observed post-dance).
+#   Every step is bounded.
+
+ORCA_WAIT_SLICE_MS = 15000       # bounded terminal-wait slice (--timeout-ms)
+ORCA_READ_PAGE = 200             # incremental read page size
+ORCA_MAX_DIALOG_ANSWERS = 5      # bounded dialog interventions
+ORCA_TURN_SETTLE_S = 20.0        # turn's artifact window before the dance
+ORCA_WORKER_BUDGET_S = 240.0     # overall worker deadline (spawn → final)
+ORCA_AGENT = "claude"            # built-in agent; omp forbidden (recursion)
+
+
+def _wait_slice_unsatisfied(exc: OrcaLaneError) -> bool:
+    """Exit-1 wait outcomes meaning "condition not met within the bounded
+    slice" (ok:true unsatisfied, or the CLI's own timeout error); anything
+    else is a real lane error and propagates."""
+    msg = str(exc)
+    return msg.startswith("exit=1") and (
+        '"ok": true' in msg or '"code": "timeout"' in msg
+    )
+
+
+def _dialog_open(page: str) -> bool:
+    """Trust/confirm dialog signature in the newest rendered lines."""
+    lines = [ln.strip() for ln in page.splitlines() if ln.strip()]
+    return bool(lines) and any(
+        marker in ln for ln in lines[-4:]
+        for marker in ("Enter to confirm", "No, exit")
+    )
+
+
+
+
+def _repo_root() -> str:
+    """Main checkout of this repo (git common-dir parent) — the orca repo
+    selector for spawning scratch worktrees."""
+    out = subprocess.run(
+        ["git", "-C", str(Path(__file__).resolve().parent.parent),
+         "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True, timeout=15,
+    ).stdout.strip()
+    return str(Path(out).resolve().parent)
+
+
+async def _orca_plane_up(lane: OrcaLane) -> bool:
+    """Lane B probe: orca-ide app running and runtime reachable."""
+    try:
+        status = await lane.status()
+    except Exception:
+        return False
+    app = status.get("app") or {}
+    runtime = status.get("runtime") or {}
+    return bool(app.get("running")) and bool(runtime.get("reachable"))
+
+
+async def _orca_teardown(lane: OrcaLane, wt_id: str, name: str) -> None:
+    """Stop the worktree's terminals, remove the worktree, assert no
+    residue (red line: the smoke leaves neither processes nor worktrees)."""
+    try:
+        await lane.stop(wt_id)
+    except OrcaLaneError:
+        pass  # already stopped / never started: rm below is the authority
+    removed = subprocess.run(
+        [OrcaLane.BIN, "worktree", "rm", "--worktree", wt_id, "--force", "--json"],
+        capture_output=True, text=True, timeout=60,
+    )
+    ps = await lane.worktree_ps()
+    residual = [w for w in ps.get("worktrees", [])
+                if name in json.dumps(w, ensure_ascii=False)]
+    assert removed.returncode == 0 and not residual, (
+        f"worktree teardown left residue (rm rc={removed.returncode}, "
+        f"residual={json.dumps(residual, ensure_ascii=False)[:300]})"
+    )
+
+
+@asynccontextmanager
+async def _orca_worker(lane: OrcaLane, name: str, prompt: str, body: str,
+                       *, budget_s: float = ORCA_WORKER_BUDGET_S,
+                       artifact: str = "final.txt"):
+    """One REAL lane-B execution: spawn a scratch worktree (agent claude,
+    cwd = worktree root) → bounded tui-idle wait slices → incremental
+    reads (dialog detection) → worker final observed as the worktree
+    ARTIFACT whose content equals the expected body exactly (render-
+    proof: TUI answer text never enters the scrollback ring).
+
+    Manager interventions stay bounded: dialog answers (≤ cap) and ONE
+    interrupt + ``/effort low`` + task resend after the spawned turn's
+    settle window passes without the artifact (high-effort thinking runs
+    minutes; 27s observed post-dance). Teardown (stop + rm + residual
+    assert) runs on every exit path."""
+    created = await lane.spawn_worktree(
+        name, f"path:{_repo_root()}", ORCA_AGENT, prompt, setup="skip",
+    )
+    wt_id, handle = created["worktreeId"], created["terminalHandle"]
+    final_path = Path(wt_id.split("::", 1)[1]) / artifact
+    try:
+        t0 = time.monotonic()
+        deadline = t0 + budget_s
+        cursor, dialogs, danced = 0, 0, False
+        t_output, final, page = None, None, ""
+        while time.monotonic() < deadline and final is None:
+            try:
+                await lane.wait(handle, what="tui-idle",
+                                timeout_ms=ORCA_WAIT_SLICE_MS)
+            except OrcaLaneError as e:
+                if not _wait_slice_unsatisfied(e):
+                    raise
+            if final_path.exists():
+                content = final_path.read_text().strip()
+                if content == body:  # exact — a partial write never completes
+                    final = content
+                    break
+            page, cursor = await lane.read(handle, cursor=cursor,
+                                           limit=ORCA_READ_PAGE)
+            if page.strip() and t_output is None:
+                t_output = time.monotonic()
+            if _dialog_open(page):
+                if dialogs >= ORCA_MAX_DIALOG_ANSWERS:
+                    break
+                dialogs += 1
+                await lane.send(handle, "1")
+                continue
+            if (not danced and t_output is not None
+                    and time.monotonic() - t_output >= ORCA_TURN_SETTLE_S):
+                await lane.interrupt(handle)
+                await asyncio.sleep(3)
+                await lane.send(handle, "/effort low")
+                await asyncio.sleep(3)
+                await lane.send(handle, prompt)
+                danced = True
+        assert final is not None, (
+            f"lane B worker artifact {artifact!r} never matched the body "
+            f"within {budget_s:.0f}s (dialogs={dialogs}, danced={danced}); "
+            f"newest page tail: {page[-400:]!r}"
+        )
+        yield wt_id, handle, final
+    finally:
+        await _orca_teardown(lane, wt_id, name)
+
+
+@pytest.mark.asyncio
+async def test_live_lane_b_smoke():
+    """VO-009①: lane B live smoke — one REAL worktree spawned through
+    rt_orca_lane (built-in agent claude; omp is forbidden to avoid
+    recursion) → bounded wait → incremental read → verbatim final with
+    the credential intact; teardown removes the worktree."""
+    if not shutil.which(OrcaLane.BIN):
+        pytest.skip("orca-ide absent (lane B host offline)")
+    if not shutil.which(ORCA_AGENT):
+        pytest.skip("claude agent binary absent (lane B worker)")
+    lane = OrcaLane(default_timeout_s=90)
+    if not await _orca_plane_up(lane):
+        pytest.skip("orca-ide plane down (app/runtime unreachable)")
+
+    suffix = uuid.uuid4().hex[:6]
+    body = f"冒烟完成 【凭证R-ORCA-SMOKE-{suffix}】 结论 41%"
+    prompt = (
+        "冒烟任务：请立即用 Write 工具把下面这一行逐字写入当前工作目录"
+        "的 final.txt 文件（文件内容必须恰好是这一行，不加任何其他文字），"
+        "写完即完成，无需其他回复：\n" + body
+    )
+    async with _orca_worker(lane, f"vo009-smoke-{suffix}", prompt, body) as ctx:
+        wt_id, handle, worker_final = ctx
+        assert wt_id and handle
+        assert worker_final == body
+        assert f"【凭证R-ORCA-SMOKE-{suffix}】" in worker_final  # 凭证逐字
+    # 有界等待纪律：冒烟确实等待过，且每条 wait 都带 --timeout-ms（无裸等）
+    waits = [argv for argv in lane._call_log if argv[1:3] == ["terminal", "wait"]]
+    assert waits, "smoke never waited (completion must be observed, not assumed)"
+    for argv in waits:
+        assert "--timeout-ms" in argv
+
+
+# A/B conformance: the SAME intent through both execution lanes must
+# deliver the IDENTICAL final to the head — FINAL_PREFIX + same body,
+# credentials verbatim — and the final channel is NOT lane-split: both
+# lanes return through the unified dais mailbox chain (the head polls its
+# dais mailbox; the manager role relays lane B's worker final via
+# send_reply exactly like the lane A reply).
+_AB_INTENT = "A/B 对拍一致性意图：复核调研结论 41% 并逐字回显凭证"
+_AB_BODY = "调研完成 【凭证R-CONF-AB-8899】 结论 41%"
+_AB_LANES = [
+    pytest.param("dais", id="laneA-dais"),
+    pytest.param("orca", id="laneB-orca"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane_kind", _AB_LANES)
+async def test_ab_lane_final_conformance(lane_kind):
+    """VO-009②③: lane-factory parameterized A/B conformance."""
+    # 验收③ — per-lane probes fail → deterministic skip with a reason.
+    # dais carries the head's messaging plane AND the unified final
+    # channel for BOTH lanes, so it is probed first in either param.
+    dais = DaisLane(default_timeout_s=10)
+    if not await _bus_healthy(dais):
+        pytest.skip("车道A dais 编排面不可用（重启窗口期；统一终稿链依赖 dais）")
+    orca = OrcaLane(default_timeout_s=90)
+    if lane_kind == "orca" and not await _orca_plane_up(orca):
+        pytest.skip("车道B orca-ide 宿主不可用（app/runtime 不可达）")
+
+    finals: list[tuple[str, str]] = []
+
+    async def on_final(ref, message):
+        finals.append((ref, message))
+
+    backend = DshBackend(lane=dais, orchestrator_handle=ORCH, head_handle=HEAD_B,
+                         on_final=on_final, poll_s=0.5,
+                         await_timeout_s=ORCA_WORKER_BUDGET_S + 120)
+    receipt = json.loads(await backend.dispatch(_AB_INTENT))
+    assert receipt["status"] == "accepted"
+    assert receipt["run_id"].startswith("run_")
+    assert receipt["ref"].startswith("vh-")
+    assert receipt["credentials"][0].startswith("【凭证")
+
+    # unified intake: the intent must sit in the orchestrator mailbox
+    row = None
+    deadline = time.monotonic() + 25
+    while row is None and time.monotonic() < deadline:
+        for candidate in await dais.check_messages(ORCH):
+            if f"[ref:{receipt['ref']}]" in candidate.get("body", ""):
+                row = candidate
+        if row is None:
+            await asyncio.sleep(0.3)
+    assert row is not None, "intent never reached the orchestrator mailbox"
+    assert _AB_INTENT in row.get("body", "")
+
+    if lane_kind == "dais":
+        # 车道A executes on the dais lane (orchestrator role) — the
+        # deterministic conformance body.
+        worker_final = _AB_BODY
+    else:
+        # 车道B executes in a REAL orca worktree; the manager relays the
+        # worker final into the same dais mailbox chain (不分会道).
+        suffix = uuid.uuid4().hex[:6]
+        prompt = (
+            "对拍任务：请立即用 Write 工具把下面这一行逐字写入当前工作目录"
+            "的 final.txt 文件（文件内容必须恰好是这一行，不加任何其他文字），"
+            "写完即完成，无需其他回复：\n" + _AB_BODY
+        )
+        async with _orca_worker(orca, f"vo009-ab-{suffix}", prompt,
+                                _AB_BODY) as (_, _, worker_final):
+            assert worker_final == _AB_BODY
+
+    # unified final channel: orchestrator → head over the dais mailbox
+    await asyncio.sleep(0.5)  # bus-lock gap (cross-process discipline)
+    await dais.send_reply(receipt["run_id"], ORCH, HEAD_B,
+                          worker_final, receipt["ref"])
+
+    for _ in range(200):  # bounded head phase-2 poll (≤40s)
+        if finals:
+            break
+        await asyncio.sleep(0.2)
+    assert finals, "head never produced the final through the unified chain"
+    ref, final = finals[0]
+    assert ref == receipt["ref"]
+    assert final == FINAL_PREFIX + _AB_BODY   # 同终稿：前缀 + 同 body
+    assert "【凭证R-CONF-AB-8899】" in final  # 凭证一致（逐字）
