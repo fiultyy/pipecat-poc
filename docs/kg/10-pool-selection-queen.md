@@ -55,3 +55,14 @@ OF-012（池选型 spawn）──→ OF-013（queen+grill+export）
 - 不做 queen 自动派生（必须用户 grill 在环——半自动收敛，人是终审）
 - 不做池 profile 反向同步进 dsh preset（单向：池→dsh 导出；dsh preset 改动不回流池）
 - 不做多 queen 协商派生（单 queen 会话内闭环）
+
+## 5. 收口（2026-08-24，波次完成）
+
+**OF-012 + OF-013 全验收过。** 实施域 = ~/tools/maestro-preset（orca repo 0cb50bd7，9a8b=maestro 现场集成者，双级指挥见其 AGENTS.md）。
+
+- **票链**：T1 pool/spawn `5315bcc` → T2 queen/grill `8b8bca2` → T3 pool/export `c4991f1` → 两 live 揭露接缝修复 `db81d50`/`2192930`（queen role 接缝 + agent_role 承重落盘，VO-002 遗留缺口关闭）→ 总报告 HEAD `ac9877c`（未 push）
+- **门**：selftest 42/42 ×2 + queen pytest 18/18 ×2（timeout 壳；parent 独立复跑核对）
+- **live E2E 证据链**（低负载窗口）：queen grill 5/18 维作答 → 三门 → 入池 v1（lineage `derived-by:queen, parent:queen-smoke` 实读）→ pool/export → roster 即刻见 → **session.create{agentPreset} 真起会话且 persona 应答与 grill 答案一致**；binding 注入首动作=邮箱核验；fanout×3 mailbox 唯一+fleet 五键；queen 守卫 -32000 两路验证
+- **部署终态**：插件守护 8790 运行中（/tmp/n10/run-plugin.mjs 载体）；GUI roster 新增 `queen-smoke-coder`（导出产物）；agent-card 六 skills 含 pool-spawn/pool-export/profiles-revalidate
+- **回流（parent 域 commit）**：pipecat-poc `199182d`（rt_projector queen+grill+消毒）；`~/.agents/skills/incubation-wizard/` wizard.py+SKILL.md 已同步（skill 目录热加载已现 queen/--derive）；回流后离线门 3+2+5P/1S 绿
+- **遗留**（非阻断）：fanout 中途失败语义（整 RPC 500，部分实例已起）；queen 场景投影对措辞敏感（v1 泄漏"19 维度"/v2 缺底线暗示，v3 过——建议元提示固化底线暗示）；报告全文见 maestro-preset repo docs/reports/N10-final-report.md
