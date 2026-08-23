@@ -2,47 +2,38 @@
 
 > 用途：**任何会话（含编排者被 compact/交接后的继任者）两跳重建全部态势**。
 > 恢复协议：goal prompt → 本文件（一屏态势）→ 按需读指向文档（全文细节）。
-> 更新纪律：每条线状态变化（合并/打回/到期/新派）**当回合**更新本文件对应行。
+> **状态：VO 波次已收口（12/12 ☑，2026-08-24 00:4x，终态提交 `b93f936`）**。本文件转为终态存档；新波次（W6 余量 OF-004/009 tests 面）另起索引。
 
-## 1. 活跃线（heartbeat 视角）
+## 1. 终态快照（收口态）
 
-| 线 | 状态 | 下一个事件 | 完成时动作 |
-|---|---|---|---|
-| **VO-012** 收口 dogfood | **已派发**（term_0e694d5c，23:4x；末票。晚峰策略=离线全量先行+live 择低载窗补跑，壳 1500） | VO-012-report.md 落地 → relay 唤醒 | 门禁→merge→☑→12/12 终态 |
-| ~~VO-007~~ | **☑ 已合并 `8845164`**（低载窗 4/4 全绿+晚峰敏感 E 节钉死；离线回归 84P 复验；当前文件完整 live 复验=VO-012 天然承载） | — | — |
-| ~~W6 规划+执行~~ | 方案合入 `b51bf05`/`cb45e85`；**执行波 8/10 ☑**（OF-001/2/3/5/6/7/8/10，maestro 域 2f220c4..4652658；OF-004/009 按计划持有）；记账入 `44c5e02` | — | — |
-| **relay <seat>** 第三期 | **23:48 re-arm**（第二期 40/40 到期按设计自灭；第三期看守 VO-012 报告+merge，30 轮预算） | VO-012 报告/merge 回投；30 轮到期 | 到期若 VO-012 未完 → re-arm |
+| 线 | 终态 |
+|---|---|
+| **VO-012** M5 收口 dogfood | **☑ `b93f936`**（dogfood 全链 494s 双 WITNESS：supervisor <seat> 真孵化→F4/F6→A/B 双车道真执行→F10 FINAL_PREFIX+凭证逐字→播报；信封 v2 parity 断言由编排者修为 OG5 子集语义；门禁=连续 2×156P+1S 全绿 + live 2P） |
+| **VO-007** | ☑ `8845164`（低载窗 4/4 全绿+晚峰敏感 E 节钉死；VO-012 dogfood 已晚峰复验 447.9s 绿——实例锁+防挂死体系见效） |
+| **W6 加固** | 方案 `b51bf05`/`cb45e85`；**执行波 8/10 ☑**（OF-001/2/3/5/6/7/8/10，maestro 域 2f220c4..4652658）；OF-004 ◐中期持有、OF-009 tests 面 ◐待窗口；记账 `44c5e02` |
+| **relay <seat>** 第三期 | 值守中（收口后无新事件将自然到期自灭；无需 re-arm） |
+| 票板 | **VO 12/12 ☑**（docs/tickets.md）· 门禁口径 `timeout 1500 壳`（VO-012 E 节教训） |
 
-> 最近核实：23:45（VO-007 ☑ 11/12 / VO-012 已派 / W6 8/10 执行波记账完成）。maestro-bridge skill 描述已含 session-send 直投+steer 两段式=OF-003 落地痕迹。下轮 goal 先重新核实再动作。
-
-> 最近核实：22:31（W6 合入 b51bf05 / VO-007 整改落地待重跑 / dais 新实例健康 / relay 22 轮）。注意：e858 INDEX N9 与我编辑撞车过一次（它先落），多主并发写共享文件需 OF-001 msgid+OF-005 数据化的又一个实录。下轮 goal 先重新核实再动作。
-
-## 2. 票板快照
-
-VO 10/12 ☑（001-006,008,009,010,011）。余：**007 在飞、012 待派**。
-门禁口径：`timeout 900 .venv/bin/python -m pytest tests/test_rt_*.py tests/test_live_v5_v6.py -q`（live 串行防邮箱互踩）。
-
-## 3. 文档库地图（全文在哪）
+## 2. 交付物地图（文档库）
 
 | 要什么 | 读哪 |
 |---|---|
-| 缺陷台账 17 条（D-01..15） | `docs/kg/08-defects-ledger.md` |
-| W6 加固规划（待 e858 产出） | `docs/kg/09-orch-hardening-plan.md`（暂缺） |
-| W6 使命书（主题A/B 全文） | `docs/kg/evidence/handoff-w6-hardening.md` |
+| 全票执行报告 | `docs/kg/evidence/VO-001..012-report.md`（12 份） |
+| 缺陷台账（17 条含修复态） | `docs/kg/08-defects-ledger.md` |
+| W6 加固方案+执行态 | `docs/kg/09-orch-hardening-plan.md` |
+| 过程台账（round 1-17） | `docs/kg/evidence/ledger-carryover-round6.md` |
 | 票面/验收/派发协议 | `docs/tickets.md` · `docs/plans/impl-specs.md` · `docs/plans/dispatch-plan.md` |
-| 过程台账（事故实录） | `docs/kg/evidence/ledger-carryover-round6.md`（cp 01-16） |
-| 各票执行报告 | `docs/kg/evidence/VO-XXX-report.md` |
-| relay 使命 | `/tmp/vo-relay-brief2.txt`（第二期）；fleet.json code=<seat> |
+| 编排经验（relay 模式/门禁纪律/晚峰预算） | 本文件 §4-5 + VO-007/012 报告 E 节 |
 
-## 4. 回程与唤醒通道（唯一权威）
+## 3. 回程与唤醒通道（唯一权威，收口后仍有效）
 
-- 任何 agent → 编排者：`~/.dsh/maestro/bin/session-send <code> session-<id> done <ref> '<body>'`（DSHMSG 直投回合队列=推唤醒；**勿用 cb-send**，落文件桥不可达）
-- 编排者 → 任何 agent：session-send `<code>` + 完整 mission 简报（自包含，勿引用对话）
+- 任何 agent → 编排者：`~/.dsh/maestro/bin/session-send <code> session-<id> done <ref> '<body>'`（DSHMSG v2 直投=推唤醒；**勿用 cb-send**）
+- 编排者 → 任何 agent：session-send `<code>` + 自包含 mission 简报
 
-## 5. 红线总表（压缩版）
+## 4. 红线总表（压缩版，新波次沿用）
 
-在飞文件勿碰：`tests/test_live_v7.py`、`examples/realtime-provider-poc/live_v5_v6_dsh.py`（VO-007 agent 所有）· 不 push · agent 不 git commit（编排者统一合并）· 不 spawn dais 实例 · live 测试同邮箱域禁止并发实例 · relay <seat> 勿动。
+不 push · agent 不 git commit（编排者统一合并）· 不 spawn dais 实例（实例锁已就位=`~/.local/state/dais/instance.lock`）· live 测试同邮箱域禁并发实例 · 门禁=timeout 壳内全量复跑全绿才合并（≥2 次，防 laneB 类瞬态）· 晚峰（21:30 后）live 链预算 ×1.5 余量。
 
-## 6. 已知陷阱（新会话必读）
+## 5. 已知陷阱（新会话必读）
 
-omp TUI 帧无响应文本（三源监控：`~/.omp/logs` agent_end + git status + 报告落地）· live 轮询预算须 ≥实测 P95×2（D-12）· urllib 回环须剥代理（D-15）· dais 重建必带 `--features orchestration`（D-01，strings 判别）。
+omp TUI 帧无响应文本（三源监控：`~/.omp/logs` agent_end + git status + 报告落地）· live 轮询预算 ≥实测 P95×2（D-12）· urllib 回环剥代理（D-15）· dais 重建必用 `dais-build`（strings 断言，D-01 已解）· TUI 缓冲不保留 verdict（用 agent 状态文件问询，VO-012 先例）· agent auto-compaction 可静默 45min+（R 态 CPU 40% = 在算，非挂死）。
