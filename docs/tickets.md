@@ -88,7 +88,7 @@
 - **量**:中 · **依赖**:VO-008;orca 宿主在线 · **派发**:本仓 code
 - **回报物**:evidence/VO-009-report.md · **done body**:同上格式
 
-### VO-010 孵化向导 skill 壳(W3.4) ☐
+### VO-010 孵化向导 skill 壳(W3.4) ☑
 
 - **目标/方案**:`~/.agents/skills/incubation-wizard/SKILL.md` 引导 dsh agent:场景选型+role 选型→投影→三门报告回显→选孵化目标→incubate;参数 --scenario --name --role --targets --model。
 - **路径**:skill 文件(新)。
