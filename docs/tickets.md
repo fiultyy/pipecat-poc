@@ -7,7 +7,7 @@
 
 ---
 
-### VO-001 Projector 第 17 维 agent_role ☐
+### VO-001 Projector 第 17 维 agent_role ☑
 
 - **目标/方案**:投影器支持角色维度——`rt_projector.py` 增 `ROLE_TEMPLATES`(liaison/manager/worker/supervisor,worker=现行零变化)与 `project(role=)` 参数;`profile_json` 增 `agent_role` 键(可追溯,不进术语面)。liaison/manager 模板条款内容 = KG 06§1.2 表。
 - **路径**:`examples/realtime-provider-poc/rt_projector.py`;`tests/test_rt_projector.py` 扩;`tests/test_projection_live.py` 增 role 冒烟。
@@ -16,7 +16,7 @@
 - **量**:小 · **依赖**:无 · **派发**:本仓 code(纯离线,可立即开工)
 - **回报物**:evidence/VO-001-report.md · **done body**:`<判定>;报告:evidence/VO-001-report.md;测试:<N>项全绿;备注:<≤40字>`
 
-### VO-002 incubate 扩参 + dsh-liaison/dsh-manager 孵化目标 ☐
+### VO-002 incubate 扩参 + dsh-liaison/dsh-manager 孵化目标 ☑
 
 - **目标/方案**:孵化池 incubate RPC 增 `role/project/mailbox` 参数(缺省=现行语义,向后兼容);targets 新合法值 `dsh-liaison`/`dsh-manager`(复用 incubateDsh,注入体=role doctrine 段+agentsMd,fleet 扩展登记)。
 - **路径**:`~/.dsh/plugins/a2a-profile-server/http-server.js`(incubate 分支)、`incubators/real.js`(incubateDsh);`selftest.mjs` 扩。
@@ -70,7 +70,7 @@
 - **量**:中–大 · **依赖**:VO-006;dais 在线 · **派发**:本仓 code + dsh 会话
 - **回报物**:evidence/VO-007-report.md · **done body**:同上格式
 
-### VO-008 OrcaLane 封装 + 单测(车道B B.1–B.2) ☐
+### VO-008 OrcaLane 封装 + 单测(车道B B.1–B.2) ☑
 
 - **目标/方案**:`rt_orca_lane.py` 全方法(status/spawn_worktree/terminal_list/read/wait/send/interrupt/stop/worktree_ps);全 --json;BIN 硬编码 `orca-ide`(**R1:严禁裸 orca**);全方法有界超时。开工首步 `orca-ide skills get orca-cli` 钉死 read 增量游标。
 - **路径**:`examples/realtime-provider-poc/rt_orca_lane.py`(新);`tests/test_rt_orca_lane.py`(新)。
@@ -97,7 +97,7 @@
 - **量**:小 · **依赖**:VO-002(**可并行**) · **派发**:dsh agent(skill)
 - **回报物**:evidence/VO-010-report.md · **done body**:同上格式
 
-### VO-011 rt_gateway 本地网关(M4) ☐
+### VO-011 rt_gateway 本地网关(M4) ☑
 
 - **目标/方案**:三路复用帧协议(control/media/event)+WsSession+TailReader+静态页(mic/播放/三级树/gate 弹层);EventBus 订阅转 event 帧;断线续接(take_tail 重播种);局域网安全基线。frp 已移出架构(Q1 关闭),仅本地。
 - **路径**:`examples/realtime-provider-poc/rt_gateway.py`(新);`tests/test_rt_gateway.py`(新);静态页。
