@@ -114,6 +114,6 @@ W5.1 扩展（N6§1.4）：ctx 增 `{role, project, mailbox}`；注入体 = role
 | W2.3 三孵化器 | dsh/omp/claude 真实孵化 | ✅ 冒烟 3/3（`tests/test_incubators_real.py`） |
 | W2.4 执行桥 | task→dais 总线往返 | ✅ `tests/test_rt_conformance.py` live 对拍 |
 | W2.5 跨语言一致 | A2aClient ↔ 插件 | ✅ `tests/test_rt_a2a_client.py` 5/5 |
-| W3.4 向导 skill 壳 | 引导 dsh agent：场景(+role)选型→投影→三门→选目标→incubate | ⬜ 待建（`〔new:~/.agents/skills/incubation-wizard/SKILL.md〕`） |
-| W5.1b/c 扩展 | incubate 扩参 + registry/reattach + 生命周期 | ⬜ N6§5 序列 |
-| W5.2 路由器 | agents/registry · agents/send · agents/inbox + journal | ⬜ N6§2.4/§5 |
+| W3.4 向导 skill 壳 | 引导 dsh agent：场景(+role)选型→投影→三门→选目标→incubate | ✅ VO-010（`〔loc:~/.agents/skills/incubation-wizard/SKILL.md〕`+wizard.py；双链冒烟绿） |
+| W5.1b/c 扩展 | incubate 扩参 + registry/reattach + 生命周期 | ✅ VO-002（扩参+selftest）/ VO-003（registry.js，5 测） |
+| W5.2 路由器 | agents/registry · agents/send · agents/inbox + journal | ✅ VO-004（6 测；live V7 F6 推唤醒实用） |

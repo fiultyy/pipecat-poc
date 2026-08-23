@@ -1,4 +1,4 @@
-# N7 · 车道B · orca ADE：OrcaLane 封装（方法级，设计态）
+# N7 · 车道B · orca ADE：OrcaLane 封装（方法级，建成：VO-008 全方法 + VO-009 live+A/B 对拍）
 
 > 上游：`docs/plans/voice-orchestration-head-plan.md§4`（v2）· 索引：[00-INDEX.md](00-INDEX.md)
 > 状态：**设计态**——命令面 2026-08-23 实测探明（`--help` 逐命令），类未实现；开工首步 `orca-ide skills get orca-cli` 拉版本匹配指南后钉死细节。
@@ -8,7 +8,7 @@
 
 ```
 manager（N6§4）/ 编排 skill（orchestration / orca-cli）
-   └─ OrcaLane〔new:examples/realtime-provider-poc/rt_orca_lane.py〕──subprocess──▶ orca-ide CLI
+   └─ OrcaLane〔loc:examples/realtime-provider-poc/rt_orca_lane.py:41→OrcaLane〕──subprocess──▶ orca-ide CLI
         ├─ spawn：worktree create --agent --prompt（工作树级交付）
         ├─ 监控：terminal read / wait --for exit|tui-idle（有界）
         ├─ 干预：terminal send --text/--enter/--interrupt
@@ -18,7 +18,7 @@ manager（N6§4）/ 编排 skill（orchestration / orca-cli）
 
 ## 1. OrcaLane 类设计
 
-`〔new:examples/realtime-provider-poc/rt_orca_lane.py→class OrcaLane〕`
+`〔loc:examples/realtime-provider-poc/rt_orca_lane.py:41→class OrcaLane〕`（✅ VO-008 建成，25 测；live 冒烟+A/B 对拍=VO-009）
 
 ```python
 class OrcaLane:
@@ -87,8 +87,9 @@ class OrcaLane:
 
 | 步 | 交付 | 验证 | 完成判定 |
 |---|---|---|---|
-| B.1 | `orca-ide skills get orca-cli` 拉指南 + read 增量语义钉死 | 探针记录入 evidence | 命令面与 §1 表一致或修订表 |
-| B.2 | OrcaLane 全方法（status/spawn/read/wait/send/ps） | `tests/test_rt_orca_lane.py`（new；mock CLI --json 输出） | 语义映射表全覆盖 |
-| B.3 | live 冒烟：真 spawn 1 worktree（codex/claude）→ wait → read | live 用例（host 掉线则 skip，对齐 `_dais_plane_up` 模式） | 全程有界超时无裸等 |
-| B.4 | A/B conformance 对拍 | 扩 `tests/test_rt_conformance.py`（lane 工厂参数化） | 双车道同终稿 |
-| B.5 | 分派策略落 manager 模板（N6§1.2） | 随 W5.4 V7 | 车道选择断言入 V7 |
+| B.1 | `orca-ide skills get orca-cli` 拉指南 + read 增量语义钉死 | ✅ round 8-9 探针（KG 07 建文即果） | 命令面与 §1 表一致或修订表 ✅ |
+| B.2 | OrcaLane 全方法（status/spawn/read/wait/send/ps） | ✅ VO-008 `tests/test_rt_orca_lane.py` 25 测（mock CLI --json 输出） | 语义映射表全覆盖 ✅ |
+| B.3 | live 冒烟：真 spawn 1 worktree（codex/claude）→ wait → read | ✅ VO-009 `test_live_lane_b_smoke`（文件产物契约 13.5-27s；host 掉线确定性 skip） | 全程有界超时无裸等 ✅ |
+| B.4 | A/B conformance 对拍 | ✅ VO-009 扩 `tests/test_rt_conformance.py`（lane 工厂参数化） | 双车道同终稿（统一 dais 邮箱链回传）✅ |
+| B.5 | 分派策略落 manager 模板（N6§1.2） | ✅ VO-007 manager appendix 第 3 条（车道选择断言入 V7 六步） | 车道选择断言入 V7 ✅ |
+

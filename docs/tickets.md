@@ -106,7 +106,7 @@
 - **量**:中–大 · **依赖**:无(**独立可并行**;EventBus 已建成) · **派发**:本仓 code
 - **回报物**:evidence/VO-011-report.md · **done body**:同上格式
 
-### VO-012 M5 收口 dogfood ☐
+### VO-012 M5 收口 dogfood ☑
 
 - **目标/方案**:全量回归+自举闭环:向导自举"监督员"profile→对接 agent 编排一次真实 A/B 双车道 fan-out;文档终态(KG 全 loc 化、账本收口)。
 - **验证目标**(VO-012 ①–③):①全量绿(含 V7/车道B/网关用例) ②dogfood 全链一次 ③文档终态。

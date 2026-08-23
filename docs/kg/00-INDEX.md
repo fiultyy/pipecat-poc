@@ -50,14 +50,14 @@ N5 ←全部（schema/凭据/测试的单一事实源）
 
 | 符号 | loc |
 |---|---|
-| `Orchestrator.dispatch_intent` / `.history` | `〔loc:examples/realtime-provider-poc/rt_orchestrator.py:191/:189→Orchestrator〕` |
+| `Orchestrator.dispatch_intent` / `.history` | `〔loc:examples/realtime-provider-poc/rt_orchestrator.py:191/:178→Orchestrator〕` |
 | `FINAL_PREFIX` / `make_credential`/`extract_credentials` | `〔loc:...rt_orchestrator.py:48/:61/:66〕` |
 | `HEAD_TOOLS_DOCTRINE` / `head_tools()` | `〔loc:...rt_orchestrator.py:213/:246〕` |
 | **DshBackend**（lane_mode:68 / orchestrator_handle:70 / head_handle:71） | `〔loc:...rt_dsh_backend.py:45→DshBackend；dispatch:80/_fanout:100/_phase2:134/query_status:179/cancel:198〕` |
 | **DaisLane**（单飞锁:47/:54） | `〔loc:...rt_dsh_lane.py:32→DaisLane；create_run:87/create_task:95/start_worker:106/send_intent:119/send_reply:134/check_messages:146/await_done:168/check_status:217/read_worker:225/fail_dispatch:254/resolve_gate:262〕` |
 | **dsh_head_tools / DSH_TOOLS_DOCTRINE** | `〔loc:...rt_head_tools.py:74/:24〕` |
 | **A2aClient**（send:57/get:68/cancel:76/await_done:83/incubate:100） | `〔loc:...rt_a2a_client.py:34→A2aClient〕` |
-| **Projector**（SOURCES:27/build_prompt:99/_call_glm:122/project:159） | `〔loc:...rt_projector.py:63→Projector〕` |
+| **Projector**（SOURCES:33/build_prompt:131/_call_glm:154/project:191） | `〔loc:...rt_projector.py:95→Projector〕` |
 | live V5/V6（bus_healthy:118/orchestrator_player:126/main:158） | `〔loc:...live_v5_v6_dsh.py〕` |
 | `TranscriptState`（含 `take_tail:97`） | `〔loc:examples/realtime-provider-poc/rt_transcript.py:42〕` |
 | `run_with_reconnect` / `ReconnectState` | `〔loc:examples/realtime-provider-poc/rt_reconnect.py:71/:39→run_with_reconnect/ReconnectState〕` |
@@ -72,7 +72,7 @@ N5 ←全部（schema/凭据/测试的单一事实源）
 | 派发一体化 `dispatch-ticket` | `〔loc:~/.dsh/maestro/bin/dispatch-ticket:2→usage 文档串〕`（读票→组契约→terminal send→ledger 落账；`ORCA_CLI_COMMAND` 默认 `orca-ide`） |
 | 回调投递 `cb-send` | `〔loc:~/.dsh/maestro/bin/cb-send:2→usage cb-send <type> <from> <to> <ref> <body>〕`（信封单行 JSON `{"type","from","to","body"}`，ref 折进 body 前缀 `[ref:<ref>] `） |
 | 会话孵化 `session-spawn` | `〔loc:~/.dsh/maestro/bin/session-spawn:2→usage session-spawn <preset> <node> <purpose>〕`（session.create {workspaceId, agentPreset}；DSH_PORT 3080；rename `ORCH/<node>-<code>·<preset>·<purpose>(active)`；fleet.json 原子登记） |
-| **跨会话直发 `session-send`**（W5.2 推送模式底座） | `〔loc:~/.dsh/maestro/bin/session-send:4→usage session-send <from> <to> <type> <ref> <body>；:6→type: ping|pong|done|ask|steer|nack|ack；:10→信封 DSHMSG]{from,to,type,ref,body}；:13→env DSH_PORT/MAESTRO_FLEET；:22→resolve(key,fleet)〕`（loopback session.prompt 注入） |
+| **跨会话直发 `session-send`**（W5.2 推送模式底座） | `〔loc:~/.dsh/maestro/bin/session-send:4→usage session-send [--msgid <id>] <from> <to> <type> <ref> <body>；:6→type: ping|pong|done|ask|steer|nack|ack；:11→信封 v2(OF-001) DSHMSG]{from,to,type,ref,body,msgid,ts}（OG5 老键只增不改）；:21→env DSH_PORT/MAESTRO_FLEET；:32→resolve(key,fleet)〕`（loopback session.prompt 注入；steer 闸 OF-002 属主租约） |
 | 账本 `ledger` | `〔loc:~/.dsh/maestro/bin/ledger:2→usage ledger node/event/review/status/project〕`（DB=`~/.dsh/maestro/ledger.db`） |
 | gen3 七步闭环 | `〔doc:~/.dsh/maestro/orch-loop.md§全链七步〕` |
 | 插件激活骨架 | `〔loc:~/.dsh/plugins/host-callback-bridge/index.js:205→apply(ctx)〕`、`〔loc:...index.js:109→activate(options)〕` |

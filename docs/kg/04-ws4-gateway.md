@@ -10,7 +10,7 @@
 局域网浏览器（mic→AudioWorklet→PCM16/16k）
     │ WebSocket ws://<host>:8765（同一连接三路复用）
     ▼
-VoiceGateway（〔new:examples/realtime-provider-poc/rt_gateway.py〕 单进程）
+VoiceGateway（〔loc:examples/realtime-provider-poc/rt_gateway.py:488→VoiceGateway / :102→WsSession / :433→TailReader〕 单进程；✅ VO-011）
   ├─ WsSession（每连接一个；帧协议 §1）
   ├─ HeadPipeline（复用 T6 形制：providers 工厂 + head + 工具四件套）
   │    └─ DshBackend（N1）──EventBus──▶ WsSession.event_sink（orch.* 汇总下发）
@@ -33,7 +33,7 @@ VoiceGateway（〔new:examples/realtime-provider-poc/rt_gateway.py〕 单进程�
 
 ## 2. VoiceGateway 类设计
 
-`〔new:examples/realtime-provider-poc/rt_gateway.py〕`
+`〔loc:examples/realtime-provider-poc/rt_gateway.py:488→VoiceGateway〕`（✅ VO-011 建成，`tests/test_rt_gateway.py` 24 测）
 
 ```python
 class VoiceGateway:

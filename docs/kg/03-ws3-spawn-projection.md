@@ -8,7 +8,7 @@
 
 ```
 scenario（自然语言）+ role（W5.1：liaison/manager/worker/supervisor）
-  └─ Projector.project()              〔loc:examples/realtime-provider-poc/rt_projector.py:159〕
+  └─ Projector.project()              〔loc:examples/realtime-provider-poc/rt_projector.py:191〕
        ├─ Phase A 采集（answers 可选注入）
        ├─ Phase B 投影：spawnAgentPrompt 模板 + 内核 references → GLM（zhipu.env）
        ├─ 三道质量门（gate1/2/3）      〔loc:examples/realtime-provider-poc/rt_projection_gates.py〕
@@ -51,7 +51,7 @@ class Projector:
     async def project(self, scenario, *, answers=None) -> Projection: ...               # :159
 ```
 
-**W5.1 扩展签名**（`〔new:...rt_projector.py→ROLE_TEMPLATES/project(role=)〕`，方法级见 N6§1.1）：
+**W5.1 扩展签名**（✅ VO-001 落地：`〔loc:...rt_projector.py:60→ROLE_TEMPLATES / :191→project(role=)〕`，方法级见 N6§1.1）：
 
 ```python
 async def project(self, scenario: str, *, answers=None, role: str = "worker") -> Projection:
@@ -61,7 +61,7 @@ async def project(self, scenario: str, *, answers=None, role: str = "worker") ->
 
 ## 2. GLM 调用契约（建成态）
 
-`build_prompt`（:99）产出 system=模板全文（含铁律）+ user=`<scenario>` + 先验 + 澄清问答；`_call_glm`（:122）temperature=0 结构化输出；`_parse`（:135）剥围栏后 `json.loads`，失败重试 1 次（升温 0.2），再失败抛 `ProjectionError`（:50）。两条铁律原样随行（`〔doc:spawnAgentPrompt.md§1:24〕`）：**框架术语零暴露；灾难底线恒 CAN NOT**——agent 间协议产物同样过门。
+`build_prompt`（:131）产出 system=模板全文（含铁律）+ user=`<scenario>` + 先验 + 澄清问答；`_call_glm`（:154）temperature=0 结构化输出；`_parse` 剥围栏后 `json.loads`，失败重试 1 次（升温 0.2），再失败抛 `ProjectionError`。两条铁律原样随行（`〔doc:spawnAgentPrompt.md§1:24〕`）：**框架术语零暴露；灾难底线恒 CAN NOT**——agent 间协议产物同样过门。
 
 ## 3. 三道质量门（建成态）
 
@@ -79,11 +79,11 @@ def gate3_completeness(p, md) -> list[str] # 对照 BEHAVIOR-SPACE §五检查�
 def run_gates(p) -> GateReport            # 三门串联；fail → 升温重投影（≤2）→ 人审队列
 ```
 
-三门同时挂在 N2 `incubate` RPC 前置（`gatesFn`，`〔loc:~/.dsh/plugins/a2a-profile-server/http-server.js:106-109〕`）——W5.1 role 模板产物照常过门。
+三门同时挂在 N2 `incubate` RPC 前置（`gatesFn`，`〔loc:~/.dsh/plugins/a2a-profile-server/http-server.js:306-307→gatesFn 调用；:248→createHttpServer 签名〕`）——W5.1 role 模板产物照常过门。
 
 ## 4. dsh skill 入口（人/编排 agent 面）
 
-- 向导 skill（W3.4，待建）`〔new:~/.agents/skills/incubation-wizard/SKILL.md〕`：引导 dsh agent 走"**场景选型 + role 选型** → 投影 → 三门报告随产物回显 → 选孵化目标（dsh/dsh-liaison/dsh-manager/omp/claude）→ incubate"；参数 `--scenario --name --role --targets --model`；
+- 向导 skill（W3.4，已建成 VO-010）`〔loc:~/.agents/skills/incubation-wizard/SKILL.md〕` + `〔loc:...wizard.py→六步链路驱动〕`：引导 dsh agent 走"**场景选型 + role 选型** → 投影 → 三门报告随产物回显 → 选孵化目标（dsh/dsh-liaison/dsh-manager/omp/claude）→ incubate"；参数 `--scenario --name --role --targets --model`；
 - head 语音路径：N2 `incubate` RPC（A2aClient.incubate :100）。
 
 ## 5. 数据流契约（与 N2 的接口）
@@ -102,5 +102,5 @@ def run_gates(p) -> GateReport            # 三门串联；fail → 升温重投
 | W3.1 Projector 骨架 | SOURCES 六文件 + check_sources | ✅ `tests/test_rt_projector.py` |
 | W3.2 GLM 流水线 | build_prompt/_call_glm/_parse + 重试 | ✅ 同上 + `tests/test_projection_live.py`（真 GLM 冒烟过三门） |
 | W3.3 三门 | gate1/2/3 正反例 | ✅ 22/22（projector+gates 合计） |
-| W3.4 向导 skill | 场景+role 选型→…→incubate | ⬜ 待建（M3+；dogfood 于 M5） |
-| W5.1a 第 17 维 | ROLE_TEMPLATES + project(role=) | ⬜ N6§5（liaison/manager 模板过三门为完成判定） |
+| W3.4 向导 skill | 场景+role 选型→…→incubate | ✅ VO-010（skill 壳+双链冒烟；M5 dogfood 实用=VO-012） |
+| W5.1a 第 17 维 | ROLE_TEMPLATES + project(role=) | ✅ VO-001（35 测绿；`ROLE_TEMPLATES`〔loc:...rt_projector.py:60〕） |

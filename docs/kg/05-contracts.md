@@ -10,16 +10,16 @@
 | DaisLane | `examples/realtime-provider-poc/rt_dsh_lane.py:32` | N1 | ✅ 建成 |
 | dsh_head_tools / DSH_TOOLS_DOCTRINE | `examples/realtime-provider-poc/rt_head_tools.py:74/:24` | N1 | ✅ 建成 |
 | A2aClient | `examples/realtime-provider-poc/rt_a2a_client.py:34` | N1/N2 | ✅ 建成 |
-| Projector / gates | `examples/realtime-provider-poc/rt_projector.py:63` / `rt_projection_gates.py:44` | N3 | ✅ 建成（W5.1 扩 role） |
+| Projector / gates | `examples/realtime-provider-poc/rt_projector.py:95` / `rt_projection_gates.py:44` | N3 | ✅ 建成（W5.1 扩 role ✅ VO-001） |
 | live V5/V6（替身=liaison 协议验证） | `examples/realtime-provider-poc/live_v5_v6_dsh.py:126→orchestrator_player` | N1/N6 | ✅ 建成 |
-| a2a-profile-server 插件（六 RPC + ProfileStore + 三孵化器 + 执行桥） | `~/.dsh/plugins/a2a-profile-server/`（`http-server.js:66` 等） | N2 | ✅ 主体（向导 skill 待建） |
-| EventBus（emit/subscribe，N1 埋点已用） | `examples/realtime-provider-poc/rt_event_bus.py:20→EventBus（subscribe:26/emit:42）` | N1/N4 | ✅ 建成（N4 网关订阅侧待 M4） |
-| VoiceGateway / WsSession / TailReader | `〔new:examples/realtime-provider-poc/rt_gateway.py〕` | N4 | ⬜ M4 |
-| OrcaLane（车道B 入口） | `〔new:examples/realtime-provider-poc/rt_orca_lane.py→OrcaLane〕` | N7 | ⬜ 方法级已定（N7，命令面已实测探明） |
-| ROLE_TEMPLATES / project(role=) | `〔new:...rt_projector.py→ROLE_TEMPLATES〕` | N3/N6 | ⬜ W5.1a |
-| registry（fleet 扩展/reattach/生命周期） | `〔new:~/.dsh/plugins/a2a-profile-server/registry.js〕` | N6 | ⬜ W5.1c |
-| router 三 RPC + journal | `〔new:~/.dsh/plugins/a2a-profile-server/http-server.js→agents/* 分支〕` | N6 | ⬜ W5.2a |
-| 向导 skill 壳 | `〔new:~/.agents/skills/incubation-wizard/SKILL.md〕` | N2/N3 | ⬜ W3.4 |
+| a2a-profile-server 插件（六 RPC + ProfileStore + 三孵化器 + 执行桥） | `~/.dsh/plugins/a2a-profile-server/`（`http-server.js:66` 等） | N2 | ✅ 主体（向导 skill ✅ VO-010） |
+| EventBus（emit/subscribe，N1 埋点已用） | `examples/realtime-provider-poc/rt_event_bus.py:20→EventBus（subscribe:26/emit:42）` | N1/N4 | ✅ 建成（N4 网关订阅侧 ✅ VO-011） |
+| VoiceGateway / WsSession / TailReader | `examples/realtime-provider-poc/rt_gateway.py:488→VoiceGateway / :102→WsSession / :433→TailReader` | N4 | ✅ VO-011（24 测） |
+| OrcaLane（车道B 入口） | `examples/realtime-provider-poc/rt_orca_lane.py:41→OrcaLane` | N7 | ✅ VO-008（25 测；live VO-009） |
+| ROLE_TEMPLATES / project(role=) | `examples/realtime-provider-poc/rt_projector.py:60→ROLE_TEMPLATES / :191→project` | N3/N6 | ✅ VO-001（35 测） |
+| registry（fleet 扩展/reattach/生命周期） | `~/.dsh/plugins/a2a-profile-server/registry.js:45→createRegistry（reattach:125/heartbeat:160）` | N6 | ✅ VO-003（5 测） |
+| router 三 RPC + journal | `~/.dsh/plugins/a2a-profile-server/http-server.js:79→createRouter（agents/* :109-115 面）` | N6 | ✅ VO-004（6 测；live V7 用） |
+| 向导 skill 壳 | `~/.agents/skills/incubation-wizard/SKILL.md` + `wizard.py` | N2/N3 | ✅ VO-010（双链冒烟） |
 
 ## 2. 两阶段应答契约（N1 产出、N4 转发、N6 liaison 沿用——V5/V6 live 验证）
 
@@ -99,11 +99,11 @@ live 序列：V5/V6 ✅ → **V7**（W5.4）→ V8（局域网网关时延基线
 |---|---|---|
 | M0 探针 | N1§5 W1.1 | ✅ 证据 `docs/kg/evidence/m0-probe.md` |
 | M1 WS3 投影 | N3§6 | ✅ 三门 22/22 + 真 GLM 冒烟 |
-| M2 孵化池 | N2§7 | ✅ 主体（selftest 14/14 + 孵化 3/3）；向导 skill ⬜ |
+| M2 孵化池 | N2§7 | ✅ 主体（selftest 14/14 + 孵化 3/3）；向导 skill ✅ VO-010 |
 | M3 车道A | N1§5 | ✅ live V5/V6 + 双路径 conformance（证据 `docs/kg/evidence/m3-live-v5v6.md`） |
-| W5.1–W5.4 | N6§5 | ⬜ 单测 + live V7 + 双模式 conformance |
-| M3+ 车道B | N7§3 | ⬜ OrcaLane + A/B 对拍 + 分派策略（命令面已探明） |
-| M4 本地网关 | N4§5 | ⬜ 帧协议 + 事件汇总 + 局域网基线 |
-| M5 收口 | 全部 | ⬜ dogfood：向导自举"监督员"→ 对接 agent 编排真实 A/B fan-out |
+| W5.1–W5.4 | N6§5 | ✅ VO-001/003/004 单测 + live V7（VO-007 低载全绿）+ 双模式 conformance（VO-005）+ liaison/manager 真身（VO-006/007） |
+| M3+ 车道B | N7§3 | ✅ OrcaLane（VO-008）+ A/B 对拍（VO-009 统一邮箱链同终稿）+ 分派策略（manager 模板落地） |
+| M4 本地网关 | N4§5 | ✅ VO-011 帧协议 24 测 + 事件汇总 + 局域网基线 |
+| M5 收口 | 全部 | ✅ VO-012：全量回归（156P+1F 信封 v2 演进项留 E 节 + live 6P 全绿）+ dogfood（向导自举监督员 6305 → liaison/manager → A/B 双车道 fan-out → 终稿双 WITNESS 逐字）+ 文档终态（KG 全 loc 化归档） |
 
 权威账本：`docs/kg/evidence/ledger-carryover-round6.md`（原长时任务账本服务端损坏，以此文件逐轮更新）。

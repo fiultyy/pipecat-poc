@@ -27,7 +27,7 @@ head ──F4 语义指令([ref:]信封)──▶ dais 邮箱 ──▶ liaison 
 
 ### 1.1 Projector 第 17 维 agent_role
 
-`〔loc:examples/realtime-provider-poc/rt_projector.py:27→SOURCES〕` 增 role 模板源；`〔loc:...rt_projector.py:159→project〕` 签名扩展：
+`〔loc:examples/realtime-provider-poc/rt_projector.py:33→SOURCES〕` 增 role 模板源；`〔loc:...rt_projector.py:191→project〕` 签名扩展：
 
 ```python
 async def project(self, scenario: str, *, answers=None,
@@ -35,7 +35,7 @@ async def project(self, scenario: str, *, answers=None,
     """role ∈ {liaison, manager, worker, supervisor}；worker 走现行 16+3 维流水线不变；
     liaison/manager 追加 role 模板段落（§1.2），三门照常适用——agent 间协议同样术语零暴露。"""
 
-ROLE_TEMPLATES = {                       # 〔new:...rt_projector.py→ROLE_TEMPLATES〕
+ROLE_TEMPLATES = {                       # 〔loc:...rt_projector.py:60→ROLE_TEMPLATES〕（✅ VO-001）
   "liaison":  "<收敛契约 + 两阶段应答协议 + [ref:] 信封规则 + 凭证逐字回显纪律>",
   "manager":  "<域职责 + A/B 车道选择策略 + 子任务拆分与依赖 + worker_done 等待 + 异常上抛>",
   "worker":   "",                        # 现行通用投影，零变化
@@ -95,7 +95,7 @@ export async function incubateDsh(ctx) {
     "spawned_at": 1724... } } }                        // 新增
 ```
 
-**reattach 算法**（插件启动时执行，`〔new:~/.dsh/plugins/a2a-profile-server/registry.js→reattach()〕`）：
+**reattach 算法**（插件启动时执行，✅ VO-003 落地 `〔loc:~/.dsh/plugins/a2a-profile-server/registry.js:125→reattach()〕`）：
 
 ```
 for entry in fleet where role ≠ worker:
@@ -114,7 +114,7 @@ ready ──(首次心跳)──▶ serving ──(retire)──▶ retired
 | 迁移 | 触发 | 实现 |
 |---|---|---|
 | spawn→arm | incubate 完成（§1.4 步骤 2 注入后追加通信契约段） | incubateDsh |
-| arm→ready | 首次心跳：router 经 loopback `session.list` 探活会话（**dsh 会话非常驻轮询者**，不由 agent 自发起） | `〔new:registry.js→heartbeat()〕` |
+| arm→ready | 首次心跳：router 经 loopback `session.list` 探活会话（**dsh 会话非常驻轮询者**，不由 agent 自发起） | `〔loc:...registry.js:160→heartbeat()〕` |
 | ready→serving | router 首次 `agents/send` 投递成功（DSHMSG 注入触发回合） | registry |
 | serving→retire | 显式取消会话 + fleet 标记；**持久 profile 保留可复活**（同 name 重孵化即复活，ProfileStore 版本延续） | registry.retire |
 
@@ -128,19 +128,19 @@ ready ──(首次心跳)──▶ serving ──(retire)──▶ retired
 
 ### 2.2 推送模式：session-send（已存在底座）
 
-`〔loc:~/.dsh/maestro/bin/session-send:10→信封〕`——收方回合首行：
+`〔loc:~/.dsh/maestro/bin/session-send:11→信封 v2(OF-001)〕`——收方回合首行：
 
 ```
-DSHMSG]{"from":"liaison","to":"mgr1","type":"steer","ref":"<node_id>","body":"…"}
+DSHMSG]{"from":"liaison","to":"mgr1","type":"steer","ref":"<node_id>","body":"…","msgid":"<uuid4>","ts":<epoch-ms>}
 ```
 
 | 事实 | 锚点 |
 |---|---|
-| CLI 契约 `session-send <from> <to> <type> <ref> <body>`；from/to 解析 4 位码/sessionId 前缀/全称 | `〔loc:...session-send:4→usage〕`、`〔loc:...session-send:22→resolve(key,fleet)〕` |
-| 信封单行拼接 `'DSHMSG]' + json.dumps(envelope)` | `〔loc:...session-send:47〕` |
-| 注入路径：loopback `POST /api/session.prompt`（mode queue） | `〔loc:...session-send:56-60〕` |
+| CLI 契约 `session-send [--msgid <id>] <from> <to> <type> <ref> <body>`；from/to 解析 4 位码/sessionId 前缀/全称 | `〔loc:...session-send:4→usage〕`、`〔loc:...session-send:32→resolve(key,fleet)〕` |
+| 信封 v2 单行拼接 `'DSHMSG]' + json.dumps(envelope)`，msg/ts 只增不改（OG5；老消费者忽略未知键）；`--msgid` 重发保号 | `〔loc:...session-send:11-14〕` |
+| 注入路径：loopback `POST /api/session.prompt`（mode queue） | `〔loc:...session-send〕`（v2 重写后行号以文件头 :2 模块 docstring 为准） |
 | 类型集 `ping|pong|done|ask|steer|ack|nack` | `〔loc:...session-send:6〕` |
-| env：`DSH_PORT`(3080) / `MAESTRO_FLEET` | `〔loc:...session-send:13〕` |
+| env：`DSH_PORT`(3080) / `MAESTRO_FLEET`；steer 闸（OF-002）属主租约 | `〔loc:...session-send:21〕` |
 
 用途：**唤醒与低时延通知**（收方回合首行可机器解析，不承载正文）。
 
@@ -150,7 +150,7 @@ DSHMSG]{"from":"liaison","to":"mgr1","type":"steer","ref":"<node_id>","body":"�
 
 ### 2.4 路由器三 RPC（挂孵化池插件）
 
-`〔new:~/.dsh/plugins/a2a-profile-server/http-server.js→handleRpc 增三分支〕`（与现行六 RPC 同形制）：
+`〔loc:~/.dsh/plugins/a2a-profile-server/http-server.js:79→createRouter（✅ VO-004 建成；agents/* 面 :109-163）〕`（与现行六 RPC 同形制）：
 
 ```javascript
 agents/registry  params={} → {agents:[{code, sessionId, mailbox, role, project,
@@ -211,10 +211,10 @@ manager 收稳定指令 → 编排 skill 选车道派发 → 车道 done 回信�
 
 | 步 | 交付 | 验证 | 完成判定 |
 |---|---|---|---|
-| W5.1a | Projector 第 17 维 + ROLE_TEMPLATES + `project(role=)` | `tests/test_rt_projector.py` 扩 role 用例 | liaison/manager 模板过三门（术语零暴露） |
-| W5.1b | incubate 扩参 + dsh-liaison/dsh-manager 目标 | `tests/test_incubators_real.py` 扩（mock session-spawn） | receipts 含 sessionId/mailbox/fleet 扩展项 |
-| W5.1c | fleet 元数据 + reattach + 生命周期 | `tests/test_rt_fleet_registry.py`（new） | 孤儿检测单测绿；spawn→retire 状态机全迁移 |
-| W5.2a | router 三 RPC + scope + journal | `tests/test_rt_router.py`（new，mock session-send/dais） | 三 RPC 契约测试绿；跨 project 拒绝 |
-| W5.2b | 推/拉双投递 conformance | 扩 `tests/test_rt_conformance.py` | DSHMSG 推 vs 邮箱拉同结果 |
-| W5.3 | liaison 落位（替身移交） | live：head 对真 liaison 一次 F4→F10 | head 侧代码 diff = 0 |
-| W5.4 | manager 群 + live V7 | `tests/test_live_v7.py`（new） | V7 全链 PASS（§4 场景 6 断言） |
+| W5.1a | Projector 第 17 维 + ROLE_TEMPLATES + `project(role=)` | ✅ VO-001 `tests/test_rt_projector.py` 35 测 | liaison/manager 模板过三门（术语零暴露）✅ |
+| W5.1b | incubate 扩参 + dsh-liaison/dsh-manager 目标 | ✅ VO-002 selftest 扩 | receipts 含 sessionId/mailbox/fleet 扩展项 ✅ |
+| W5.1c | fleet 元数据 + reattach + 生命周期 | ✅ VO-003 `tests/test_rt_fleet_registry.py` 5 测 | 孤儿检测单测绿；spawn→retire 状态机全迁移 ✅ |
+| W5.2a | router 三 RPC + scope + journal | ✅ VO-004 `tests/test_rt_router.py` 6 测 | 三 RPC 契约测试绿；跨 project 拒绝 ✅ |
+| W5.2b | 推/拉双投递 conformance | ✅ VO-005 扩 `tests/test_rt_conformance.py`（live） | DSHMSG 推 vs 邮箱拉同结果 ✅ |
+| W5.3 | liaison 落位（替身移交） | ✅ VO-006 live：head 对真 liaison F4→F10 ×2 | head 侧代码 diff = 0 ✅ |
+| W5.4 | manager 群 + live V7 | ✅ VO-007 `tests/test_live_v7.py`（低载全绿 773s） | V7 全链 PASS（§4 场景 6 断言）✅ |

@@ -13,7 +13,7 @@ head 工具调用（dispatch_intent / query_status / cancel_run / remain_silent�
         ├─ 到达路径① CLI 直达：DaisLane〔loc:...rt_dsh_lane.py:32〕──subprocess──▶ dais orchestration
         ├─ 到达路径② 孵化池执行桥：A2aClient〔loc:...rt_a2a_client.py:34〕──HTTP──▶ a2a-profile-server
         │    └─ executors/dais.js〔loc:~/.dsh/plugins/a2a-profile-server/executors/dais.js:80〕──▶ 同一 dais 总线
-        ├─ OrcaLane（车道B 入口，M3+ 待建）〔new:...rt_orca_lane.py〕──▶ orca-cli
+        ├─ OrcaLane（车道B 入口，已建成）〔loc:...rt_orca_lane.py:41→OrcaLane〕──▶ orca-cli
         └─ EventBus 埋点 ──▶ N4 网关 orch.* 事件（WS4 汇总通道）
 对端：dais 邮箱句柄 = DshBackend.orchestrator_handle:70 —— W5.3 后指向真 liaison（mailbox agent_liaison）
 ```
@@ -108,7 +108,7 @@ class DaisLane:
 1. 收 `status` 消息（body 含 `[ref:]`）→ 判定意图类型（fan-out/查询/取消/闲聊）；
 2. 处理：drain 自身邮箱 → 按 ref 经 `DaisLane.send_reply` 回信；
 3. 两阶段：即时受理回执 `{status:accepted, run_id, ref, credentials}` → 终稿 `FINAL_PREFIX + done body`（凭证内嵌）；
-4. 落位 `〔new:~/.dsh/maestro/flows/voice-head/doctrine.md〕` 或经孵化池注入（N2§5）。
+4. 落位真身（VO-006 起）：经孵化池注入（N2§5 incubate RPC，role=liaison mailbox=agent_liaison；head 侧仅配置值 `orchestrator_handle:70`）。
 
 ## 4. 两阶段应答与打断语义（建成态契约）
 
@@ -130,4 +130,4 @@ class DaisLane:
 | W1.5 双到达路径 | A2aClient 路径 + 执行桥完整版 | ✅ `tests/test_rt_conformance.py` 2 用例（离线状态机 + live A/B 对拍，双路径 final 均 FINAL_PREFIX+同 body） |
 | W1.6 live | `live_v5_v6_dsh.py` 真 GLM head + 真 dais 总线 | ✅ `tests/test_live_v5_v6.py`（V5 六验 / V6 五验；证据 `〔doc:docs/kg/evidence/m3-live-v5v6.md〕`） |
 
-后续：车道B OrcaLane（plan §4）；liaison 真身移交（N6§3）；manager 群与 live V7（N6§4）。
+后续：~~车道B OrcaLane（plan §4）~~ ✅ VO-008/009；~~liaison 真身移交（N6§3）~~ ✅ VO-006；~~manager 群与 live V7（N6§4）~~ ✅ VO-007。M5 收口=VO-012。

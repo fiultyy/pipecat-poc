@@ -670,27 +670,27 @@
       </div>
       <div class="tl-item">
         <h4>M2 · A2A 孵化池插件 <span class="b b-ok">主体完成</span></h4>
-        <p>六 RPC + 版本化持久 list + 三真实孵化器冒烟 3/3；<span class="b b-pend">创建向导 skill 壳（W3.4）待建</span></p>
+        <p>六 RPC + 版本化持久 list + 三真实孵化器冒烟 3/3；创建向导 skill 壳 <span class="b b-ok">✅ VO-010</span>（双链冒烟绿）</p>
       </div>
       <div class="tl-item">
         <h4>M3 · 车道A（dais ADE）全链 <span class="b b-ok">完成</span></h4>
         <p>DaisLane / DshBackend / 工具四件套 / 车道内双路径 conformance / live V5（语音→run→播报）V6（打断+问询+取消）——GLM 文本模式（Q2 定案）；编排会话由测试替身扮演</p>
       </div>
-      <div class="tl-item pend">
-        <h4>W5 · dsh agent 生态（孵化v2 + 内部通信）<span class="b b-pend">规划完成 · 待建</span></h4>
-        <p>W5.1 孵化能力扩展（角色维度 / dsh-liaison / dsh-manager 模板 / fleet 元数据 + reattach / 生命周期）；W5.2 内部通信层（session-send 推送 + dais 邮箱拉取 + 路由器三 RPC + 受控打破隔离）；W5.3 对接 agent 落位（替身协议移交）；W5.4 manager 群；验证 = 单测 + live V7 + 双模式 conformance —— 详见 §4</p>
+      <div class="tl-item">
+        <h4>W5 · dsh agent 生态（孵化v2 + 内部通信）<span class="b b-ok">完成</span></h4>
+        <p>W5.1a-d 第 17 维 ROLE_TEMPLATES（VO-001，35 测）/ incubate 扩参（VO-002）/ registry+reattach（VO-003，5 测）/ router 三 RPC+journal（VO-004，6 测）；W5.2b 推/拉双投递 conformance（VO-005）；W5.3 liaison 真身落位 head 零改动（VO-006）；W5.4 manager 群 + live V7 全链六步（VO-007 低载 773s 全绿）——详见 §4</p>
       </div>
-      <div class="tl-item pend">
-        <h4>M3+ · 架构修正后增量 <span class="b b-pend">待做</span></h4>
-        <p>① 车道B orca ADE：OrcaLane + 与 dais 车道 conformance 对拍 ② 编排器 skill A/B 分派策略（随 W5.4 manager 落地）③ 孵化池创建向导 skill 壳</p>
+      <div class="tl-item">
+        <h4>M3+ · 架构修正后增量 <span class="b b-ok">完成</span></h4>
+        <p>① 车道B orca ADE：OrcaLane 全方法 25 测（VO-008）+ A/B 对拍统一邮箱链同终稿（VO-009）② 分派策略落 manager 模板（VO-007）③ 孵化池创建向导 skill 壳（VO-010）</p>
       </div>
-      <div class="tl-item pend">
-        <h4>M4 · WS4 本地网关 <span class="b b-pend">待做</span></h4>
-        <p>rt_gateway 三路复用帧协议 + orch.* 事件汇总（局域网语音入口；公网穿透已移出架构）</p>
+      <div class="tl-item">
+        <h4>M4 · WS4 本地网关 <span class="b b-ok">完成</span></h4>
+        <p>rt_gateway 三路复用帧协议 + orch.* 事件汇总 + 断线续接 + 局域网基线（VO-011，24 测；公网穿透已移出架构）</p>
       </div>
-      <div class="tl-item pend">
-        <h4>M5 · 收口 <span class="b b-pend">待做</span></h4>
-        <p>全量测试绿 + dogfood：孵化向导自举"监督员"profile → 主对接 agent 编排一次真实 A/B 车道 fan-out</p>
+      <div class="tl-item">
+        <h4>M5 · 收口 <span class="b b-ok">完成（VO-012）</span></h4>
+        <p>全量回归：离线 156P + live 6P 全绿（V5/V6 2P + V7 4P 晚峰全绿；唯一 1F=DSHMSG 信封 v2（OF-001）演进击穿 VO-005 逐字节断言，语义五元组全同，见 VO-012 报告 E 节）；dogfood 全链 494s PASS：孵化向导自举"监督员"（三门过 + 真孵化 dsh-supervisor）→ liaison/manager 真孵化 → 真 GLM head 派发（F4）→ F6 双投递（跨 project grants 首验）→ manager A/B 双车道真派发（A=dais 消息 DAG / B=orca worktree 文件产物契约）→ F10 终稿（FINAL_PREFIX + 凭证 R-M5-1201 + 双 WITNESS 纳秒时间戳逐字 + 监督员码）→ 播报回合；文档终态：KG 00-09 loc 化归档（9 漂移修齐 + 18 new→loc）+ 账本 round 17。证据：docs/kg/evidence/VO-012-report.md</p>
       </div>
     </div>
   </div>

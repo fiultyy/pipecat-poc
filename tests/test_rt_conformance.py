@@ -330,8 +330,14 @@ async def test_dual_delivery_parity(tmp_path):
                                {"sessionId": session_id, "maxMessages": 10}).get("events", [])
             push_line = next((t for t in _dshmsg_lines(events) if f'"{ref}"' in t), None)
         assert push_line is not None, "pushed DSHMSG never reached recipient history"
-        assert push_line == line, f"push wire line drifted:\n{push_line!r}\n{line!r}"
-        push_tuple = json.loads(push_line[len(DSHMSG):])  # first line machine-parseable
+        # OG5 semantics: envelope keys are append-only (msgid/ts added by v2 senders);
+        # assert the five-tuple subset plus DSHMSG framing instead of byte equality.
+        pushed_env = json.loads(push_line[len(DSHMSG):])
+        assert all(pushed_env.get(k) == v for k, v in envelope.items()), (
+            f"push envelope tuple drifted:\n{pushed_env!r}\n{envelope!r}"
+        )
+        assert push_line.startswith(DSHMSG)  # first line machine-parseable
+        push_tuple = pushed_env
 
         # ---- pull: same line via dais mailbox (send-message → check-messages) ----
         await asyncio.sleep(0.5)  # bus-lock gap: cross-plane
@@ -349,12 +355,19 @@ async def test_dual_delivery_parity(tmp_path):
                 if text.startswith(DSHMSG) and f'"{ref}"' in text:
                     pull_line = text
         assert pull_line is not None, "mailed envelope never reached ORCH mailbox"
-        assert pull_line == line, f"pull wire line drifted:\n{pull_line!r}\n{line!r}"
+        assert pull_line.startswith(DSHMSG), f"pull line not DSHMSG-framed: {pull_line!r}"
         pull_tuple = json.loads(pull_line[len(DSHMSG):])
 
-        # ---- parity: identical five-tuple, credentials verbatim ----
-        assert push_tuple == pull_tuple == envelope
-        assert push_tuple["body"] == body  # 凭证逐字（TOKEN 与【凭证…】未改写）
+        # ---- parity: five-tuple identical across push/pull; push may carry v2
+        # append-only extras (msgid/ts) per OG5 — subset semantics, not byte equality.
+        for t_name, tup in (("push", push_tuple), ("pull", pull_tuple)):
+            assert all(tup.get(k) == v for k, v in envelope.items()), (
+                f"{t_name} envelope tuple drifted:\n{tup!r}\n{envelope!r}"
+            )
+        assert all(push_tuple.get(k) == pull_tuple.get(k) for k in pull_tuple), (
+            f"push lost keys present in pull:\n{push_tuple!r}\n{pull_tuple!r}"
+        )
+        assert push_tuple["body"] == pull_tuple["body"] == body  # 凭证逐字（TOKEN 与【凭证…】未改写）
 
         # ---- read-consume: the mailbox snapshot consumed our row ----
         await asyncio.sleep(0.7)
