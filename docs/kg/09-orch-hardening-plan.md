@@ -1,7 +1,7 @@
 # Voice-Orchestration KG · 09 W6 编排链加固方案（orch-hardening）
 
 > 版本 v1 · 2026-08-23 · 来源：`docs/kg/evidence/handoff-w6-hardening.md`（使命书，主题 A/B 为用户裁决级输入）+ `docs/kg/08-defects-ledger.md`（N8）+ `docs/kg/evidence/ledger-carryover-round6.md`（round 14–16 事故实录）
-> 性质：**只规划不执行**。票编号 OF-001..OF-009，与 VO 系列隔离；票板=本文件 §8。
+> 性质：**只规划不执行**。票编号 OF-001..OF-010，与 VO 系列隔离；票板=本文件 §8。
 > 依据链：OF 票 → 本文件 §包（验收编号）→ 08-defects-ledger（D-xx）→ evidence/ledger（事故证据）。
 > 格式先例：`docs/plans/impl-specs.md`（工作包表）；`docs/tickets.md`（v4 票制）；`docs/plans/dispatch-plan.md`（Lane+合并五步）。
 
@@ -12,7 +12,7 @@
 - 主题 A（多主无契约软隔离）：插件 router 层有 scope+journal 契约（VO-004 建成），但脚下的 `session-send` 安全模型=知道 sessionId 即可注入：`from` 自报、无 msgid、无凭证、steer fire-and-forget。契约建在了上面一层，下面敞开。
 - 主题 B（长任务无高级编排）：波次状态活在 LLM 上下文（已 compact 一次、longtask 服务端坏过一次）；编排者回合制=回合间隙无滴答（VO-007 挂死 2h 由用户发现）；relay 固定寿命先于长票到期；编排者之上无升级路径。
 
-治法：把**身份（谁有权发）、状态（票/检查点）、守望（watchd）**三件事从协定层下沉到机械层。九票按此分三组：A 组 OF-001..004（会话面身份与契约）、B 组 OF-005..007（数据面状态）、C 组 OF-008..009（缺陷直修：dais 守卫 + live 纪律）。
+治法：把**身份（谁有权发）、状态（票/检查点）、守望（watchd）**三件事从协定层下沉到机械层。十票按此分三组：A 组 OF-001..004（会话面身份与契约）、B 组 OF-005..007 + OF-010（数据面状态 + 与 DSH longtask 面的绑定）、C 组 OF-008..009（缺陷直修：dais 守卫 + live 纪律）。
 
 ## 1. 全局验证门（OF 系列通用，OG 门）
 
@@ -115,6 +115,17 @@
 | 量·依赖 | 小 · 无；④ 联动软依赖 OF-005 |
 | 文件域 | `bin-ledger`：wave-checkpoint(new)、state/wave-checkpoints.jsonl(new)；`doc-maestro`：orch-loop.md |
 
+### OF-010 · tickets→longtask 单向投影（B.4 绑定层）
+
+| 项 | 内容 |
+|---|---|
+| 依据 | 用户裁决（2026-08-23 追加）：主题 B 三点未覆盖 maestro 数据面与 DSH longtask/goal 面的绑定——resume 场景 goal 视图不反映票态、断点续传绕开原生恢复路径的缺口 |
+| 范围 | ledger `ticket` 子命令族（OF-005）在**终态迁移**（done/merged/rejected/rolled-back）与 wave-checkpoint 追加（OF-007）时，单向投影进 DSH 长时任务：checkpoint 行=本轮 wave 票态摘要（复用 ledger-carryover 的 Checkpoints 形制：陈述 + verifiedBy=票号）；Objective/goal 本体**不自动改写**（人类所有），只投事实行。投影失败不阻塞主迁移（journal WARN，下次迁移补投）；无活跃 longtask 时静默跳过。**方向钉死：maestro 为源、longtask 为渲染视图；不反向同步、不修 longtask 服务器本体**（其损坏史=不建在它上面的理由，见 §0） |
+| 验收 | ①票终态迁移后 longtask checkpoint 含该票号+终态（live 冒烟一次）；②longtask 拒写时不阻塞 tickets 主流程，journal 落 WARN 且后续补投成功；③无活跃 longtask 会话时静默跳过零报错；④wave-checkpoint 行与 longtask checkpoint 摘要勾稽一致；⑤全链无反向写（longtask 侧不产生 maestro 状态来源） |
+| 验证形式 | 自动=mock longtask 写入单测；live=一轮真 wave 追加后核对 checkpoint |
+| 量·依赖 | 小 · OF-005（迁移钩子）+ OF-007（摘要行复用）；投递通道（loopback API vs 文件承接件）票内二选一定 |
+| 文件域 | `bin-ledger`：ledger、wave-checkpoint（同域串行，天然无冲突） |
+
 ---
 
 ## 5. 缺陷直修工作包（台账高优）
@@ -180,6 +191,7 @@
 | OF-007 | wave 检查点机器可读 | 小 | 无（④软依赖 005） | bin-ledger | 即开，④ 待 005 |
 | OF-008 | dais 构建+实例守卫（D-01/02/03 附） | 中 | 无 | dais-wrap+poc-probe | **即开**（POC 域独立） |
 | OF-009 | live 预算 doctrine+并发租约（D-12/13） | 小–中 | 无 | docs+tests-live | docs 即开；tests 待 VO-012 |
+| OF-010 | tickets→longtask 单向投影（绑定层） | 小 | OF-005+OF-007 | bin-ledger | 第二波（W2 收尾） |
 
 ## 9. 总依赖图与排期（VO-012 后）
 
@@ -197,7 +209,7 @@ OF-009（docs 独立；tests ⇢ VO-007 合入）
 Lane 拓扑（VO-012 收口后放行；Wave 0 先行）：
 
 Lane W1（会话面，串行）: OF-001 → OF-002 → OF-003 → [OF-004 中期窗口]
-Lane W2（数据面）:      OF-005 → OF-007（④联动收尾）
+Lane W2（数据面）:      OF-005 → OF-007（④联动收尾）→ OF-010（longtask 绑定收尾）
 Lane W3（守护面）:      OF-008 即开；OF-006 待 W1 的 002（③面待 W2 的 005）
 Lane W4（live 纪律）:   OF-009 docs 即开；tests 部分=VO-012 后窗口
 ```
@@ -224,4 +236,4 @@ Lane W4（live 纪律）:   OF-009 docs 即开；tests 部分=VO-012 后窗口
 | D-12 | OF-009 ① | ✅ |
 | D-13 | OF-009 ② | ✅ |
 | 主题 A | OF-001..004 | 台账 §新节：A 组收口记录（信封/租约/两段/凭证四层） |
-| 主题 B | OF-005..007 | 台账 §新节：B 组收口记录（状态/守望/检查点三层） |
+| 主题 B | OF-005..007 + OF-010 | 台账 §新节：B 组收口记录（状态/守望/检查点三层 + longtask 绑定） |

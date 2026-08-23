@@ -27,7 +27,7 @@
 | N6 | [06-ws5-agent-ecosystem.md](06-ws5-agent-ecosystem.md) | W5 dsh agent 生态：孵化扩展 v2 + 内部通信层 + liaison 落位 + manager 群（方法级） |
 | N7 | [07-laneb-orca-ade.md](07-laneb-orca-ade.md) | 车道B · orca ADE：OrcaLane 封装 + A/B 语义映射与 conformance 对拍（方法级，设计态） |
 | N8 | [08-defects-ledger.md](08-defects-ledger.md) | **编排链缺陷台账**（复盘实录）：dais 面/插件/relay 监控/live 预算/环境坑，现行对策+建议修复锚点 |
-| N9 | [09-orch-hardening-plan.md](09-orch-hardening-plan.md) | **W6 编排链加固方案**（OF-001..009 票草案）：主题 A 信封 v2/租约/steer 两段/凭证 + 主题 B tickets DAG/watchd/checkpoint + 缺陷直修 dais 守卫/live 纪律，含依赖图与 VO-012 后排期 |
+| N9 | [09-orch-hardening-plan.md](09-orch-hardening-plan.md) | **W6 编排链加固方案**（OF-001..010 票草案）：主题 A 信封 v2/租约/steer 两段/凭证 + 主题 B tickets DAG/watchd/checkpoint/longtask 绑定 + 缺陷直修 dais 守卫/live 纪律，含依赖图与 VO-012 后排期 |
 
 ## 3. 边表（对接依赖图，按修正架构）
 

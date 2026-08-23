@@ -8,12 +8,12 @@
 
 | 线 | 状态 | 下一个事件 | 完成时动作 |
 |---|---|---|---|
-| **VO-007** manager群+V7 | **auto-compaction 中**（pid 806391，21:37 回合结束后 19 万 token 压缩，R 态 39.6% CPU 慢算 47min+；spinner"等 settle 后清迟到 worker"=压缩后计划）。整改已落文件（90 次×2 处）但**未重跑**（无 pytest 实例、报告仍 21:37 旧版）。勿据旧 done body 合并 | 压缩完 → agent 重跑绿 → 报告更新 → relay 唤醒 | 门禁(timeout 900 壳复跑)→ merge→☑→派 VO-012 |
-| **e858** W6 规划者 | 活跃作业中（log mtime 22:18 持续更新，11+ toolCall；无需干预） | done plan-done 直投编排者 | 验收 09 文档 → INDEX N9 → git 合入 |
-| **relay <seat>** 第二期 | 值守中（21/40 轮） | VO-007 报告更新/merge 回投；40 轮到期 | 到期若 VO-007 未完 → re-arm 新 mission |
+| **VO-007** manager群+V7 | **三连跑稳定性验证中**（agent 自驱：bg_5 串 sleep240→purge f0a3→timeout900 pytest，"等三跑"=连跑 3 轮防单跑侥幸；22:49 第 2 轮）。报告仍 21:37 旧版勿合并 | 三跑全绿 → 报告更新 → relay 唤醒 | 门禁(timeout 900 壳复跑)→ merge→☑→派 VO-012 |
+| **W6 规划** | **☑ 已验收合入 `b51bf05`**（09 方案 227 行 9 票 + INDEX N9 由 e858 自注 + 缺陷台账 08 + handoff 使命书 + orch-index）。e858 会话可 retire | — | 次波执行按 09 §9：VO-012 前只做 Wave 0 + OF-009 docs |
+| **relay <seat>** 第二期 | 值守中（22/40 轮） | VO-007 报告更新/merge 回投；40 轮到期 | 到期若 VO-007 未完 → re-arm |
 | VO-012 | 待派（前置=VO-007☑） | — | 派发主区 omp（收口 dogfood 票） |
 
-> 最近核实：22:20（VO-007=压缩中非挂死 / e858 活跃 / relay 21 轮）。诊断方法：omp pid→log mtime+agent_end 计数+CPU/STAT 三信号，勿单看终端 spinner。下轮 goal 先重新核实再动作。
+> 最近核实：22:31（W6 合入 b51bf05 / VO-007 整改落地待重跑 / dais 新实例健康 / relay 22 轮）。注意：e858 INDEX N9 与我编辑撞车过一次（它先落），多主并发写共享文件需 OF-001 msgid+OF-005 数据化的又一个实录。下轮 goal 先重新核实再动作。
 
 ## 2. 票板快照
 
