@@ -43,7 +43,7 @@
 - **量**:中 · **依赖**:VO-003 · **派发**:本仓 code
 - **回报物**:evidence/VO-004-report.md · **done body**:同上格式
 
-### VO-005 推/拉双投递 conformance ☐
+### VO-005 推/拉双投递 conformance ☑
 
 - **目标/方案**:同一消息双投递模式对拍——DSHMSG 推注入(session-send 底座)vs dais 邮箱投递,收方视角同结果;跨进程 sleep 间隙(总线锁纪律)。
 - **路径**:`tests/test_rt_conformance.py` 扩。

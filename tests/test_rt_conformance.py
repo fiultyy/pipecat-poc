@@ -11,14 +11,25 @@
   mailbox, replies per ref). Lane A runs its own mailbox identity
   (``voice-head-a2a``) so the two consumers never contend for reads —
   check-messages is consume-on-read.
+
+VO-005 dual-delivery conformance: the SAME {from,to,ref,type,body} envelope
+delivered via push (session-send DSHMSG] injection — lands as the recipient
+turn's first line) and via pull (dais mailbox send-message → check-messages)
+must parse to the identical five-tuple at the recipient. Live-probed facts
+baked in (2026-08-23): dais send-message accepts only ``--message-type
+status``; session.history user/message events carry the injected line
+verbatim; push needs a fleet-registered session (session-spawn, no GUI).
 """
 
 import asyncio
+import json
 import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.request
+import uuid
 from pathlib import Path
 
 import pytest
@@ -39,6 +50,14 @@ ORCH = "session_vhconf"
 HEAD_A = "voice-head-a2a"
 HEAD_B = "voice-head"
 PORT = 8799
+
+# ---- VO-005 push/pull dual-delivery conformance ----
+
+FLEET_PATH = Path("~/.dsh/maestro/fleet.json").expanduser()
+SESSION_SPAWN = Path("~/.dsh/maestro/bin/session-spawn").expanduser()
+SESSION_SEND = Path("~/.dsh/maestro/bin/session-send").expanduser()
+SESSION_PURGE = Path("~/.dsh/maestro/bin/session-purge").expanduser()
+DSHMSG = "DSHMSG]"
 
 
 def _boot(port: int, state_dir: Path, profile_root: Path, executor_expr: str) -> subprocess.Popen:
@@ -212,3 +231,135 @@ async def test_live_lane_a_b_conformance(tmp_path):
     except rt_dsh_lane_module.DaisLaneError:
         # one retry absorbs transient bus contention from the resident daemon
         await attempt("-r2")
+
+
+# ---- live: VO-005 dual-delivery parity (push session-send vs pull mailbox) ----
+
+def _loopback(port: str, method: str, payload: dict, timeout_s: float = 10.0) -> dict:
+    """One maestro loopback RPC (session-send wire format); returns result.value."""
+    wire = json.dumps({
+        "type": "client-request", "rpcId": str(uuid.uuid4()), "method": method, "payload": payload,
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/{method}",
+        data=wire, headers={"content-type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        result = json.loads(resp.read()).get("result", {})
+    if not result.get("ok"):
+        raise RuntimeError(f"loopback {method} failed: {result.get('error')}")
+    return result.get("value", {})
+
+
+def _push_plane_up() -> bool:
+    """Push plane = maestro loopback session.list answering."""
+    try:
+        fleet = json.loads(FLEET_PATH.read_text())
+        return bool(_loopback(str(fleet.get("port", 3080)), "session.list", {}))
+    except Exception:
+        return False
+
+
+def _dshmsg_lines(events: list) -> list[str]:
+    """Machine-parseable DSHMSG] first-line texts from recipient turn events."""
+    texts = []
+    for e in events:
+        ev = e.get("event", e)
+        if ev.get("type") not in ("user/message", "agent/inbox/spliced"):
+            continue
+        data = ev.get("data", {})
+        for msg in data.get("inserted") or [data]:
+            for part in msg.get("content") or []:
+                text = part.get("text", "")
+                if text.startswith(DSHMSG):
+                    texts.append(text)
+    return texts
+
+
+@pytest.mark.asyncio
+async def test_dual_delivery_parity(tmp_path):
+    """VO-005: same envelope via DSHMSG push and mailbox pull → identical
+    five-tuple at the recipient; push lands as the turn's first (machine-
+    parseable) line; mailbox reads consume."""
+    if not _env_ok() or not DAIS_BIN.exists():
+        pytest.skip("node or dais absent")
+    if not SESSION_SEND.exists():
+        pytest.skip("maestro session-send absent")
+    lane = DaisLane(default_timeout_s=20)
+    if not _push_plane_up():
+        pytest.skip("dsh loopback plane down (push unreachable)")
+    if not await _bus_healthy(lane):
+        pytest.skip("dais bus unresponsive (daemon wedge; restart resident dais)")
+
+    suffix = uuid.uuid4().hex[:6]
+    ref = f"vh-dual-{suffix}"
+    body = f"双投递对拍 TOKEN-DUAL-{suffix} 【凭证R-DUAL-{suffix}】"
+
+    # recipient for push: fresh fleet session (session-spawn; no GUI dependency)
+    spawned = subprocess.run(
+        [SESSION_SPAWN, "standard", f"vh-dual-{suffix}",
+         f"VO-005 dual-delivery parity probe {ref}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    codes = re.findall(r"\b([0-9a-f]{4})\b", spawned.stdout)
+    assert codes, f"session-spawn produced no code: {spawned.stdout!r} {spawned.stderr!r}"
+    code = codes[-1]
+    envelope = {"from": HEAD_A, "to": code, "type": "steer", "ref": ref, "body": body}
+    # byte-identical construction to session-send's json.dumps default separators
+    line = DSHMSG + json.dumps(envelope, ensure_ascii=False)
+
+    try:
+        # ---- push: session-send → DSHMSG] as recipient turn first line ----
+        await asyncio.sleep(0.5)  # bus-lock gap: spawn → send
+        push = subprocess.run(
+            [SESSION_SEND, HEAD_A, code, "steer", ref, body],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert push.returncode == 0 and "accepted=True" in push.stdout, (
+            f"session-send failed: {push.stdout!r} {push.stderr!r}"
+        )
+        session_id = json.loads(FLEET_PATH.read_text())["fleet"][code]["sessionId"]
+        push_line = None
+        deadline = time.monotonic() + 20
+        while push_line is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.7)  # bus-lock gap between loopback calls
+            events = _loopback(str(json.loads(FLEET_PATH.read_text()).get("port", 3080)),
+                               "session.history",
+                               {"sessionId": session_id, "maxMessages": 10}).get("events", [])
+            push_line = next((t for t in _dshmsg_lines(events) if f'"{ref}"' in t), None)
+        assert push_line is not None, "pushed DSHMSG never reached recipient history"
+        assert push_line == line, f"push wire line drifted:\n{push_line!r}\n{line!r}"
+        push_tuple = json.loads(push_line[len(DSHMSG):])  # first line machine-parseable
+
+        # ---- pull: same line via dais mailbox (send-message → check-messages) ----
+        await asyncio.sleep(0.5)  # bus-lock gap: cross-plane
+        run_id = await lane.create_run(f"vo005 dual-delivery parity {ref}")
+        await asyncio.sleep(0.5)
+        # live fact: only --message-type status is accepted by dais send-message
+        await lane._run("send-message", run_id, HEAD_A, ORCH,
+                        "--message-type", "status", "--subject", "route", "--body", line)
+        pull_line = None
+        deadline = time.monotonic() + 20
+        while pull_line is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.7)
+            for row in await lane.check_messages(ORCH, wait_s=2.0):
+                text = row.get("body", "")
+                if text.startswith(DSHMSG) and f'"{ref}"' in text:
+                    pull_line = text
+        assert pull_line is not None, "mailed envelope never reached ORCH mailbox"
+        assert pull_line == line, f"pull wire line drifted:\n{pull_line!r}\n{line!r}"
+        pull_tuple = json.loads(pull_line[len(DSHMSG):])
+
+        # ---- parity: identical five-tuple, credentials verbatim ----
+        assert push_tuple == pull_tuple == envelope
+        assert push_tuple["body"] == body  # 凭证逐字（TOKEN 与【凭证…】未改写）
+
+        # ---- read-consume: the mailbox snapshot consumed our row ----
+        await asyncio.sleep(0.7)
+        again = await lane.check_messages(ORCH, wait_s=2.0)
+        assert not any(f'"{ref}"' in r.get("body", "") for r in again), (
+            "mailbox row survived a read (consume-on-read broken)"
+        )
+    finally:
+        # best-effort cleanup: purge refuses sessions written <5min ago (busy gate)
+        subprocess.run([SESSION_PURGE, code], capture_output=True, timeout=30)
