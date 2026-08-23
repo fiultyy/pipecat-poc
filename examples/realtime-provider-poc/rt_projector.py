@@ -9,6 +9,10 @@ read-only) through the standardized spawn prompt, producing a pure-natural-
 language AGENTS.md plus machine-readable profile metadata. Two iron rules
 travel with every projection (spawnAgentPrompt.md §1): zero framework
 terminology in the artifact, and a non-negotiable catastrophe floor.
+
+VO-001 adds the 17th dimension ``agent_role`` (KG 06 §1.1–1.2): role
+doctrine clauses are pinned verbatim via ROLE_TEMPLATES so every role
+product passes the three gates unchanged.
 """
 
 from __future__ import annotations
@@ -20,6 +24,8 @@ from pathlib import Path
 
 from openai import AsyncOpenAI
 
+from rt_orchestrator import FINAL_PREFIX  # protocol constant, embedded verbatim (G5: no drift)
+from rt_projection_gates import run_gates
 from rt_env import glm_credentials
 
 CF = Path("~/文档/context-files").expanduser()
@@ -44,6 +50,32 @@ PRESET_KEYWORDS = {
     "group-chat": ("群聊", "协作", "团队", "社交", "群", "chat", "沟通"),
     "long-term": ("长期", "驻留", "自主", "long-term", "陪伴", "常驻"),
     "security": ("安全", "审计", "风控", "security", "合规", "渗透"),
+}
+
+# 第 17 维 agent_role 的 doctrine 模板（KG 06 §1.2 表条款逐条固化）。
+# worker=空串：现行通用投影零变化（回归锚）。liaison/manager/supervisor
+# 在产物尾部追加本段；模板条款文本自身必须过 gate1（术语零暴露同样
+# 约束模板自身）。协议字面量（FINAL_PREFIX/[ref:]/【凭证…】）一律按
+# 现行常量逐字内嵌，不得改写（G5 不漂移）。
+ROLE_TEMPLATES = {
+    "liaison": f"""### 角色契约：对接联络（liaison）
+以下四条是对外沟通铁条款，优先级高于场景行为准则：
+1. 语义收敛：把上游口语化意图收敛成稳定指令——自包含（离开对话历史仍可独立执行）、指代全部展开（不留"它/上面/刚才"类悬空指代）、幂等可重放（同一意图收敛结果恒定）。
+2. 两阶段应答：
+   - 第一阶段·受理回执：收到指令即刻回执，形如 {{status:accepted, run_id, ref, credentials}}，其中 ref 与 credentials 逐字取自来件；
+   - 第二阶段·终稿：汇总完成后回终稿，回复 body 必须以前缀 {FINAL_PREFIX!r} 开头（逐字符原样照抄，含结尾换行），前缀之后接终稿正文。
+3. 信封规则：一切对外消息的 body 前加 [ref:<来件ref>] 前缀；ref 逐跳透传，不改写、不丢弃。
+4. 凭证纪律：来件中的【凭证…】标记必须逐字回显——不改、不丢、不加。""",
+    "manager": """### 角色契约：域管理（manager）
+以下五条是编排铁条款，优先级高于场景行为准则：
+1. 域职责边界：只受理本域内的稳定指令；域外需求原样上抛给来件方，不越界受理、不私下扩权。
+2. 车道选择：终端/工作树类任务（需真实终端与代码检出）走 orca 车道；消息 DAG/轻量 fan-out 类任务（纯消息往返即可完成）走 dais 车道。
+3. 拆分与依赖：把稳定指令拆成子任务清单，每个子任务携带 --dep 依赖表；依赖未收齐的子任务不得派发。
+4. 完成等待：以 worker_done 块匹配等待各子任务完成（免轮询）；全部依赖收齐后再做域汇总回信。
+5. 异常上抛：gate 阻塞→调 resolve-gate 处置；疑似卡死→调 scan-wait-blocked 排查；仍超时→原样上抛 supervisor，不静默吞掉、不无限重试。""",
+    "worker": "",  # 现行通用投影，零变化
+    "supervisor": """### 角色契约：监护（supervisor，预留）
+你是监护员：只做三件事——受理下级上抛的超时与异常、决定升级或降级处置、留痕回告；不代跑下级任务，不改写下级指令。""",
 }
 
 
@@ -157,28 +189,45 @@ class Projector:
         return []
 
     async def project(self, scenario: str, *, answers: list[str] | None = None,
-                      max_retries: int = 2) -> Projection:
-        """Full pipeline: prompt → GLM → parse → Projection.
+                      role: str = "worker", max_retries: int = 2) -> Projection:
+        """Full pipeline: prompt → GLM → parse → role doctrine → gates → Projection.
 
-        Retries once per failure with a warmer temperature (0.2) before
-        raising ProjectionError.
+        ``role`` is the 17th dimension (KG 06 §1.1): worker keeps the current
+        pipeline verbatim; liaison/manager/supervisor append their ROLE_TEMPLATES
+        doctrine to the artifact. All roles must pass the three gates before
+        returning — gate failures warm-retry (temperature 0.2, ≤ max_retries)
+        exactly like parse/transport failures, then raise ProjectionError.
         """
+        if role not in ROLE_TEMPLATES:
+            raise ValueError(
+                f"unknown agent_role {role!r}; expected one of {sorted(ROLE_TEMPLATES)}"
+            )
         prompt, priors = self.build_prompt(scenario, answers)
         temperature = 0.0
         last_err: Exception | None = None
         for _ in range(max_retries + 1):
             try:
                 data = self._parse(await self._call_glm(prompt, temperature))
+                agents_md = data["agents_md"]
+                doctrine = ROLE_TEMPLATES[role]
+                if doctrine:
+                    agents_md = agents_md.rstrip() + "\n\n" + doctrine
+                report = run_gates(agents_md)
+                if not report.passed:
+                    raise ValueError(f"gate violations: {report.violations}")
+                profile_json = dict(data.get("vector19", {}))
+                profile_json["agent_role"] = role  # traceable, never in the artifact
                 return Projection(
-                    agents_md=data["agents_md"],
-                    profile_json=data.get("vector19", {}),
+                    agents_md=agents_md,
+                    profile_json=profile_json,
                     description=data.get("description", ""),
                     scenario=scenario,
                     priors=priors,
                 )
             except (json.JSONDecodeError, KeyError, RuntimeError, ValueError) as e:
                 # JSONDecodeError/KeyError: malformed contract; RuntimeError:
-                # transport failure (openai SDK surfaces those); both retry.
+                # transport failure (openai SDK); ValueError: gate violations
+                # (raised above) — all warm-retry once per failure.
                 last_err = e
                 temperature = 0.2
         raise ProjectionError(f"projection failed after retries: {last_err}")

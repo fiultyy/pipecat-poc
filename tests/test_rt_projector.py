@@ -4,6 +4,7 @@
 
 """Unit tests for the WS3 projector and its three acceptance gates."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -11,8 +12,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "realtime-provider-poc"))
 
+from rt_orchestrator import FINAL_PREFIX  # noqa: E402  (G5: 协议常量对拍锚)
 from rt_projection_gates import gate1_terminology, gate2_catastrophe, gate3_completeness, run_gates  # noqa: E402
-from rt_projector import PRESET_NAMES, Projector, ProjectionError  # noqa: E402
+from rt_projector import PRESET_NAMES, ROLE_TEMPLATES, Projector, ProjectionError  # noqa: E402
 
 GOOD_MD = """# AGENTS.md
 
@@ -116,8 +118,6 @@ async def test_project_retries_then_raises():
 
 @pytest.mark.asyncio
 async def test_project_parses_structured_output():
-    import json
-
     payload = {"agents_md": GOOD_MD, "vector19": {"evidence": 0.9}, "description": "触发描述"}
 
     class FakeCompletions:
@@ -144,7 +144,7 @@ async def test_project_parses_structured_output():
     proj._model = "fake"
     result = await proj.project("探索型 MVP 开发 agent")
     assert result.agents_md == GOOD_MD
-    assert result.profile_json == {"evidence": 0.9}
+    assert result.profile_json == {"evidence": 0.9, "agent_role": "worker"}
     assert result.priors  # priors recorded on the projection
 
 
@@ -184,3 +184,139 @@ def test_run_gates_aggregates():
     bad = run_gates("# 没有章节\n只有 D1 泛化算法\n")
     assert not bad.passed
     assert set(bad.violations) >= {"gate1_terminology", "gate3_completeness"}
+
+# ---- VO-001: 17th dimension agent_role ----
+
+def _payload(md: str, vector19: dict | None = None) -> str:
+    """Fenced JSON output-contract payload for the fake GLM."""
+    body = {"agents_md": md, "vector19": vector19 or {}, "description": "触发描述"}
+    return "```json\n" + json.dumps(body, ensure_ascii=False) + "\n```"
+
+
+def _mock_projector(outputs):
+    """Projector whose GLM yields queued payloads (last repeats); records create() kwargs."""
+    calls: list[dict] = []
+
+    class FakeCompletions:
+        @staticmethod
+        async def create(**kwargs):
+            calls.append(kwargs)
+            out = outputs[min(len(calls) - 1, len(outputs) - 1)]
+            if isinstance(out, Exception):
+                raise out
+            r = type("R", (), {})()
+            c = type("Choice", (), {})()
+            c.message = type("Msg", (), {})()
+            c.message.content = out
+            r.choices = [c]
+            return r
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeGLM:
+        chat = FakeChat()
+
+    proj = object.__new__(Projector)
+    proj._glm = FakeGLM()
+    proj._model = "fake"
+    return proj, calls
+
+
+def test_role_templates_cover_four_roles_worker_empty():
+    assert set(ROLE_TEMPLATES) == {"liaison", "manager", "worker", "supervisor"}
+    assert ROLE_TEMPLATES["worker"] == ""  # 现行零变化（回归锚）
+
+
+def test_role_templates_pass_gate1_themselves():
+    for role, text in ROLE_TEMPLATES.items():
+        assert gate1_terminology(text) == [], (role, gate1_terminology(text))
+
+
+def test_liaison_template_pins_kg06_clauses():
+    t = ROLE_TEMPLATES["liaison"]
+    # ① 语义→稳定指令收敛契约 ② 两阶段应答 ③ [ref:] 信封 ④ 凭证逐字回显
+    assert "稳定指令" in t and "自包含" in t and "幂等可重放" in t
+    assert "{status:accepted, run_id, ref, credentials}" in t
+    assert FINAL_PREFIX.strip() in t and repr(FINAL_PREFIX) in t  # 协议常量逐字内嵌（G5 不漂移）
+    assert "[ref:" in t
+    assert "【凭证" in t and "逐字回显" in t
+
+
+def test_manager_template_pins_kg06_clauses():
+    t = ROLE_TEMPLATES["manager"]
+    # ① 域职责 ② A/B 车道选择 ③ --dep 拆分 ④ worker_done 等待 ⑤ 异常上抛
+    assert "域职责" in t
+    assert "车道选择" in t and "orca" in t and "dais" in t
+    assert "--dep" in t
+    assert "worker_done" in t
+    assert "resolve-gate" in t and "scan-wait-blocked" in t and "supervisor" in t
+
+
+@pytest.mark.asyncio
+async def test_project_role_liaison_product_carries_four_clauses():
+    proj, _ = _mock_projector([_payload(GOOD_MD)])
+    result = await proj.project("对接联络 agent", role="liaison")
+    md = result.agents_md
+    assert md.startswith(GOOD_MD.rstrip())  # 基底投影在前，doctrine 追加在后
+    assert ROLE_TEMPLATES["liaison"] in md
+    assert "幂等可重放" in md and "{status:accepted, run_id, ref, credentials}" in md
+    assert FINAL_PREFIX.strip() in md and "[ref:" in md and "【凭证" in md
+    assert result.profile_json["agent_role"] == "liaison"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["liaison", "manager", "supervisor"])
+async def test_project_role_products_pass_three_gates(role):
+    proj, _ = _mock_projector([_payload(GOOD_MD)])
+    result = await proj.project("任意场景", role=role)
+    report = run_gates(result.agents_md)
+    assert report.passed, report.violations
+    assert result.profile_json["agent_role"] == role
+
+
+@pytest.mark.asyncio
+async def test_project_role_worker_is_current_pipeline_verbatim():
+    proj, _ = _mock_projector([_payload(GOOD_MD, {"evidence": 0.9})])
+    default = await proj.project("探索型 MVP 开发 agent")  # 缺省即 worker
+    proj2, _ = _mock_projector([_payload(GOOD_MD, {"evidence": 0.9})])
+    explicit = await proj2.project("探索型 MVP 开发 agent", role="worker")
+    assert default.agents_md == GOOD_MD  # 产物与现行全等（回归锚）
+    assert (explicit.agents_md, explicit.profile_json, explicit.priors) == (
+        default.agents_md, default.profile_json, default.priors)
+    assert default.profile_json["agent_role"] == "worker"
+
+
+@pytest.mark.asyncio
+async def test_agent_role_traced_in_profile_only():
+    proj, _ = _mock_projector([_payload(GOOD_MD)])
+    result = await proj.project("对接联络 agent", role="manager")
+    assert result.profile_json["agent_role"] == "manager"  # 落键（第 17 维可追溯）
+    assert "agent_role" not in result.agents_md  # 不进正文/术语面
+
+
+@pytest.mark.asyncio
+async def test_project_rejects_unknown_role_before_any_call():
+    proj, calls = _mock_projector([_payload(GOOD_MD)])
+    with pytest.raises(ValueError, match="unknown agent_role"):
+        await proj.project("任意场景", role="hero")
+    assert calls == []  # 校验先于任何 GLM 调用
+
+
+@pytest.mark.asyncio
+async def test_project_warm_retries_on_gate_failure():
+    leaky = GOOD_MD + "\n按 19 维向量推理\n"  # gate1 必炸（术语暴露）
+    proj, calls = _mock_projector([_payload(leaky), _payload(GOOD_MD)])
+    result = await proj.project("探索型 MVP 开发 agent")
+    assert result.agents_md == GOOD_MD
+    assert len(calls) == 2  # 门失败升温重投影 1 次后过门
+    assert calls[0]["temperature"] == 0.0 and calls[1]["temperature"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_project_raises_after_gate_retry_budget():
+    broken = GOOD_MD.replace("### Output", "### 交付物")  # gate3 必炸（缺章节）
+    proj, calls = _mock_projector([_payload(broken)])
+    with pytest.raises(ProjectionError, match="gate violations"):
+        await proj.project("探索型 MVP 开发 agent")
+    assert len(calls) == 3  # 1 次首发 + ≤2 次升温重投影
