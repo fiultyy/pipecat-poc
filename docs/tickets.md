@@ -34,7 +34,7 @@
 - **量**:中 · **依赖**:VO-002 · **派发**:本仓 code
 - **回报物**:evidence/VO-003-report.md · **done body**:同上格式
 
-### VO-004 router 三 RPC + scope + journal ☐
+### VO-004 router 三 RPC + scope + journal ☑
 
 - **目标/方案**:插件增 `agents/registry`(在册+状态+心跳)/`agents/send`(scope 校验→轻载 session-send DSHMSG 推注入、重载 dais 邮箱投→ack)/`agents/inbox`(只读快照);`router-journal.jsonl` 全量审计。**红线:只注入固定信封格式,不注入任意指令**(G5 同源)。
 - **路径**:`~/.dsh/plugins/a2a-profile-server/http-server.js`(三分支)+router-journal;`tests/test_rt_router.py`(新)。
