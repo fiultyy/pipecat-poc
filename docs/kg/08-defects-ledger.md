@@ -97,3 +97,13 @@
 
 - ✅ EventBus 通配订阅双重投递：〔loc:examples/realtime-provider-poc/rt_event_bus.py:26→subscribe〕kinds-or-star 单注册路径，exactly-once 复验（VO-011 agent 发现，main 已合）。
 - ✅ VO-007 无界等待挂死：v7_main 全局 watchdog 840s + shell 900 壳 + 轮询预算整改（本台账 D-12 关联）。
+
+## 8. 长时模式编排能力自检（2025-08-24，实证=session-20d0a3ee 自身）
+
+`session.list` 证实本会话 `agentPreset: "long-task"`；对照组合文件 + 本会话活工具面：
+
+**进程内多代理编排 ✔（组合内生，工具面一致）**：`delegation` 组（isolate realm workflowEngine）含 subagent(spawn)/subagent_fork(fork)（continuable 可跨轮召回）+ subagent-control（send_message/interrupt_agent/list_agents）+ workflow-worker-thread/tool-workflow（JS fan-out 编排脚本）+ tool-ralph(64 轮)；另有 tool-jobs（后台作业三件套）、tool-goal + tool-long-task（双台账）、tool-todo/ask-user。实证：本会话（70 turns/1105 steps）完成 VO 12/12（goal-9a721634 complete）。
+
+**跨会话/跨平面编排 ✖（组合内生为 0）**：①persona 是一行裸文本（"You are a coding agent..."），零编排 doctrine（dispatch 握手/预算裁决/red lines 全靠外置 orch-index）；②预设目录仅 2 文件——无 skills/（skill-filesystem 未配 customSkillDirs，orchestration/orca-cli/maestro-bridge 全不在面）、无 plugins/ 行（maestro 有 message-bridge/orca-callback pump/session-purge/workspace-unarchive 4 行，long-task 0 行）；③codex/claude-code provider 显式 disabled（生产不装）。本会话历史里的跨会话编排（relay <seat>/supervisor <seat>/e858 handoff）全部走 host 级外置桥（`~/.dsh/maestro/bin/session-send`、孵化插件 subprocess），非 preset 能力。
+
+**判定**：长时模式=单会话编排完备、舰队编排靠环境外挂——即 §5 复盘"long-task 缺高级编排"的结构性根源：桥是 ambient 的（知道即能用），不是 contractual 的（组合声明）。N10 的 queen 派生若要产出"编排型"profile，delegation 组是正确基底，跨会话面需显式补插件行+skills。
