@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>语音编排头系统 · 方案报告（架构修正版）</title>
+<style>
+  :root{
+    --ink:#0f172a; --ink-2:#334155; --ink-3:#64748b;
+    --line:#e2e8f0; --bg:#f8fafc; --card:#ffffff;
+    --accent:#0ea5e9; --accent-deep:#0369a1;
+    --ok:#16a34a; --ok-bg:#f0fdf4; --ok-line:#bbf7d0;
+    --warn:#d97706; --warn-bg:#fffbeb; --warn-line:#fde68a;
+    --pend:#64748b; --pend-bg:#f1f5f9; --pend-line:#e2e8f0;
+    --violet:#7c3aed; --violet-bg:#f5f3ff;
+    --code:#f1f5f9; --code-ink:#be123c;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{
+    font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",system-ui,-apple-system,sans-serif;
+    background:var(--bg); color:var(--ink); line-height:1.75; font-size:15px;
+  }
+  .page{max-width:1120px;margin:0 auto;padding:48px 32px 96px;}
+  header.hero{
+    background:linear-gradient(135deg,#0c4a6e 0%,#0369a1 55%,#0ea5e9 100%);
+    color:#fff;border-radius:16px;padding:40px 44px;margin-bottom:36px;
+  }
+  header.hero h1{font-size:30px;font-weight:700;letter-spacing:.5px;}
+  header.hero .sub{margin-top:10px;font-size:15px;opacity:.92;}
+  header.hero .meta{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px;}
+  .pill{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.28);
+    padding:5px 14px;border-radius:999px;font-size:13px;}
+  section{margin-bottom:40px;}
+  h2{font-size:21px;font-weight:700;color:var(--ink);margin-bottom:6px;
+     display:flex;align-items:center;gap:10px;}
+  h2 .idx{display:inline-flex;align-items:center;justify-content:center;
+    width:28px;height:28px;border-radius:8px;background:var(--accent);color:#fff;
+    font-size:14px;font-weight:700;flex:none;}
+  .lede{color:var(--ink-3);font-size:14px;margin-bottom:18px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:26px 28px;box-shadow:0 1px 2px rgba(15,23,42,.04);}
+  .b{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;
+    font-weight:600;line-height:1.7;white-space:nowrap;vertical-align:middle;}
+  .b-ok{background:var(--ok-bg);color:var(--ok);border:1px solid var(--ok-line);}
+  .b-warn{background:var(--warn-bg);color:var(--warn);border:1px solid var(--warn-line);}
+  .b-pend{background:var(--pend-bg);color:var(--pend);border:1px solid var(--pend-line);}
+  .b-info{background:#eff6ff;color:var(--accent-deep);border:1px solid #bfdbfe;}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;}
+  th{background:#f1f5f9;color:var(--ink-2);font-weight:600;text-align:left;
+    padding:9px 12px;border-bottom:2px solid var(--line);white-space:nowrap;}
+  td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top;}
+  tr:last-child td{border-bottom:none;}
+  td code, p code, li code{background:var(--code);color:var(--code-ink);
+    padding:1px 6px;border-radius:5px;font-size:12.5px;
+    font-family:"JetBrains Mono",Consolas,Menlo,monospace;}
+  /* ---- architecture ---- */
+  .arch{display:flex;flex-direction:column;gap:0;}
+  .tier{display:flex;gap:14px;align-items:stretch;}
+  .tier + .arrow-row{margin:2px 0;}
+  .node{flex:1;background:var(--card);border:1.5px solid var(--line);border-radius:12px;
+    padding:14px 16px;min-width:0;}
+  .node h4{font-size:14.5px;font-weight:700;margin-bottom:4px;display:flex;
+    align-items:center;gap:8px;flex-wrap:wrap;}
+  .node p{font-size:12.5px;color:var(--ink-3);line-height:1.6;}
+  .node.hl{border-color:var(--accent);background:#f0f9ff;}
+  .node.v{border-color:#c4b5fd;background:var(--violet-bg);}
+  .node.dim{opacity:.92;}
+  .arrow-row{display:flex;justify-content:center;}
+  .arrow{color:var(--ink-3);font-size:13px;display:flex;align-items:center;gap:8px;}
+  .arrow::before{content:"";width:0;height:0;border-left:6px solid transparent;
+    border-right:6px solid transparent;border-top:8px solid #94a3b8;}
+  /* dsh host container */
+  .host{border:2px dashed #94a3b8;border-radius:16px;padding:18px 16px 14px;
+    background:#fbfdff;position:relative;margin-top:6px;}
+  .host-label{position:absolute;top:-13px;left:22px;background:#fbfdff;
+    border:2px dashed #94a3b8;border-radius:999px;padding:2px 16px;
+    font-size:13px;font-weight:700;color:var(--ink-2);}
+  .host .tier{margin-bottom:10px;}
+  .host .tier:last-child{margin-bottom:0;}
+  .tag{font-size:11px;padding:1px 8px;border-radius:999px;font-weight:600;}
+  .tag-a{background:#ecfeff;color:#0e7490;border:1px solid #a5f3fc;}
+  .tag-b{background:#fdf2f8;color:#9d174d;border:1px solid #fbcfe8;}
+  /* timeline */
+  .tl{position:relative;padding-left:26px;}
+  .tl::before{content:"";position:absolute;left:8px;top:6px;bottom:6px;width:2px;
+    background:linear-gradient(var(--ok) 0%,var(--ok) 66%,var(--pend) 66%,var(--pend) 100%);}
+  .tl-item{position:relative;padding:0 0 20px 14px;}
+  .tl-item::before{content:"";position:absolute;left:-24px;top:6px;width:12px;height:12px;
+    border-radius:50%;background:#fff;border:3px solid var(--ok);}
+  .tl-item.pend::before{border-color:var(--pend);}
+  .tl-item h4{font-size:15px;font-weight:700;display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+  .tl-item p{font-size:13px;color:var(--ink-3);margin-top:3px;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+  @media (max-width:880px){.grid2{grid-template-columns:1fr;}.tier{flex-direction:column;}}
+  .kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:8px;}
+  @media (max-width:880px){.kpi{grid-template-columns:repeat(2,1fr);}}
+  .kpi .box{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:16px 18px;text-align:center;}
+  .kpi .num{font-size:26px;font-weight:800;color:var(--accent-deep);}
+  .kpi .lbl{font-size:12.5px;color:var(--ink-3);margin-top:2px;}
+  .note{border-left:4px solid var(--accent);background:#f0f9ff;border-radius:0 10px 10px 0;
+    padding:12px 16px;font-size:13.5px;color:var(--ink-2);margin-top:14px;}
+  .note.warn{border-left-color:var(--warn);background:var(--warn-bg);}
+  .note.fix{border-left-color:var(--violet);background:var(--violet-bg);}
+  ol.tight,ul.tight{padding-left:20px;}
+  ol.tight li,ul.tight li{margin-bottom:6px;font-size:13.5px;}
+  .flow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;
+    background:#f8fafc;border:1px dashed var(--line);border-radius:10px;padding:12px 14px;}
+  .flow .step{background:#fff;border:1px solid var(--line);border-radius:8px;
+    padding:4px 10px;font-weight:600;white-space:nowrap;}
+  .flow .n{color:var(--ink-3);font-weight:400;}
+  .foot{margin-top:48px;padding-top:18px;border-top:1px solid var(--line);
+    color:var(--ink-3);font-size:12.5px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;}
+  /* ---- W-refined: chips + numbered flows ---- */
+  .chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;}
+  .chip{font-size:11px;line-height:1.6;padding:1px 8px;border-radius:6px;
+    background:#f1f5f9;border:1px solid var(--line);color:var(--ink-2);white-space:nowrap;}
+  .chip.done{background:var(--ok-bg);border-color:var(--ok-line);color:var(--ok);}
+  .chip.todo{background:var(--warn-bg);border-color:var(--warn-line);color:var(--warn);}
+  .chip.core{background:#eff6ff;border-color:#bfdbfe;color:var(--accent-deep);}
+  .fn{display:inline-flex;align-items:center;justify-content:center;flex:none;
+    width:20px;height:20px;border-radius:50%;background:var(--accent);color:#fff;
+    font-size:11px;font-weight:700;margin-right:2px;}
+  .fn.h{background:var(--violet);} .fn.c{background:#dc2626;} .fn.e{background:var(--ok);}
+  .fnz{display:inline-flex;align-items:center;gap:2px;}
+  .arrow .fnz{margin-right:8px;}
+  td .hop{white-space:nowrap;font-weight:600;}
+  td .proto{white-space:nowrap;}
+  .sub{font-size:12px;color:var(--ink-3);}
+  .tbl-sm td, .tbl-sm th{padding:7px 10px;font-size:12.5px;}
+  .fixlist td:first-child{white-space:nowrap;}
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- ================= HEADER ================= -->
+<header class="hero">
+  <h1>语音编排头系统 · 方案报告 <span style="font-size:16px;font-weight:600;opacity:.85;">（架构修正版 v2）</span></h1>
+  <div class="sub">pipecat 语音头 → dsh 宿主生态（主对接 agent · 编排器 skill · A2A 孵化池插件）→ 双 ADE 车道（dais / orca）</div>
+  <div class="meta">
+    <span class="pill">仓库：pipecat-poc</span>
+    <span class="pill">方案：docs/plans/voice-orchestration-head-plan.md</span>
+    <span class="pill">逻辑 KG：docs/kg/（四前缀指针）</span>
+    <span class="pill">2026-08-23 · 依用户架构修正重写</span>
+  </div>
+</header>
+
+<!-- ================= KPI ================= -->
+<div class="kpi">
+  <div class="box"><div class="num">车道A</div><div class="lbl">dais ADE 全链 live PASS（V5/V6）</div></div>
+  <div class="box"><div class="num">94 / 94</div><div class="lbl">任务测试全绿（13 文件）</div></div>
+  <div class="box"><div class="num">3 / 3</div><div class="lbl">孵化池真实孵化器冒烟（dsh/omp/claude）</div></div>
+  <div class="box"><div class="num">6 项</div><div class="lbl">待建：孵化v2 / 内部通信层 / 主对接 / orca车道 / 向导skill / 本地网关</div></div>
+</div>
+
+<!-- ================= 0 修正说明 ================= -->
+<section>
+  <h2><span class="idx">0</span>架构修正对照</h2>
+  <div class="card">
+    <table class="fixlist">
+      <tr><th style="width:210px;">修正点</th><th style="width:40%;">旧版（错误）</th><th>修正后（正确）</th></tr>
+      <tr>
+        <td><strong>双车道定义</strong></td>
+        <td>车道A = A2A 插件，车道B = dais CLI（两条实际都落在 dais 总线）</td>
+        <td><strong>车道A = dais ADE，车道B = orca ADE</strong>——两个 Agent 执行环境各自成车道；旧版的两条到达路径（CLI 直达 / 插件执行桥转投）均为车道A 内的双通道</td>
+      </tr>
+      <tr>
+        <td><strong>dsh 的角色</strong></td>
+        <td>dais CLI 被当作后端直接调用</td>
+        <td><strong>dsh 是宿主</strong>：挂 ① A2A 孵化池插件 ② 编排器 skill（指向 A/B 车道）③ 主对接 agent；编排发生在 dsh-web GUI 的 agent 生态内</td>
+      </tr>
+      <tr>
+        <td><strong>A2A 插件定位</strong></td>
+        <td>被当作执行车道</td>
+        <td><strong>孵化池</strong>：持久 profile list + 创建向导 skill（引导 dsh agent 创建 agent），基于 WS3 多维架构；不承载任务执行车道</td>
+      </tr>
+      <tr>
+        <td><strong>主对接 agent</strong></td>
+        <td>无此概念（head 直接 dispatch 到总线；测试中由脚本扮演编排会话）</td>
+        <td><strong>dsh 侧专职 agent</strong>：接收 head 语义指令 → 转稳定指令 → 分发 dsh 中各 <strong>manager 级 agent</strong> 编排执行</td>
+      </tr>
+      <tr>
+        <td><strong>编排 skill</strong></td>
+        <td>仅用 dais CLI 封装</td>
+        <td><strong>两个编排 skill</strong>引导 dsh-web GUI agent：<code>dais-orchestration</code> skill（车道A）与 <code>orchestration</code>/orca-cli skill（车道B）</td>
+      </tr>
+    </table>
+    <div class="note fix"><strong>既有工作的正确归位：</strong>live V5/V6 里的 <code>session_vhlive</code>（测试扮演的编排会话）正是<strong>主对接 agent 的替身</strong>——两阶段契约与 <code>[ref:]</code> 信封恰好就是 head↔主对接 agent 的线协议；DaisLane/DshBackend/live 全链归位为<strong>车道A（dais ADE）</strong>的完整实现。修正不推翻已验证代码，只重排其在架构中的位置并明确剩余工作。</div>
+  </div>
+</section>
+
+<!-- ================= 1 执行摘要 ================= -->
+<section>
+  <h2><span class="idx">1</span>执行摘要</h2>
+  <div class="card">
+    <p>系统把<strong>语音会话</strong>升级为<strong>编排入口</strong>。正确链路：用户对语音头说话 → head 抽取自包含语义指令 → 送入 <strong>dsh 宿主生态</strong>：<strong>主对接 agent</strong> 把语义指令转成稳定指令分发各 <strong>manager 级 agent</strong>；manager 经 <strong>编排器 skill</strong>（<code>dais-orchestration</code> / <code>orchestration</code> 两个 skill 引导 dsh-web GUI 中的 agent）把任务派到<strong>双 ADE 车道</strong>——车道A dais ADE、车道B orca ADE——执行 fan-out 与监控；<strong>A2A 孵化池插件</strong>（基于 WS3 多维架构）以持久 list + 创建向导 skill 维持 agent 供给。结果带<strong>机器可校验凭证</strong>逐字回传播报。</p>
+    <table style="margin-top:12px;">
+      <tr><th style="width:250px;">组件</th><th style="width:110px;">状态</th><th>说明</th></tr>
+      <tr><td>车道A · dais ADE</td><td><span class="b b-ok">建成 · live 验证</span></td><td>head 工具四件套 → DshBackend（两条到达路径：DaisLane CLI 直达 / 孵化池执行桥转投）→ 真 dais 总线；V5/V6 全链 PASS；双路径 conformance 同结果</td></tr>
+      <tr><td>A2A 孵化池插件</td><td><span class="b b-ok">主体建成</span></td><td>六 RPC + 版本化持久 list + 三真实孵化器（dsh/omp/claude）冒烟 3/3；<span class="b b-pend">创建向导 skill 壳待建</span></td></tr>
+      <tr><td>WS3 多维投影架构</td><td><span class="b b-ok">建成</span></td><td>孵化池的基底：Projector（16+3 维行为空间 / 7 场景 profile）+ 三道质量门 + 真 GLM 冒烟</td></tr>
+      <tr><td>dsh agent 生态（孵化v2 + 内部通信层）</td><td><span class="b b-pend">规划完成 · 待建</span></td><td><strong>对接 agent 与 manager 级 agent 也经孵化池供 prompt</strong>：孵化能力扩展（角色维度 / dsh-liaison / dsh-manager 模板 / 生命周期）+ dsh 内部消息层（session-send DSHMSG 推送 + dais 邮箱拉取，打破会话隔离）——详见 §4</td></tr>
+      <tr><td>车道B · orca ADE</td><td><span class="b b-pend">待建</span></td><td>orca-cli / orchestration skill 封装 OrcaLane + 与 dais 车道 conformance 对拍（M0 时 orca-ide 探针已通，245ms）</td></tr>
+      <tr><td>主对接 agent</td><td><span class="b b-pend">待建</span></td><td>dsh 侧专职会话：语义→稳定指令→manager 级 agent；线协议已验证（两阶段契约），需落位为真实 dsh 常驻 agent</td></tr>
+      <tr><td>WS4 本地 WS 网关</td><td><span class="b b-pend">待做</span></td><td>rt_gateway 三路复用帧协议 + orch.* 事件汇总，局域网语音入口；公网穿透（frp）已移出架构</td></tr>
+    </table>
+    <div class="note"><strong>Q2 已定案：</strong>DASHSCOPE_API_KEY 缺失 → head 走 <strong>GLM 文本模式先行</strong>；Qwen realtime 路径已探通，key 补给后经 providers factory 切换。</div>
+  </div>
+</section>
+
+<!-- ================= 2 架构 ================= -->
+<section>
+  <h2><span class="idx">2</span>系统架构：组件规划与流程指向（细化）</h2>
+  <p class="lede">三层视图：§2.1 组件清单（子组件 / 提供接口 / 依赖）→ §2.2 组件关系与指向图（编号边 F/H/C/E）→ §2.3–2.6 四条关键流程逐跳细化。</p>
+
+  <!-- ============ 2.1 组件清单 ============ -->
+  <h3 style="font-size:16px;margin:14px 0 10px;color:var(--accent-deep);">2.1 组件清单（按层）</h3>
+  <div class="card">
+    <table class="tbl-sm">
+      <tr><th style="width:104px;">层</th><th style="width:150px;">组件</th><th>子组件 / 内部模块</th><th style="width:220px;">提供接口（谁调用它）</th><th style="width:180px;">依赖（它调用谁）</th><th style="width:78px;">状态</th></tr>
+      <tr>
+        <td rowspan="1">L0 接入</td>
+        <td><strong>rt_gateway</strong></td>
+        <td><span class="chips"><span class="chip todo">WsSession</span><span class="chip todo">帧复用器 control/media/event</span><span class="chip todo">EventBus 订阅器</span><span class="chip todo">TailReader</span></span></td>
+        <td>WS 端点（局域网客户端）</td>
+        <td>head EventBus；dais 日志尾读</td>
+        <td><span class="b b-pend">待建</span></td>
+      </tr>
+      <tr>
+        <td rowspan="3">L1 语音头<br><span class="sub">pipecat</span></td>
+        <td><strong>head 管线</strong></td>
+        <td><span class="chips"><span class="chip done">GLM 工具循环</span><span class="chip done">DSH_TOOLS_DOCTRINE</span><span class="chip done">TranscriptState</span><span class="chip done">ReconnectState</span></span></td>
+        <td>工具四件套 dispatch_intent / query_status / cancel_run / remain_silent（head 模型调用）</td>
+        <td>GLM API；DshBackend</td>
+        <td><span class="b b-ok">运行中</span></td>
+      </tr>
+      <tr>
+        <td><strong>DshBackend</strong></td>
+        <td><span class="chips"><span class="chip core">两阶段应答</span><span class="chip done">lane_mode a/b</span><span class="chip done">phase-2 锁重试</span><span class="chip done">收件箱匹配三过滤</span></span></td>
+        <td>dispatch / query_status / cancel / as_backend_fn（工具四件套调用）</td>
+        <td>DaisLane；A2aClient；EventBus</td>
+        <td><span class="b b-ok">建成</span></td>
+      </tr>
+      <tr>
+        <td><strong>DaisLane</strong></td>
+        <td><span class="chips"><span class="chip done">CLI 单飞锁</span><span class="chip done">_inbox 缓冲</span><span class="chip done">live 两行式解析</span></span></td>
+        <td>create_run / send_intent / send_reply / await_done / check_status / read_worker…（DshBackend、执行桥调用）</td>
+        <td>dais CLI（子进程）</td>
+        <td><span class="b b-ok">建成</span></td>
+      </tr>
+      <tr>
+        <td rowspan="4">L2 dsh 宿主<br><span class="sub">agent 生态</span></td>
+        <td><strong>主对接 agent</strong><br><span class="sub">dsh-liaison</span></td>
+        <td><span class="chips"><span class="chip todo">语义收敛器</span><span class="chip todo">稳定指令分发器</span><span class="chip todo">终稿汇总器</span><span class="chip core">信箱（dais 邮箱句柄）</span></span></td>
+        <td>head 的 DshBackend.orchestrator_handle 指向它（V5/V6 替身协议原样移交）</td>
+        <td>router（agents/send）；自身邮箱</td>
+        <td><span class="b b-pend">W5.3</span></td>
+      </tr>
+      <tr>
+        <td><strong>manager 群</strong><br><span class="sub">dsh-manager × N 域</span></td>
+        <td><span class="chips"><span class="chip todo">任务拆分器</span><span class="chip todo">车道选择器 A/B</span><span class="chip todo">worker 监控（游标尾读）</span><span class="chip todo">异常处理（gate/wait-blocked/超时）</span></span></td>
+        <td>向 liaison 回 done；向 worker 派子任务</td>
+        <td>编排 skill（A/B）；router</td>
+        <td><span class="b b-pend">W5.4</span></td>
+      </tr>
+      <tr>
+        <td><strong>内部通信层 router</strong></td>
+        <td><span class="chips"><span class="chip todo">agents/registry</span><span class="chip todo">agents/send</span><span class="chip todo">agents/inbox</span><span class="chip todo">scope 鉴权</span><span class="chip todo">journal 审计</span></span></td>
+        <td>三 RPC（dsh 内 agent 互发；head 查询）</td>
+        <td>session-send（推送）；dais 邮箱（投递）</td>
+        <td><span class="b b-pend">W5.2</span></td>
+      </tr>
+      <tr>
+        <td><strong>A2A 孵化池插件</strong></td>
+        <td><span class="chips"><span class="chip done">六 RPC http-server</span><span class="chip done">ProfileStore 版本化</span><span class="chip done">三孵化器 dsh/omp/claude</span><span class="chip done">执行桥 executors/dais.js</span><span class="chip todo">dsh-liaison/manager 孵化目标</span><span class="chip todo">向导 skill 壳</span></span></td>
+        <td>incubate / profiles.* / message/send / tasks.*（manager、向导、外部调用）</td>
+        <td>Projector+三门；session-spawn；dais 总线</td>
+        <td><span class="b b-ok">主体</span></td>
+      </tr>
+      <tr>
+        <td rowspan="2">L3 车道<br><span class="sub">ADE 双车道</span></td>
+        <td><strong>车道A · dais ADE</strong></td>
+        <td><span class="chips"><span class="chip done">sqlite 邮箱总线</span><span class="chip done">任务 DAG</span><span class="chip done">工作器终端</span><span class="chip done">gate 看护</span></span></td>
+        <td>18 子命令（编排 skill / DaisLane / 执行桥调用）</td>
+        <td>—（底座）</td>
+        <td><span class="b b-ok">live✅</span></td>
+      </tr>
+      <tr>
+        <td><strong>车道B · orca ADE</strong></td>
+        <td><span class="chips"><span class="chip todo">OrcaLane 封装</span><span class="chip todo">terminal send/read-wait</span><span class="chip todo">handoff</span></span></td>
+        <td>编排 skill 车道B 入口（待建）</td>
+        <td>orca-cli</td>
+        <td><span class="b b-pend">待建</span></td>
+      </tr>
+      <tr>
+        <td>L4 底座</td>
+        <td><strong>WS3 投影架构</strong></td>
+        <td><span class="chips"><span class="chip done">Projector 16+3 维</span><span class="chip done">三道质量门</span><span class="chip done">7 场景 profile</span><span class="chip todo">第 17 维 agent_role</span></span></td>
+        <td>project()（孵化池 incubate 调用）</td>
+        <td>GLM API；context-files</td>
+        <td><span class="b b-ok">建成</span></td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- ============ 2.2 指向图 ============ -->
+  <h3 style="font-size:16px;margin:20px 0 10px;color:var(--accent-deep);">2.2 组件关系与指向图</h3>
+  <div class="card">
+    <div class="arch">
+      <div class="tier">
+        <div class="node dim">
+          <h4>局域网语音客户端 <span class="b b-pend">WS4</span></h4>
+          <p>上行 control（文本意图）/ media（音频）；下行 media（播报）+ event（orch.*）</p>
+          <div class="chips"><span class="chip">F1 ↑</span><span class="chip">F12 ↓</span></div>
+        </div>
+      </div>
+      <div class="arrow-row"><div class="arrow"><span class="fnz"><span class="fn">1</span><span class="fn">12</span></span>本地 WebSocket · rt_gateway 帧复用（control/media/event 三路）</div></div>
+      <div class="tier">
+        <div class="node hl" style="flex:2.4;">
+          <h4>pipecat 语音编排头 <span class="b b-ok">运行中</span></h4>
+          <p>工具四件套 + 两阶段 doctrine；受理即回执播报，终稿注入后二次播报（凭证逐字）</p>
+          <div class="chips"><span class="chip">F2 ←gateway</span><span class="chip">F3 →DshBackend</span><span class="chip">F11 播报</span><span class="chip">E1 →EventBus</span></div>
+        </div>
+      </div>
+      <div class="arrow-row"><div class="arrow"><span class="fnz"><span class="fn">4</span><span class="fn">10</span></span>语义指令 ↓（[ref:] 信封）· 终稿 ↑（"Agent Final Message": 前缀）——经 dais 邮箱</div></div>
+      <div class="host">
+        <div class="host-label">dsh 宿主（dsh-web GUI · agent 生态）</div>
+        <div class="tier">
+          <div class="node" style="flex:1.3;">
+            <h4>主对接 agent <span class="b b-pend">W5.3</span></h4>
+            <p>语义→稳定指令收敛；按域分发；终稿汇总回信 head</p>
+            <div class="chips"><span class="chip">F5 收intent</span><span class="chip">F6 →manager</span><span class="chip">F9 ←manager done</span><span class="chip">F10 →head邮箱</span></div>
+          </div>
+          <div class="node">
+            <h4>manager 群 <span class="b b-pend">W5.4</span></h4>
+            <p>拆分子任务 + 选车道 + 监控 worker + 异常上抛</p>
+            <div class="chips"><span class="chip">F7 →车道A/B</span><span class="chip">F8 ←worker done</span><span class="chip">C3 ←取消通知</span></div>
+          </div>
+        </div>
+        <div class="tier">
+          <div class="node" style="border-style:dashed;border-color:#94a3b8;background:#fbfdff;">
+            <h4>内部通信层 router <span class="b b-pend">W5.2</span></h4>
+            <p>推=session-send DSHMSG 注入 · 拉=dais 邮箱投递；scope=project 互通 + journal 审计</p>
+            <div class="chips"><span class="chip">F6 承载</span><span class="chip">C3 承载</span><span class="chip todo">registry/send/inbox</span></div>
+          </div>
+          <div class="node v" style="flex:1.6;">
+            <h4>A2A 孵化池插件 <span class="b b-ok">主体</span></h4>
+            <p>持久 profile list + incubate（三孵化器+执行桥）；router 三 RPC 挂此</p>
+            <div class="chips"><span class="chip">H3 incubate</span><span class="chip">H4 spawn</span><span class="chip todo">向导 skill</span></div>
+          </div>
+        </div>
+        <div class="tier">
+          <div class="node hl">
+            <h4>车道A · dais ADE <span class="b b-ok">live✅</span></h4>
+            <p>dais-orchestration skill；DAG + 邮箱 + 游标监控</p>
+            <div class="chips"><span class="chip">F7/F8</span></div>
+          </div>
+          <div class="node">
+            <h4>车道B · orca ADE <span class="b b-pend">待建</span></h4>
+            <p>orchestration/orca-cli skill；worktree/终端/handoff</p>
+            <div class="chips"><span class="chip">F7/F8（对拍）</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="arrow-row"><div class="arrow"><span class="fnz"><span class="fn">7</span><span class="fn">8</span></span>A/B 车道 task 执行（fan-out ↓ · done 回信 ↑）</div></div>
+      <div class="tier">
+        <div class="node hl">
+          <h4>dais 执行面 <span class="b b-ok">live✅</span></h4>
+          <p>18 子命令 sqlite 邮箱总线（读即消费）；工作器终端</p>
+        </div>
+        <div class="node dim">
+          <h4>orca 执行面 <span class="b b-pend">待接入</span></h4>
+          <p>工作树 / 终端 / 浏览器自动化</p>
+        </div>
+      </div>
+      <div class="arrow-row"><div class="arrow"><span class="fnz"><span class="fn e">E</span></span>孵化供给线：H1 投影 → H2 三门 → H3 incubate → H4 session-spawn → H5 arm（见 §2.4）</div></div>
+    </div>
+    <div class="note" style="margin-top:12px;">边编号语义：<span class="fnz"><span class="fn">F</span></span> 主任务流 · <span class="fnz"><span class="fn h">H</span></span> 孵化流 · <span class="fnz"><span class="fn c">C</span></span> 取消/打断流 · <span class="fnz"><span class="fn e">E</span></span> 事件流——逐跳明细见 §2.3–2.6。</div>
+  </div>
+
+  <!-- ============ 2.3 主任务流 ============ -->
+  <h3 style="font-size:16px;margin:20px 0 10px;color:var(--accent-deep);">2.3 主任务流（语音→编排→播报，逐跳）</h3>
+  <div class="card">
+    <table>
+      <tr><th style="width:46px;">跳</th><th style="width:250px;">指向（from → to）</th><th style="width:210px;">通道 / 协议</th><th>载荷与语义</th></tr>
+      <tr><td><span class="fnz"><span class="fn">1</span></span></td><td class="hop">客户端 → rt_gateway</td><td class="proto">WS · control 帧</td><td>文本意图（或 media 帧音频→head 转写）</td></tr>
+      <tr><td><span class="fnz"><span class="fn">2</span></span></td><td class="hop">rt_gateway → head 管线</td><td class="proto">pipecat 帧管线（进程内）</td><td>用户回合入 LLMContext</td></tr>
+      <tr><td><span class="fnz"><span class="fn">3</span></span></td><td class="hop">head 模型 → DshBackend</td><td class="proto">工具调用 dispatch_intent(raw_intent)</td><td><strong>语义指令</strong>：自包含、指代全展开；立即返回受理回执 {status:accepted, ref, credentials}</td></tr>
+      <tr><td><span class="fnz"><span class="fn">4</span></span></td><td class="hop">DshBackend → dais 邮箱</td><td class="proto">DaisLane：create-run + send-message</td><td>[ref:vh-…] + 语义指令 → 主对接 agent 句柄（收件人邮箱语义，读即消费）</td></tr>
+      <tr><td><span class="fnz"><span class="fn">5</span></span></td><td class="hop">主对接 agent 收 intent</td><td class="proto">拉=邮箱快照轮询；推=router DSHMSG 唤醒</td><td>解析 [ref:]；语义收敛为<strong>稳定指令</strong>（agent 类型 + 自包含 goal + deps，幂等可重放）</td></tr>
+      <tr><td><span class="fnz"><span class="fn">6</span></span></td><td class="hop">对接 agent → manager（们）</td><td class="proto">router agents/send：DSHMSG 推 + 邮箱投</td><td>稳定指令（带 ref 链）；manager 按 schema 受理</td></tr>
+      <tr><td><span class="fnz"><span class="fn">7</span></span></td><td class="hop">manager → 车道A/B</td><td class="proto">编排 skill：dais create-task --dep/start-worker 或 orca terminal/handoff</td><td>子任务 DAG（选车道：终端/工作树→orca；消息 DAG/轻量 fan-out→dais）</td></tr>
+      <tr><td><span class="fnz"><span class="fn">8</span></span></td><td class="hop">车道执行面 → manager</td><td class="proto">worker_done 等待 + read-worker 游标尾读</td><td>子任务产物；异常走 gate / wait-blocked / 超时上抛</td></tr>
+      <tr><td><span class="fnz"><span class="fn">9</span></span></td><td class="hop">manager → 对接 agent</td><td class="proto">邮箱回信（[ref:] 匹配）</td><td>域内汇总 done</td></tr>
+      <tr><td><span class="fnz"><span class="fn">10</span></span></td><td class="hop">对接 agent → head 邮箱</td><td class="proto">dais send-reply → voice-head 句柄</td><td><strong>终稿</strong>："Agent Final Message":\n\n + done body（凭证【凭证…】内嵌）</td></tr>
+      <tr><td><span class="fnz"><span class="fn">11</span></span></td><td class="hop">DshBackend._phase2 → head 上下文</td><td class="proto">on_final 回调注入</td><td>防自匹配三过滤（ref 命中 ∧ seq&gt;intent_seq ∧ from 校验）后注入；head 二次播报（凭证逐字）</td></tr>
+      <tr><td><span class="fnz"><span class="fn">12</span></span></td><td class="hop">head → 客户端</td><td class="proto">rt_gateway · media/event 帧</td><td>播报音频/文本 + orch.done 事件</td></tr>
+    </table>
+    <div class="note">跳 3→4（head→dais）与 10→11（终稿回注）即 V5 已验证的替身协议——W5.3 只是把 5/6/9/10 从测试替身换成真孵化 agent，协议零改动。</div>
+  </div>
+
+  <!-- ============ 2.4 孵化流 ============ -->
+  <h3 style="font-size:16px;margin:20px 0 10px;color:var(--violet);">2.4 孵化流（agent 供给线，含 liaison/manager）</h3>
+  <div class="card">
+    <table>
+      <tr><th style="width:46px;">跳</th><th style="width:250px;">指向</th><th style="width:210px;">通道 / 协议</th><th>载荷与语义</th></tr>
+      <tr><td><span class="fnz"><span class="fn h">1</span></span></td><td class="hop">向导 skill（dsh agent）→ Projector</td><td class="proto">project() 调用</td><td>场景选型 + <strong>role 选型</strong>（liaison/manager/worker/supervisor，第 17 维）→ AGENTS.md 投影</td></tr>
+      <tr><td><span class="fnz"><span class="fn h">2</span></span></td><td class="hop">投影 → 三道质量门</td><td class="proto">gate1/2/3</td><td>术语零暴露 / 灾难底线恒 CAN NOT / 七章节完整；不过则重投影</td></tr>
+      <tr><td><span class="fnz"><span class="fn h">3</span></span></td><td class="hop">向导 → 孵化池 incubate</td><td class="proto">RPC incubate（扩 role/project/mailbox）</td><td>ProfileStore 版本化落盘（重投影才 v+1，原子写）</td></tr>
+      <tr><td><span class="fnz"><span class="fn h">4</span></span></td><td class="hop">孵化器 → session-spawn</td><td class="proto">dsh-liaison / dsh-manager 目标（复用 dsh 孵化器）</td><td>会话创建 + AGENTS.md 注入 + fleet 登记（role/project/mailbox/profile_version）</td></tr>
+      <tr><td><span class="fnz"><span class="fn h">5</span></span></td><td class="hop">arm → ready</td><td class="proto">session.prompt 注入角色 doctrine + 通信契约</td><td>首次心跳后 serving；retire 时 profile 保留可复活（reattach 支持重启重建）</td></tr>
+    </table>
+  </div>
+
+  <!-- ============ 2.5 取消/打断流 ============ -->
+  <h3 style="font-size:16px;margin:20px 0 10px;color:#dc2626;">2.5 打断与取消流</h3>
+  <div class="card">
+    <table>
+      <tr><th style="width:46px;">跳</th><th style="width:250px;">指向</th><th style="width:210px;">通道 / 协议</th><th>载荷与语义</th></tr>
+      <tr><td><span class="fnz"><span class="fn c">1</span></span></td><td class="hop">用户插话 → head</td><td class="proto">语音打断（本地）</td><td>仅打断播报，<strong>从不取消远程执行</strong>（V6 已验证 run 仍在途）</td></tr>
+      <tr><td><span class="fnz"><span class="fn c">2</span></span></td><td class="hop">head → DshBackend.cancel</td><td class="proto">cancel_run(ref)</td><td>杀本地 phase-2 任务（权威取消点）；fail-dispatch 仅当句柄为 ctx_</td></tr>
+      <tr><td><span class="fnz"><span class="fn c">3</span></span></td><td class="hop">router → manager</td><td class="proto">DSHMSG{type:steer}（W5.2）</td><td>可选：通知车道侧终止（gate resolve / 终端中断）</td></tr>
+      <tr><td><span class="fnz"><span class="fn c">4</span></span></td><td class="hop">head 回执用户</td><td class="proto">口语</td><td>{"status":"canceled"}；取消后迟到终稿被丢弃（V6：无迟到播报）</td></tr>
+    </table>
+  </div>
+
+  <!-- ============ 2.6 事件流 ============ -->
+  <h3 style="font-size:16px;margin:20px 0 10px;color:var(--ok);">2.6 事件流（WS4 汇总）</h3>
+  <div class="card">
+    <table>
+      <tr><th style="width:46px;">跳</th><th style="width:250px;">指向</th><th style="width:210px;">通道 / 协议</th><th>载荷与语义</th></tr>
+      <tr><td><span class="fnz"><span class="fn e">1</span></span></td><td class="hop">DshBackend → EventBus</td><td class="proto">orch.dispatch / orch.progress / orch.done</td><td>受理（ref+credentials）/ 仍在跑 / 终稿 artifact</td></tr>
+      <tr><td><span class="fnz"><span class="fn e">2</span></span></td><td class="hop">rt_gateway 订阅</td><td class="proto">EventBus.subscribe</td><td>编排事件 → event 帧通道（与 media/control 复用一条 WS）</td></tr>
+      <tr><td><span class="fnz"><span class="fn e">3</span></span></td><td class="hop">gateway → 客户端</td><td class="proto">event 帧下发</td><td>前端可视化编排进度（W5 后可扩 router journal 回放）</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ================= 3 组件详情 ================= -->
+<section>
+  <h2><span class="idx">3</span>dsh 宿主组件与双车道</h2>
+
+  <div class="card" style="margin-bottom:16px;">
+    <h4 style="font-size:16px;margin-bottom:8px;">① 主对接 agent（语义→稳定的专职翻译官）<span class="b b-pend">待建</span></h4>
+    <ul class="tight">
+      <li><strong>职责：</strong>专于把 head 模型传来的<strong>语义指令</strong>收敛为<strong>稳定指令</strong>（结构化、幂等、可校验），下发 dsh 中每个 <strong>manager 级 agent</strong> 进行编排</li>
+      <li><strong>形态：</strong>dsh 常驻会话（session-spawn 落 fleet）；live V5/V6 中的 <code>session_vhlive</code> 即其替身——两阶段契约（受理回执 + <code>"Agent Final Message":</code> 终稿）与 <code>[ref:]</code> 信封已全链验证可直接沿用</li>
+      <li><strong>现成底座：</strong>DshBackend 的 phase-1/phase-2、防自匹配三过滤、收件箱缓冲、瞬时锁重试——全部可复用为其信箱协议实现</li>
+    </ul>
+  </div>
+
+  <div class="card" style="margin-bottom:16px;">
+    <h4 style="font-size:16px;margin-bottom:8px;">② 编排器 skill → 双 ADE 车道</h4>
+    <table>
+      <tr><th style="width:190px;">车道</th><th style="width:220px;">编排 skill</th><th>实现状态</th></tr>
+      <tr>
+        <td><strong>车道A · dais ADE</strong> <span class="b b-ok">建成</span></td>
+        <td><code>dais-orchestration</code> skill</td>
+        <td>DaisLane（18 子命令 async 封装 + 单飞锁 + 收件箱缓冲）→ DshBackend 两阶段应答 → 工具四件套；live V5/V6 全链 PASS；<strong>车道内双到达路径</strong>（CLI 直达 / 孵化池执行桥 <code>executors/dais.js</code>）conformance 同结果（tests/test_rt_conformance.py）</td>
+      </tr>
+      <tr>
+        <td><strong>车道B · orca ADE</strong> <span class="b b-pend">待建</span></td>
+        <td><code>orchestration</code> / <code>orca-cli</code> skill</td>
+        <td>OrcaLane 封装（worktree/terminal send/read-wait、task dispatch、worker_done 等待）+ 与 dais 车道 A/B conformance 对拍；M0 探针已验证 orca-ide 可调起（245ms）</td>
+      </tr>
+    </table>
+    <div class="note">分派策略（按任务特征选车道：长驻终端任务/工作树级交付 → orca；消息总线 DAG/轻量 fan-out → dais）随主对接 agent 落地一并交付。</div>
+  </div>
+
+  <div class="card">
+    <h4 style="font-size:16px;margin-bottom:8px;">③ A2A 孵化池插件（agent 供给线）<span class="b b-ok">主体建成</span></h4>
+    <div class="grid2">
+      <div>
+        <ul class="tight">
+          <li><strong>位置：</strong><code>~/.dsh/plugins/a2a-profile-server/</code>（cordis 插件形制，dsh 挂载）</li>
+          <li><strong>持久 list：</strong>版本化 ProfileStore——AGENTS.md + profile.json + meta + history.jsonl + <code>versions/</code> 归档，重投影才 v+1，原子写</li>
+          <li><strong>六 RPC：</strong>message/send · tasks/get · tasks/cancel · incubate · profiles/list · profiles/get（Bearer 鉴权）</li>
+          <li><strong>底座 = WS3 多维架构：</strong>Projector（BEHAVIOR-SPACE 16+3 维 / 7 场景 profile）+ 三门（术语零暴露 / 灾难底线恒 CAN NOT / 七章节完整），真 GLM 投影冒烟过三门</li>
+        </ul>
+      </div>
+      <div>
+        <ul class="tight">
+          <li><strong>三真实孵化器：</strong>dsh（session-spawn 真会话注入 fleet）/ omp（oh-my-opencode.json 备份写+还原验证）/ claude（frontmatter 形制三门过体）——冒烟 3/3</li>
+          <li><span class="b b-pend">待建</span> <strong>创建向导 skill：</strong>引导 dsh agent 走"场景选型 → 投影 → 三门 → 选孵化目标 → incubate"流程；Projector+三门+incubate 全部就绪，缺 skill 壳（W3.4）</li>
+          <li><strong>验证：</strong>node selftest 14/14；跨语言一致性 5/5；真孵化 3/3</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h4 style="font-size:16px;margin-bottom:8px;">④ dsh 内部通信层（agent 间消息）<span class="b b-pend">W5.2 规划</span></h4>
+    <ul class="tight">
+      <li><strong>定位：</strong>孵化出的对接 agent / manager 群 / worker 在 <strong>dsh 内部互通</strong>，打破会话隔离——但按 scope 受控打破（项目内全互通，跨项目显式授权）</li>
+      <li><strong>现成底座（已存在，规划直接复用）：</strong>maestro <code>session-send</code>（<code>DSHMSG]{from,to,type,ref,body}</code> 信封，经 loopback <code>session.prompt</code> 注入目标会话 = 推送模式）；dais 邮箱总线（agent 持 skill 轮询 = 拉取模式）</li>
+      <li><strong>新增：</strong>孵化池插件内路由器三 RPC（agents/registry · agents/send · agents/inbox）+ 全量 journal 审计</li>
+      <li><strong>详细规划：</strong>见 §4（W5.1 孵化能力扩展 / W5.2 通信层 / W5.3 对接落位 / W5.4 manager 群）</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ================= 4 dsh agent 生态详细规划 ================= -->
+<section>
+  <h2><span class="idx">4</span>dsh 内 agent 生态：孵化扩展 + 内部通信（详细规划）</h2>
+  <p class="lede">原则：对接 agent 与 manager 级 agent <strong>同样是孵化池产物</strong>（prompt 来自 WS3 投影）；dsh 从"单会话容器"升级为"可孵化、可互通、可续命的 agent 生态底座"。分四个工作包 W5.1–W5.4。</p>
+
+  <div class="card" style="margin-bottom:16px;">
+    <h4 style="font-size:16px;margin-bottom:8px;">W5.1 · dsh 孵化能力扩展（incubation v2）</h4>
+    <table>
+      <tr><th style="width:190px;">项</th><th>规划</th><th style="width:240px;">落点</th></tr>
+      <tr>
+        <td><strong>角色维度进行为空间</strong></td>
+        <td>BEHAVIOR-SPACE 增设第 17 维 <code>agent_role ∈ {liaison, manager, worker, supervisor}</code>；每 role 专属投影模板（见下）；三门照常适用——agent 间协议同样术语零暴露</td>
+        <td><code>rt_projector.py</code> SOURCES+模板</td>
+      </tr>
+      <tr>
+        <td><strong>liaison 模板</strong>（对接）</td>
+        <td>语义→稳定指令收敛契约；两阶段应答协议（受理回执 + <code>"Agent Final Message":</code> 终稿）；<code>[ref:]</code> 信封规则；凭证逐字回显纪律</td>
+        <td>Projector role 模板</td>
+      </tr>
+      <tr>
+        <td><strong>manager 模板</strong>（域编排）</td>
+        <td>域职责；A/B 车道选择策略；子任务拆分与依赖（--dep）；worker_done 等待；异常上抛（gate 阻塞 / wait-blocked / 超时）</td>
+        <td>Projector role 模板</td>
+      </tr>
+      <tr>
+        <td><strong>孵化目标扩展</strong></td>
+        <td>新增 <code>dsh-liaison</code> / <code>dsh-manager</code> 孵化目标（复用 dsh 孵化器 + role profile）；incubate RPC 参数扩展 <code>role / project / mailbox</code>（默认句柄 <code>agent_&lt;name&gt;</code>）；返回 sessionId + fleet 登记 + 句柄 + profile 版本</td>
+        <td><code>incubators/real.js</code> + http-server incubate</td>
+      </tr>
+      <tr>
+        <td><strong>Fleet 元数据扩展</strong></td>
+        <td>fleet.json 登记项扩：<code>role / project / mailbox / profile_version / spawned_at</code>；<strong>reattach</strong>：dsh 重启后按 fleet 反查会话重建路由（会话不存在 → 标记 retired，孤儿检测）</td>
+        <td><code>session-spawn</code> + 插件 registry</td>
+      </tr>
+      <tr>
+        <td><strong>生命周期</strong></td>
+        <td><code>spawn（开会话+注 profile）→ arm（注入角色 doctrine + 通信契约）→ ready（首次心跳）→ serving → retire</code>；心跳 = agent 定期向自身邮箱 ping 或 router 探活会话；退休 = 取消会话 + fleet 标记，持久 profile 保留可复活</td>
+        <td>插件 lifecycle + registry</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="card" style="margin-bottom:16px;">
+    <h4 style="font-size:16px;margin-bottom:8px;">W5.2 · dsh 内部通信层（打破会话隔离）</h4>
+    <table>
+      <tr><th style="width:190px;">项</th><th>规划</th><th style="width:240px;">落点</th></tr>
+      <tr>
+        <td><strong>通信原语</strong></td>
+        <td>与既有契约同构（零新概念）：信封 <code>{"from","to","ref","type","body"}</code>；两阶段（ack 含 ref → 终稿前缀）；凭证逐字；防自匹配三过滤（ref 命中 ∧ seq&gt;intent_seq ∧ from 校验）</td>
+        <td>复用两阶段契约（V5/V6 已验证）</td>
+      </tr>
+      <tr>
+        <td><strong>推送模式</strong></td>
+        <td>maestro <code>session-send</code> 现成底座：<code>DSHMSG]{from,to,type,ref,body}</code> 单行信封经 loopback <code>session.prompt</code> 注入目标会话（收方回合首行可机器解析）；类型集 <code>ping/pong/done/ask/steer/ack/nack</code>；用于唤醒与低时延通知</td>
+        <td><code>~/.dsh/maestro/bin/session-send</code>（已存在）</td>
+      </tr>
+      <tr>
+        <td><strong>拉取模式</strong></td>
+        <td>dais 邮箱：agent 持 <code>dais-orchestration</code> skill 有界快照轮询自身句柄（语义已钉死：收件人邮箱 / 读即消费 / <code>--timeout-ms</code> 快照）；用于正文与大负载</td>
+        <td>车道A 语义照搬（§6）</td>
+      </tr>
+      <tr>
+        <td><strong>路由器三 RPC</strong></td>
+        <td>孵化池插件新增：<code>agents/registry</code>（在册 agent：role/project/session/心跳）、<code>agents/send</code>（{to,from,ref,body} → 推注入或邮箱投递 → ack）、<code>agents/inbox</code>（agent 未读列表，调试与 head 查询）</td>
+        <td><code>a2a-profile-server/http-server.js</code></td>
+      </tr>
+      <tr>
+        <td><strong>隔离边界（受控打破）</strong></td>
+        <td>scope=<code>project</code> 内全互通；跨 project 需 registry 显式授权记录；router 只注入<strong>固定信封格式的消息通知</strong>，不注入任意指令——目标 agent 按 doctrine 解析；全量路由消息进 journal 审计（复用 task-store JSONL 形制）</td>
+        <td>router + journal</td>
+      </tr>
+      <tr>
+        <td><strong>与 A/B 车道的关系</strong></td>
+        <td>manager 收稳定指令 → 编排 skill 选车道派发 → 车道 done 回信投回 manager 邮箱 → 汇总 → 回对接 agent → 回 head；<strong>每跳带 ref，凭证全链不丢</strong></td>
+        <td>全链贯通即 V7 验证</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h4 style="font-size:16px;margin-bottom:8px;">W5.3 · 主对接 agent（liaison）落位</h4>
+      <ul class="tight">
+        <li>用 <code>dsh-liaison</code> 模板孵化；profile 由 Projector 投影（场景=编排对接）过三门</li>
+        <li><strong>邮箱句柄 = head 的 <code>DshBackend.orchestrator_handle</code> 目标</strong>——V5/V6 已验证的替身协议（<code>session_vhlive</code>）原样移交，head 侧零改动</li>
+        <li>职责链：语义指令 → 稳定指令（agent + 自包含 goal + deps 结构）→ 按域分发 manager → 汇总终稿 → 回信 head</li>
+        <li>下游通路走 W5.2 通信层（推唤醒 + 拉正文）</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4 style="font-size:16px;margin-bottom:8px;">W5.4 · manager 级 agent 群</h4>
+      <ul class="tight">
+        <li>每个项目域一个 <code>dsh-manager</code>（调研 / 代码 / 文档…按 project profile 孵化）</li>
+        <li>收到稳定指令 → 拆子任务 + 依赖 → <strong>选车道</strong>：长驻终端 / 工作树级交付 → orca ADE；消息 DAG / 轻量 fan-out → dais ADE → 派发 → 等 worker_done → 汇总回对接</li>
+        <li>异常路径：gate 阻塞（resolve-gate）/ wait-blocked（scan-wait-blocked）/ 超时上抛 supervisor（role 预留）</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <h4 style="font-size:16px;margin-bottom:8px;">W5 验证计划</h4>
+    <table>
+      <tr><th style="width:130px;">层</th><th>内容</th></tr>
+      <tr><td>单测</td><td>registry / send / inbox 三 RPC（mock 路由）；fleet 元数据读写与 reattach 孤儿检测；role 投影模板过三门</td></tr>
+      <tr><td>live V7</td><td>孵化 liaison + manager 各一 → head → 对接 → manager → dais 车道执行 → 终稿逐跳回传 → head 播报（凭证逐字）全链一次</td></tr>
+      <tr><td>conformance</td><td>推注入（DSHMSG）vs 邮箱拉取 双投递模式同结果；A/B 车道对拍（复用既有对拍方法论）</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ================= 5 核心契约 ================= -->
+<section>
+  <h2><span class="idx">5</span>分层核心契约</h2>
+  <p class="lede">head 只说语义；主对接 agent 收敛为稳定指令；凭证经口语通道逐字回显，机器侧可校验。</p>
+  <div class="card">
+    <div class="flow" style="margin-bottom:16px;">
+      <span class="step">用户语音</span><span class="n">→</span>
+      <span class="step">head 抽取语义指令</span><span class="n">→</span>
+      <span class="step">dispatch_intent</span><span class="n">→</span>
+      <span class="step">主对接 agent 受理（回执 ref）</span><span class="n">→</span>
+      <span class="step">稳定指令 → manager 级 agent</span><span class="n">→</span>
+      <span class="step">编排器 skill 选 A/B 车道</span><span class="n">→</span>
+      <span class="step">ADE 执行 fan-out</span><span class="n">→</span>
+      <span class="step">终稿回信（[ref:] 匹配）</span><span class="n">→</span>
+      <span class="step">head 二次播报（凭证逐字）</span>
+    </div>
+    <table>
+      <tr><th style="width:210px;">契约</th><th>内容</th></tr>
+      <tr><td>语义指令（head 出口）</td><td><code>dispatch_intent(raw_intent)</code> 单字符串，自包含、指代全展开；head 零 schema 压力</td></tr>
+      <tr><td>受理回执（phase-1）</td><td><code>{"status":"accepted","run_id","ref","credentials":["【凭证VH-…】"]}</code>——立即返回，ref 原样口语播报（丢失即事故）</td></tr>
+      <tr><td>稳定指令（主对接 agent 出口）</td><td>语义收敛为结构化指令（agent 类型 + 自包含 goal + 依赖），幂等可重放；下发 manager 级 agent</td></tr>
+      <tr><td>终稿（phase-2）</td><td><code>"Agent Final Message":\n\n&lt;done body&gt;</code> 前缀 → 注入 head 上下文 → 二次播报；<strong>编排输出是权威凭证通道，head 口语是摘要</strong></td></tr>
+      <tr><td>凭证约定</td><td><code>【凭证…】</code> 定界符逐字回显（12/12 麻雀泛化验证）</td></tr>
+      <tr><td>回信匹配（防自匹配）</td><td><code>[ref:]</code> 命中 ∧ <code>seq &gt; intent_seq</code> ∧ <code>from == 对接 agent 句柄</code>——否则会把自己发的指令当回信（live 实锤）</td></tr>
+      <tr><td>打断 / 取消</td><td>本地播报打断从不取消远程执行；显式 <code>cancel_run</code> 才取消（V6 验证：取消后无迟到终稿）；<code>fail-dispatch</code> 仅认 ctx_ 句柄，杀本地 phase-2 即权威取消</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ================= 5 总线语义 ================= -->
+<section>
+  <h2><span class="idx">6</span>dais 总线 live 语义（车道A 实测钉死）</h2>
+  <div class="card">
+    <table>
+      <tr><th style="width:60px;">#</th><th style="width:230px;">语义</th><th>工程对策（已固化代码）</th></tr>
+      <tr><td>1</td><td><code>check-messages</code> 列<strong>收件人</strong>邮箱；<strong>读即消费</strong></td><td>phase-2 轮询 head 自己的邮箱；一箱多信入 <code>_inbox</code> 缓冲供并发等待者</td></tr>
+      <tr><td>2</td><td>无 flags 空邮箱<strong>无限阻塞</strong>；<code>--wait</code> 只捕窗口期新到、忽略已有未读</td><td>轮询循环一律 <code>--timeout-ms N</code>（无 wait）有界快照 + 自管 sleep</td></tr>
+      <tr><td>3</td><td>并发调用在总线锁<strong>互饿</strong>（超时只界等信不界排队）</td><td>DaisLane 进程内 <code>asyncio.Lock</code> 单飞化；跨进程轮询者留 sleep 间隙</td></tr>
+      <tr><td>4</td><td>daemon 高 churn 下偶发 <strong>dispatch 楔死</strong>（futex 挂起持锁）</td><td>live 测试健康探测 + 单次重试，楔死则 skip 提示重启 daemon</td></tr>
+      <tr><td>5</td><td>跨进程瞬时 <code>database is locked</code></td><td>_phase2 对 DaisLaneError 重试至总预算；仅 TimeoutError 视作"仍在跑"</td></tr>
+    </table>
+    <div class="note warn">车道B（orca ADE）接入时需同法钉死其 live 语义（orca-cli 终端读写/等待契约），并做 A/B 车道 conformance 对拍——对应旧计划中的对拍框架可直接复用（tests/test_rt_conformance.py 已验证对拍方法论）。</div>
+  </div>
+</section>
+
+<!-- ================= 6 里程碑 ================= -->
+<section>
+  <h2><span class="idx">7</span>里程碑进度（按修正架构重新归位）</h2>
+  <div class="card">
+    <div class="tl">
+      <div class="tl-item">
+        <h4>M0 · 探针矩阵 <span class="b b-ok">完成</span></h4>
+        <p>dais 177ms / orca-ide 245ms 均可从 pipecat venv 调起（双 ADE 车道探针齐备）；A2A fake server 骨架 9/9</p>
+      </div>
+      <div class="tl-item">
+        <h4>M1 · WS3 多维投影架构 <span class="b b-ok">完成</span></h4>
+        <p>Projector + 三门 22/22；真 GLM 投影冒烟过三门——孵化池的底座</p>
+      </div>
+      <div class="tl-item">
+        <h4>M2 · A2A 孵化池插件 <span class="b b-ok">主体完成</span></h4>
+        <p>六 RPC + 版本化持久 list + 三真实孵化器冒烟 3/3；<span class="b b-pend">创建向导 skill 壳（W3.4）待建</span></p>
+      </div>
+      <div class="tl-item">
+        <h4>M3 · 车道A（dais ADE）全链 <span class="b b-ok">完成</span></h4>
+        <p>DaisLane / DshBackend / 工具四件套 / 车道内双路径 conformance / live V5（语音→run→播报）V6（打断+问询+取消）——GLM 文本模式（Q2 定案）；编排会话由测试替身扮演</p>
+      </div>
+      <div class="tl-item pend">
+        <h4>W5 · dsh agent 生态（孵化v2 + 内部通信）<span class="b b-pend">规划完成 · 待建</span></h4>
+        <p>W5.1 孵化能力扩展（角色维度 / dsh-liaison / dsh-manager 模板 / fleet 元数据 + reattach / 生命周期）；W5.2 内部通信层（session-send 推送 + dais 邮箱拉取 + 路由器三 RPC + 受控打破隔离）；W5.3 对接 agent 落位（替身协议移交）；W5.4 manager 群；验证 = 单测 + live V7 + 双模式 conformance —— 详见 §4</p>
+      </div>
+      <div class="tl-item pend">
+        <h4>M3+ · 架构修正后增量 <span class="b b-pend">待做</span></h4>
+        <p>① 车道B orca ADE：OrcaLane + 与 dais 车道 conformance 对拍 ② 编排器 skill A/B 分派策略（随 W5.4 manager 落地）③ 孵化池创建向导 skill 壳</p>
+      </div>
+      <div class="tl-item pend">
+        <h4>M4 · WS4 本地网关 <span class="b b-pend">待做</span></h4>
+        <p>rt_gateway 三路复用帧协议 + orch.* 事件汇总（局域网语音入口；公网穿透已移出架构）</p>
+      </div>
+      <div class="tl-item pend">
+        <h4>M5 · 收口 <span class="b b-pend">待做</span></h4>
+        <p>全量测试绿 + dogfood：孵化向导自举"监督员"profile → 主对接 agent 编排一次真实 A/B 车道 fan-out</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 7 测试证据 ================= -->
+<section>
+  <h2><span class="idx">8</span>测试与证据</h2>
+  <div class="card">
+    <table>
+      <tr><th>测试文件</th><th style="width:90px;">用例</th><th>覆盖（按修正架构归位）</th></tr>
+      <tr><td><code>test_live_v5_v6.py</code> <span class="b b-info">live</span></td><td>1</td><td>车道A 全链：真 GLM head + 真 dais 总线，V5/V6 双 PASS（编排会话为替身）</td></tr>
+      <tr><td><code>test_rt_conformance.py</code> <span class="b b-info">live</span></td><td>2</td><td>车道A 内双到达路径对拍（CLI 直达 vs 孵化池执行桥）——方法论可复用于将来 A/B 车道对拍</td></tr>
+      <tr><td><code>test_rt_dsh_lane.py</code></td><td>14</td><td>dais-orchestration 封装全方法 + live 两行式解析 + 防自匹配 + 真 dais 冒烟</td></tr>
+      <tr><td><code>test_rt_dsh_backend.py</code> / <code>test_rt_head_tools.py</code></td><td>12</td><td>两阶段应答 / 终稿注入 / 取消 / 四件套 schema 与 doctrine</td></tr>
+      <tr><td><code>test_rt_projector.py</code> + <code>test_projection_live.py</code> <span class="b b-info">live</span></td><td>23</td><td>WS3 多维投影 + 三门 + 真 GLM 冒烟（孵化池底座）</td></tr>
+      <tr><td><code>test_rt_a2a_client.py</code> + <code>test_incubators_real.py</code> <span class="b b-info">live</span></td><td>8</td><td>孵化池六 RPC 跨语言一致 + 三真实孵化器冒烟</td></tr>
+      <tr><td><code>test_rt_orchestrator / reconnect / transcript / m0_probe</code></td><td>34</td><td>编排层 / 重连 / 转写 / 双 ADE 探针矩阵</td></tr>
+      <tr><td><strong>合计</strong></td><td><strong>94</strong></td><td><strong>13 文件全绿</strong>（.venv/bin/python -m pytest）</td></tr>
+    </table>
+    <div class="note">证据文档：<code>docs/kg/evidence/m0-probe.md</code>（双 ADE 探针）、<code>m3-live-v5v6.md</code>（车道A 全链）；逻辑 KG：<code>docs/kg/00-INDEX.md</code>→<code>05-contracts.md</code>（〔loc:〕〔new:〕〔cli:〕〔doc:〕 指针，全部机械验证）。</div>
+  </div>
+</section>
+
+<!-- ================= 8 风险与开放问题 ================= -->
+<section>
+  <h2><span class="idx">9</span>风险与开放问题</h2>
+  <div class="card">
+    <table>
+      <tr><th style="width:90px;">状态</th><th style="width:250px;">事项</th><th>说明与对策</th></tr>
+      <tr><td><span class="b b-ok">已定案</span></td><td>Q2 · 语音模态</td><td>DASHSCOPE_API_KEY 缺失 → GLM 文本模式先行；Qwen realtime 路径已探通待 key</td></tr>
+      <tr><td><span class="b b-pend">新增待办</span></td><td>主对接 agent 落位</td><td>协议已验证（替身全链 PASS）；需孵化为真实 dsh 常驻 agent（session-spawn + fleet），并把 DshBackend 信箱逻辑移交其会话</td></tr>
+      <tr><td><span class="b b-pend">新增待办</span></td><td>车道B orca ADE</td><td>OrcaLane 封装 orca-cli（终端读写/等待/任务派发）+ A/B conformance 对拍；R1 风险：裸 orca 是屏幕阅读器，必须 orca-ide/orca-cli（M0 已验证路径）</td></tr>
+      <tr><td><span class="b b-pend">新增待办</span></td><td>孵化池向导 skill</td><td>Projector+三门+incubate 全就绪，缺引导 dsh agent 的 skill 壳（W3.4）</td></tr>
+      <tr><td><span class="b b-info">已对策</span></td><td>dais daemon 楔死 / 锁竞争</td><td>健康探测 + 重试 + skip；进程内单飞锁 + 有界快照轮询；详见 §5</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ================= 9 下一步 ================= -->
+<section>
+  <h2><span class="idx">10</span>下一步计划（按修正架构排序）</h2>
+  <div class="card">
+    <ol class="tight">
+      <li><strong>W5.1 孵化能力扩展</strong>：Projector 增第 17 维 agent_role（liaison/manager/worker/supervisor 模板）；插件新增 <code>dsh-liaison</code> / <code>dsh-manager</code> 孵化目标（incubate 扩 role/project/mailbox 参数）；fleet 元数据扩展 + 重启 reattach + 生命周期（spawn→arm→ready→serving→retire）。</li>
+      <li><strong>W5.2 内部通信层</strong>：插件内路由器三 RPC（agents/registry · agents/send · agents/inbox）；推 = session-send DSHMSG 注入，拉 = dais 邮箱有界快照轮询；scope 受控互通 + journal 审计。</li>
+      <li><strong>W5.3 主对接 agent 落位</strong>：dsh-liaison 模板孵化 → 邮箱句柄接管 head 的 DshBackend.orchestrator_handle（V5/V6 替身协议原样移交，head 零改动）。</li>
+      <li><strong>W5.4 manager 群 + live V7</strong>：dsh-manager 孵化 → head→对接→manager→dais 车道全链一次（凭证逐跳逐字）；推/拉双模式 conformance。</li>
+      <li><strong>车道B orca ADE</strong>：OrcaLane 封装 orca-cli + A/B 分派策略（随 manager 落地）+ dais↔orca conformance 对拍。</li>
+      <li><strong>孵化池创建向导 skill</strong>（W3.4 壳）：引导 dsh agent 走"场景选型→投影→三门→选目标→incubate"（现在也覆盖 role 选型）。</li>
+      <li><strong>M4 WS4</strong>：rt_gateway 三路复用帧协议 + orch.* 事件汇总（本地 ws 服务，局域网语音入口）。</li>
+      <li><strong>M5 收口</strong>：全量回归 + dogfood——向导自举"监督员"profile → 对接 agent 编排一次真实 A/B 双车道 fan-out。</li>
+    </ol>
+    <div class="note warn"><strong>账本备注：</strong>原长时任务账本服务端损坏，本会话以 <code>docs/kg/evidence/ledger-carryover-round6.md</code> 为权威账本逐轮更新；本轮架构修正已同步记入。</div>
+  </div>
+</section>
+
+<div class="foot">
+  <span>语音编排头系统 · 方案报告 v2（架构修正版：dsh 宿主 + 双 ADE 车道 + 孵化池 + 主对接 agent）</span>
+  <span>pipecat-poc · 2026-08-23</span>
+</div>
+
+</div>
+</body>
+</html>
