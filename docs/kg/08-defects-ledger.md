@@ -107,3 +107,5 @@
 **跨会话/跨平面编排 ✖（组合内生为 0）**：①persona 是一行裸文本（"You are a coding agent..."），零编排 doctrine（dispatch 握手/预算裁决/red lines 全靠外置 orch-index）；②预设目录仅 2 文件——无 skills/（skill-filesystem 未配 customSkillDirs，orchestration/orca-cli/maestro-bridge 全不在面）、无 plugins/ 行（maestro 有 message-bridge/orca-callback pump/session-purge/workspace-unarchive 4 行，long-task 0 行）；③codex/claude-code provider 显式 disabled（生产不装）。本会话历史里的跨会话编排（relay <seat>/supervisor <seat>/e858 handoff）全部走 host 级外置桥（`~/.dsh/maestro/bin/session-send`、孵化插件 subprocess），非 preset 能力。
 
 **判定**：长时模式=单会话编排完备、舰队编排靠环境外挂——即 §5 复盘"long-task 缺高级编排"的结构性根源：桥是 ambient 的（知道即能用），不是 contractual 的（组合声明）。N10 的 queen 派生若要产出"编排型"profile，delegation 组是正确基底，跨会话面需显式补插件行+skills。
+
+**更新溯源（补充）**：delegation 组是 2026-08-22 更新带来的——该日 10:01 装 dsh rc.8，21:39:26–57 三 preset（liangshen/maestro/long-task）agent.cordis.yml 同窗重写，maestro 与 long-task 的 delegation 组行集**完全一致**（含同为 disabled 的 codex/claude-code 行）。即更新后两 preset 的进程内编排面已对齐，maestro 的独占差异仅剩：4 个本地插件行（message-bridge/orca-callback pump/workspace-unarchive/session-purge）+ skills/ 目录 + persona 编排 doctrine。
