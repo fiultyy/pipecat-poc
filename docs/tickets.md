@@ -79,7 +79,7 @@
 - **量**:中 · **依赖**:无(**可与 W5 线并行**) · **派发**:本仓 code
 - **回报物**:evidence/VO-008-report.md · **done body**:同上格式
 
-### VO-009 车道B live 冒烟 + A/B 对拍(B.3–B.4) ☐
+### VO-009 车道B live 冒烟 + A/B 对拍(B.3–B.4) ☑
 
 - **目标/方案**:真 spawn 1 worktree→wait→read 全程有界;A/B conformance:同一意图双车道→终稿均 FINAL_PREFIX+同 body、凭证一致(终稿通道不分会道,统一 dais 邮箱链回传)。
 - **路径**:`tests/test_rt_conformance.py` 扩(lane 工厂参数化)。
