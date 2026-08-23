@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rt_gateway 语音编排面板</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; background: #101418; color: #dfe7ee; display: grid;
+         grid-template-columns: 340px 1fr; gap: 12px; padding: 12px; }
+  panel { background: #171d24; border: 1px solid #26303a; border-radius: 10px; padding: 12px; }
+  h1 { font-size: 15px; margin: 0 0 8px; color: #8fd3ff; }
+  button { background: #2b3a4a; color: #dfe7ee; border: 1px solid #3a4c5f;
+           border-radius: 6px; padding: 6px 10px; cursor: pointer; margin: 2px; }
+  button:hover { background: #365069; }
+  input[type=password] { background: #0d1116; color: #dfe7ee; border: 1px solid #3a4c5f;
+                         border-radius: 6px; padding: 6px 8px; width: 92%; }
+  pre { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap;
+        overflow: auto; margin: 6px 0; }
+  #tree { min-height: 180px; }
+  #log { min-height: 160px; max-height: 340px; color: #a9b7c4; }
+  #metrics { color: #7fe3a1; }
+  #gatePanel { position: fixed; inset: 0; background: rgba(4,8,12,.72);
+               display: flex; align-items: center; justify-content: center; }
+  #gatePanel[hidden] { display: none; }
+  #gateBox { background: #1b232c; border: 1px solid #4a9eff; border-radius: 12px;
+             padding: 20px; max-width: 520px; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 6px 0; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+  <panel>
+    <h1>rt_gateway · WS4</h1>
+    <div class="row"><input id="token" type="password" placeholder="VOICE_GATEWAY_TOKEN"></div>
+    <div class="row">
+      <button id="micBtn">开播麦克风</button>
+      <button id="endBtn">结束会话</button>
+      <button id="pingBtn">ping</button>
+    </div>
+    <div id="metrics">—</div>
+    <pre id="tree">（等待编排事件…）</pre>
+  </panel>
+  <panel>
+    <h1>事件流</h1>
+    <pre id="log"></pre>
+  </panel>
+
+  <div id="gatePanel" hidden>
+    <div id="gateBox">
+      <div id="gateQ" style="margin-bottom:12px"></div>
+      <div id="gateOpts" class="row"></div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+// 静态页（KG 04 §2）：AudioWorklet 采集/播放 + run/ticket/worker 三级树 +
+// gate 弹层。断线指数退避 0.5→8s 重连（KG 04 §4），重连后 session.start 带
+// 旧会话 id → 网关 take_tail 重播种。
+
+const $ = (id) => document.getElementById(id);
+const state = {
+  ws: null,
+  sessionId: null,   // 本连接 auth.ok 签发
+  convId: null,      // 会话级（重连续接不变）
+  reconnectAttempt: 0,
+  micWanted: false,
+  micOn: false,
+  sendCtx: null, sendNode: null,
+  playCtx: null, playNode: null,
+  runs: new Map(),   // run_id -> {tickets: Map(ticket -> Map(worker -> note)), done}
+};
+
+const logLine = (line) => {
+  const el = $("log");
+  el.textContent += `[${new Date().toTimeString().slice(0, 8)}] ${line}\n`;
+  el.scrollTop = el.scrollHeight;
+};
+
+// ---- 连接 / 握手 / 重连 ----
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  state.ws = ws;
+
+  ws.onopen = () => wsSend({ t: "auth", token: $("token").value });
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) { enqueuePlay(new Int16Array(ev.data)); return; }
+    handleControl(JSON.parse(ev.data));
+  };
+  ws.onclose = () => {
+    stopMic();
+    if (state.micWanted) {
+      const delay = Math.min(8000, 500 * 2 ** state.reconnectAttempt++);
+      logLine(`连接断开，${delay}ms 后重连（第 ${state.reconnectAttempt} 次）`);
+      setTimeout(connect, delay);
+    }
+  };
+}
+
+function handleControl(msg) {
+  switch (msg.t) {
+    case "auth.ok":
+      state.sessionId = msg.session_id;
+      // 断线重连带旧会话 id → 网关 take_tail 重播种
+      wsSend({ t: "session.start", session_id: state.convId || state.sessionId });
+      break;
+    case "session.started":
+      state.convId = msg.session_id;
+      state.reconnectAttempt = 0;
+      logLine(`会话 ${msg.session_id} 建立${msg.reseeded ? `（重播种 ${msg.entries} 条）` : ""}`);
+      if (state.micWanted) startMic();
+      break;
+    case "pong": break;
+    case "error":
+      logLine(`错误 ${msg.code}: ${msg.msg}`);
+      if (msg.code === "auth" || msg.code === "concurrent_limit") {
+        state.micWanted = false; $("micBtn").textContent = "开播麦克风";
+      }
+      break;
+    case "session.ended":
+      logLine("会话已结束");
+      state.micWanted = false; $("micBtn").textContent = "开播麦克风";
+      break;
+    default:
+      if (msg.t && msg.t.startsWith("orch.")) {
+        renderEvent(msg);
+        logLine(`evt ${msg.t} ${summarize(msg)}`);
+      }
+  }
+}
+
+function wsSend(obj) {
+  if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj));
+}
+
+function summarize(m) {
+  if (m.t === "orch.dispatch") return `${m.ref} ${m.run_id} [${(m.tickets || []).join(",")}]`;
+  if (m.t === "orch.progress") return `${m.dispatch_id} ${m.lines}行 ${(m.head || "").slice(0, 60)}`;
+  if (m.t === "orch.ack") return `${m.node} ← ${m.worker}`;
+  if (m.t === "orch.done") return `${m.run_id} ${(m.artifact || "").slice(0, 60)}`;
+  return JSON.stringify(m).slice(0, 90);
+}
+
+// ---- 三级树：run → ticket → worker ----
+
+function ensureRun(runId) {
+  if (!state.runs.has(runId)) state.runs.set(runId, { tickets: new Map(), done: null });
+  return state.runs.get(runId);
+}
+function latestRun() {
+  const ids = [...state.runs.keys()];
+  return ids.length ? state.runs.get(ids[ids.length - 1]) : null;
+}
+
+function renderEvent(m) {
+  if (m.t === "orch.dispatch") {
+    const run = ensureRun(m.run_id);
+    (m.tickets || []).forEach((tk) => { if (!run.tickets.has(tk)) run.tickets.set(tk, new Map()); });
+  } else if (m.t === "orch.ack") {
+    const run = latestRun();
+    if (run && run.tickets.has(m.node)) run.tickets.get(m.node).set(m.worker, "ack");
+  } else if (m.t === "orch.progress") {
+    // dispatch_id(ctx_…)即 worker 视图；挂到尚无该 worker 的第一个 ticket 下
+    const run = latestRun();
+    if (run) {
+      for (const workers of run.tickets.values()) {
+        if (!workers.has(m.dispatch_id)) {
+          workers.set(m.dispatch_id, `${m.lines}行 ${(m.head || "").slice(0, 48)}`);
+          break;
+        }
+      }
+    }
+  } else if (m.t === "orch.gate") {
+    showGate(m);
+  } else if (m.t === "orch.done") {
+    ensureRun(m.run_id).done = m.artifact;
+  } else if (m.t === "orch.metrics") {
+    $("metrics").textContent = `首音 ${m.ttfb_ms}ms · 端到端 ${m.e2e_ms}ms · workers ${m.workers}`;
+  }
+  renderTree();
+}
+
+function renderTree() {
+  const lines = [];
+  for (const [runId, run] of state.runs) {
+    lines.push(`▸ run ${runId}${run.done ? "  ✓done" : ""}`);
+    for (const [ticket, workers] of run.tickets) {
+      lines.push(`  ├─ ${ticket}`);
+      for (const [worker, note] of workers) lines.push(`  │   · ${worker}: ${note}`);
+    }
+    if (run.done) lines.push(`  └─ 终稿: ${run.done.slice(0, 120)}`);
+  }
+  $("tree").textContent = lines.join("\n") || "（等待编排事件…）";
+}
+
+// ---- gate 弹层 ----
+
+function showGate(m) {
+  $("gatePanel").hidden = false;
+  $("gateQ").textContent = `${m.gate_id}: ${m.question}`;
+  const box = $("gateOpts");
+  box.innerHTML = "";
+  (m.options && m.options.length ? m.options : ["yes", "no"]).forEach((opt) => {
+    const b = document.createElement("button");
+    b.textContent = opt;
+    b.onclick = () => {
+      wsSend({ t: "gate.resolve", gate_id: m.gate_id, resolution: opt });
+      $("gatePanel").hidden = true;
+      logLine(`gate ${m.gate_id} 已答复: ${opt}`);
+    };
+    box.appendChild(b);
+  });
+}
+
+// ---- AudioWorklet 采集 / 播放（PCM16LE/16k/mono）----
+
+const WORKLET_SRC = `
+class SendProc extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) {
+      const pcm = new Int16Array(ch.length);
+      for (let i = 0; i < ch.length; i++) {
+        const s = Math.max(-1, Math.min(1, ch[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      this.port.postMessage(pcm.buffer, [pcm.buffer]);
+    }
+    return true;
+  }
+}
+class PlayProc extends AudioWorkletProcessor {
+  constructor() { super(); this.q = []; }
+  process(_inputs, outputs) {
+    const out = outputs[0][0];
+    for (let i = 0; i < out.length; i++) {
+      while (this.q.length && this.q[0].length === 0) this.q.shift();
+      out[i] = this.q.length ? this.q[0].shift() / 32768 : 0;  // 欠载插静音抗抖
+    }
+    return true;
+  }
+}
+registerProcessor("send-proc", SendProc);
+registerProcessor("play-proc", PlayProc);
+`;
+const workletUrl =
+  URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
+
+async function startMic() {
+  if (state.micOn) return;
+  if (!state.ws || state.ws.readyState !== 1) { connect(); return; }
+  const ctx = new AudioContext({ sampleRate: 16000 });
+  await ctx.audioWorklet.addModule(workletUrl);
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+  });
+  const src = ctx.createMediaStreamSource(stream);
+  const node = new AudioWorkletNode(ctx, "send-proc");
+  node.port.onmessage = (ev) => {
+    if (state.ws && state.ws.readyState === 1) state.ws.send(ev.data);  // 二进制 PCM
+  };
+  src.connect(node);  // 不连 destination：静音采集
+  state.sendCtx = ctx; state.sendNode = node;
+  state.micOn = true;
+  $("micBtn").textContent = "停播麦克风";
+}
+
+function stopMic() {
+  if (state.sendNode) { state.sendNode.port.onmessage = null; state.sendNode.disconnect(); }
+  if (state.sendCtx) state.sendCtx.close();
+  state.sendNode = null; state.sendCtx = null; state.micOn = false;
+}
+
+async function ensurePlay() {
+  if (state.playNode) return;
+  const ctx = new AudioContext({ sampleRate: 16000 });
+  await ctx.audioWorklet.addModule(workletUrl);
+  const node = new AudioWorkletNode(ctx, "play-proc", { outputChannelCount: [1] });
+  await ctx.resume();
+  node.connect(ctx.destination);
+  state.playCtx = ctx; state.playNode = node;
+}
+
+function enqueuePlay(pcm) {
+  if (state.playNode) state.playNode.port.postMessage(Array.from(pcm));
+}
+
+// ---- 控件 ----
+
+$("micBtn").onclick = async () => {
+  if (state.micOn || state.micWanted && !state.micOn && state.ws) {
+    // 停播
+    state.micWanted = false; stopMic();
+    $("micBtn").textContent = "开播麦克风";
+    return;
+  }
+  state.micWanted = true;
+  await ensurePlay();
+  await startMic();
+};
+
+$("endBtn").onclick = () => wsSend({ t: "session.end" });
+$("pingBtn").onclick = () => wsSend({ t: "ping" });
+setInterval(() => wsSend({ t: "ping" }), 10000);  // 心跳
+
+logLine("就绪：填 token → 点「开播麦克风」");
+</script>
+</body>
+</html>
