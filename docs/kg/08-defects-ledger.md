@@ -6,21 +6,19 @@
 
 ## 1. dais 编排面
 
-### D-01 【高】orchestration feature 静默丢失
+### D-01 【高→主体解】orchestration feature 静默丢失
 - 现象：不带 `--features orchestration` 重建后，GUI 正常启动但编排面整体消失（无 RPC/无 dais-runtime.json/无邮箱），启动零告警。VO-005 agent 的一次重建即击落全平面 ≈2.5h。
 - 根因：orchestration 为非默认 cargo feature；产物缺失只能靠 `strings 二进制 | grep "not enabled in this build"` 计数判别。
-- 现行对策：wrapper `~/.local/bin/dais` 头注释写明构建命令；事故后人工 strings 校验。
-- 建议：构建脚本一体化（build+strings 断言）；或 runtime 侧对"消费方在而平面不在"打启动 WARN。〔evidence:ledger round 15〕
+- 现行对策（已落地，W6/OF-008 ①）：`~/.local/bin/dais-build`（构建→strings 断言计数=0→安装→构建报告含错误形制快照，兼收 D-03 契约基线）；wrapper 头注释指路禁裸 cargo build。selftest 24/24（〔doc:~/.dsh/maestro/reports/OF-008-report.md〕）。**真构建全链已验**（2026-08-23：16m release 构建，sentinel=0 PASS，原位安装，平面 canary 存活；报告 〔doc:~/.local/state/dais/build-report.md〕）。③消费侧 WARN（rt_probe_m0/rt_dsh_lane 醒目告警）deferred 至 VO-012 后。
 
-### D-02 【高】GUI 单实例脆弱 + 看护拉起双实例
+### D-02 【高→已解】GUI 单实例脆弱 + 看护拉起双实例
 - 现象：①测试/agent spawn 的 transient dais 实例可击落常驻 GUI（VO-005 残留事故）；②重启窗口出现自动拉起实例与手工 nohup 并存（双实例 287105/302881）。
 - 根因：无实例锁或锁不保护常驻进程；看护拉起与人工重启无协调。
-- 现行对策：票面红线禁 agent spawn dais；发现双实例手工杀后起者。
-- 建议：runtime 锁文件（pid+boot-id 校验，后起者退出并提示持有者）。
+- 现行对策（已落地，W6/OF-008 ②）：wrapper 实例锁 `~/.local/state/dais/instance.lock`（flock+pid+boot-id，锁 fd 随 exec 传入 GUI，退出自动释放；后起者退出并提示持有者；`--force` 覆盖；boot-id 变化陈旧锁让位）——agent transient spawn 走同一 PATH wrapper 同样被守卫；orchestration 等 CLI 子命令显式零取锁（监督通道豁免）。selftest 24/24。
 
 ### D-03 【中】CLI 软错误契约漂移
 - 现象：重建后 read-worker 从 exit-1 改为 exit-0+JSON `{"error":...}`。
-- 现行对策：〔loc:examples/realtime-provider-poc/rt_dsh_lane.py→DaisLane.read_worker〕双形态归一为 DaisLaneError。
+- 现行对策：〔loc:examples/realtime-provider-poc/rt_dsh_lane.py→DaisLane.read_worker〕双形态归一为 DaisLaneError。W6/OF-008 起 `dais-build` 构建报告含 read-worker 错误形制探测快照=版本化契约基线落盘起点。
 - 建议：dais 侧把错误形制写入版本化契约文档，跨重建守恒。
 
 ### D-04 【中】start-worker pane 自动绑定未完成
@@ -38,26 +36,25 @@
 - 现象：`~/.dsh/plugins/a2a-profile-server` 无版本控制 → 无回滚、无 diff 审查；派发被迫 Lane P 主线串行。
 - 建议：init git（本地仓即可）或纳入 dotfiles 管理；worktree 化后可并行。
 
-### D-07 【低】fleet.json 陈旧 active 累积
+### D-07 【低→已解】fleet.json 陈旧 active 累积
 - 现象：大量历史 vh-vh-smoke-probe 条目 status=active 未 retire；VO-003 状态机（spawn→arm→ready→serving→retire）只管新增。
-- 建议：存量 sweep + 心跳 lastSeenAt 判活自动 retire。
+- 现行对策（已落地，W6/OF-002）：`fleet-touch sweep`（lastSeenAt/heartbeatAt 陈旧>N 天 active→retired，`--dry-run` 默认 `--apply` 才动真）+ 属主租约三动作 claim/heartbeat/release（flock 原子）+ steer 闸（owner≠from 拒绝 exit 4 + `fleet-conflicts.jsonl` 冲突审计）。selftest 33/33（〔doc:~/.dsh/maestro/reports/OF-002-report.md〕）。存量 sweep 待 GM 窗口对真实 fleet 跑一次 `--dry-run` 复核后 apply。
 
 ## 3. 回程与监控
 
 ### D-08 【高→已解】cb-send 文件桥不能唤醒回合制编排者
 - 现象：cb-send 降级文件桥后仅在编排者**下一回合**被消费 → "30s 无响应"结构性不可达。
 - 现行对策（已落地）：**vo-relay 模式**——`session-spawn maestro` 落 fleet，relay 用 `session-send <relay> <编排者完整sessionId>` 直投编排者回合队列=推唤醒。〔doc:~/.dsh/maestro/bin/session-send〕
-- 建议：把"编排者可达性=直投 sessionId"写进 maestro-bridge skill 文档，取代 cb-send 叙事。
+- W6/OF-003 尾巴收口：maestro-bridge skill 主叙事已切换为"编排者可达性=直投完整 sessionId（推唤醒）"，cb-send 降级备胎；steer 两段式契约（ack/nack）同步落 orch-loop + dispatch-ticket 模板。live steer 往返冒烟留首次生产使用时验证。
 
 ### D-09 【高】relay 看守面无进程活性 + 固定寿命中途到期
 - 现象：①relay 只看守文件事件（报告落地/merge），VO-007 pytest 挂死 2h（CPU 0.1%/ep_poll）零告警；②60 轮寿命在长票未完时先到期，需手工 re-arm（今晚实录）。
-- 现行对策：编排者穿插人工三信号抽查（进程 etime/CPU、omp 日志 mtime、终端 spinner）；re-arm 靠新 mission 注入。
-- 建议：relay 增加第三看守面（agent 进程 CPU 阈值 + 日志 mtime 陈旧度 >N 分钟即回报 stuck）；寿命改"到期前若有在飞票则自动续期"。
+- 现行对策（W6/OF-006 ①② 已落地）：`bin/event-watchd` 常驻守护——文件面（glob+位点推进防回声）+ 进程面（CPU 阈值+日志 mtime 陈旧度**双条件与**判定，单条件不误报）+ 自续期（有活动票顺延寿命）+ alerts.log 升级终点；③SLA/④租约两面留 patch 位。selftest 27×2（worker 双绿；GM 侧 26/27=RENEW 轮询窗口在本机常态负载下偏紧，放宽 15s 已入补丁批）。relay 实迁 watchd 与真值守待 GM 窗口。〔doc:~/.dsh/maestro/reports/OF-006-report.md〕
 
-### D-10 【低】relay 事件回声
+### D-10 【低→已解】relay 事件回声
 - 现象：已由编排者处理完的事件（合并后）仍回报（VO-009/merge 回声）。
 - 根因：无消费位点；回报不推进基线。
-- 建议：回报后原子推进 `reports.base`/`git.base`。
+- 现行对策（已落地，W6/OF-001）：信封 v2 增 msgid+ts（重发保号）；收方去重窗口 `msg-dedup`（60s (from,msgid) 去重）；relay 契约=事件回报后原子推进 `reports.base`/`git.base`（〔loc:~/.dsh/maestro/orch-fleet-conventions.md〕）。selftest 25/25（〔doc:~/.dsh/maestro/reports/OF-001-report.md〕，commit 1ebc155）。
 
 ### D-11 【约束】omp TUI alt-screen 帧不含响应文本
 - 现象：`terminal read` 看不到 agent 回复文本。
@@ -84,7 +81,19 @@
 - 现象：urllib 不认宿主 NO_PROXY 的 CIDR 条目、httpx 需剥 SOCKS——VO-010 与 VO-006 各自重新发现，各写各的解法。
 - 建议：conftest/插件 README 提供 `no_proxy_env()` 统一帮手 + 坑位文档一处收录。
 
-## 6. 已修复（存档）
+## 6. W6 加固收口记录（2026-08-23，OF 系列 8/10 done）
+
+> 方案：`docs/kg/09-orch-hardening-plan.md`（N9）；maestro 域 commits `2f220c4..4652658`（9 个）；报告 `~/.dsh/maestro/reports/OF-00x-report.md` ×8；GM=orch-fix-plan(e858) 会话。
+
+**主题 A（多主契约软隔离）W1 车道收口**：信封 v2（msgid+ts 只增键，`1ebc155`）→ fleet 属主租约+steer 闸+冲突审计（`28fa9d8`）→ steer 两段式契约+可达性主叙事切换（`260c597`）。v2 信封在 W6 全程回程通道实弹（6 例 done 均自带 msgid）。OF-004（loopback 凭证）按方案 §9 持有在中期窗口。
+
+**主题 B（长时任务编排）W2+W3 车道收口**：tickets DAG（状态机 7 态/12 合法边，非法迁移实测拦截；`b013d64`）→ wave 检查点（SIGKILL×3 原子性实证；`439d9f0`）→ event-watchd ①②面（`a19558d`，③④留 patch 位）→ longtask 单向投影绑定（`4652658`；真实激活=收口时 10 票全量投影至 `state/longtask-carryover.md`）。**波次状态已搬出 LLM 上下文**：ticket 面（ledger.db）+检查点面（wave-checkpoints.jsonl）+承接面（longtask-carryover.md）三层数据化。
+
+**C 组**：dais 构建断言+实例锁（`934cccc`；真构建 16m PASS sentinel=0）。
+
+**遗留批（tracked）**：OF-006③SLA/④租约补丁+RENEW 窗口 15s；OF-007④ render 头部摘要联动；relay 实迁 watchd+一轮真值守；fleet 存量 sweep apply（dry-run 复核后）；OF-009（VO-012 后）；OF-004（中期）。
+
+## 7. 已修复（存档）
 
 - ✅ EventBus 通配订阅双重投递：〔loc:examples/realtime-provider-poc/rt_event_bus.py:26→subscribe〕kinds-or-star 单注册路径，exactly-once 复验（VO-011 agent 发现，main 已合）。
 - ✅ VO-007 无界等待挂死：v7_main 全局 watchdog 840s + shell 900 壳 + 轮询预算整改（本台账 D-12 关联）。
