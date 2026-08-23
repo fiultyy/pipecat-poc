@@ -34,6 +34,7 @@
 - **派生入池闭环**：queen 收敛结果 → ProfileStore.save（lineage 记 `derived-by: queen,<parent-profile>?`）→ 三门 → 回执含新 profile 名+版本
 - **dsh 格式导出**（打通节点1 格式差）：`pool/export` RPC——池 profile → 生成 `~/.dsh/.agent-presets/<name>/`（preset.yml 从 profile.json 生成 + agent.cordis.yml persona 段嵌 AGENTS.md 全文 + 软链 plugins/skills 资产自 maestro 模板）→ dsh 原生 agentPreset 即刻可用
 - **验收**：①queen 孵化真跑：grill ≥3 维问答 → 派生 profile 入池（三门过）；②lineage 血缘可溯；③export 后 `session.create {agentPreset:<derived>}` 原生起会话；④revalidate 对派生物有效；⑤queen 不越权（只能派生 profile，不能直接 spawn——spawn 走 OF-012）
+- **GUI 通路实证**（2025 实测，loopback `agentPreset.list`）：新会话屏原生有 preset 选择 chip（`AgentPresetSeat`，workspace 选择器旁，菜单项=name+description）；roster 每次 list 调用实时扫 `~/.dsh/.agent-presets/`——落一个目录**即刻出现**（trust=user，无需重启/重载）；只写 preset.yml 缺 agent.cordis.yml 会标 `broken`（"directory still occupies the id"）→ export 必须两文件齐写。即 export 一步就把派生 profile 送进 GUI 原生列表，零 UI 改动
 - 量：中-大 · 依赖：OF-012（选型面先行，queen 产物经池选型消费）· 文件域：rt_projector.py + wizard + 插件 export RPC
 
 ## 3. 排期与依赖
