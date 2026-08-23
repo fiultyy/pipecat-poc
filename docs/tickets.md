@@ -52,7 +52,7 @@
 - **量**:小 · **依赖**:VO-004;dais 编排面在线(环境前置 1) · **派发**:本仓 code
 - **回报物**:evidence/VO-005-report.md · **done body**:同上格式
 
-### VO-006 liaison 落位(替身协议移交) ☐
+### VO-006 liaison 落位(替身协议移交) ☑
 
 - **目标/方案**:真孵化 dsh-liaison(mailbox=agent_liaison);head 的 `DshBackend.orchestrator_handle` 指向真身;**head 代码 diff=0**(KG 06§3.1 对照表四项逐条核)。
 - **路径**:live_v5_v6 场景扩(替身换真身);head 侧仅配置值。
