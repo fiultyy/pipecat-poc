@@ -24,9 +24,8 @@ class EventBus:
         self._listeners: dict[str, list[Listener]] = defaultdict(list)
 
     def subscribe(self, callback: Listener, *kinds: str) -> Callable[[], None]:
-        """Register a listener; no kinds = all events."""
+        """Register a listener; no kinds = all events (via the ``*`` bucket)."""
         entry = (callback, kinds)
-        self._listeners["*"].append(entry) if not kinds else None
         for kind in kinds or ["*"]:
             self._listeners[kind].append(entry)
 
