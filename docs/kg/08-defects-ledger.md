@@ -109,3 +109,16 @@
 **判定**：长时模式=单会话编排完备、舰队编排靠环境外挂——即 §5 复盘"long-task 缺高级编排"的结构性根源：桥是 ambient 的（知道即能用），不是 contractual 的（组合声明）。N10 的 queen 派生若要产出"编排型"profile，delegation 组是正确基底，跨会话面需显式补插件行+skills。
 
 **更新溯源（补充）**：delegation 组是 2026-08-22 更新带来的——该日 10:01 装 dsh rc.8，21:39:26–57 三 preset（liangshen/maestro/long-task）agent.cordis.yml 同窗重写，maestro 与 long-task 的 delegation 组行集**完全一致**（含同为 disabled 的 codex/claude-code 行）。即更新后两 preset 的进程内编排面已对齐，maestro 的独占差异仅剩：4 个本地插件行（message-bridge/orca-callback pump/workspace-unarchive/session-purge）+ skills/ 目录 + persona 编排 doctrine。
+
+## 9. D-14 · long-task 工具读取路径校验 bug + 台账悬空（2026-08-24，用户问责触发）
+
+**现象**：`get_long_task` 恒报 `long-task change open question closes unknown checkpoint 5`；读路径死锁。盘上投影（storages/session_projcache.json）状态本体完好（6 checkpoints，seq 1-6），但 openQuestions 两项引用 `closesCheckpoint 5/4`——校验按"change"口径拒绝；宿主内存为权威，projcache 手改被覆写（实测 seq 318901→319397 回滚）。无独立服务存储落盘。
+
+**根因**：宿主 rc.8 long-task 服务的 change 校验缺陷（引用编号口径错位），上游 bug。
+
+**处置**：
+- 不在运行宿主内存上做手术（会话自身活在 pid 16893 里，重启需用户裁决）。
+- **台账判定性关闭**（声明式）：longtask-670ac697 目标=VO 四线波次，事实上已完成——M0-M5 六检查点全达成（VO 12/12、dogfood VO-012、goal-9a721634 平行 goal 已正规 complete、终态 commit bc27d7e）。两项 openQuestions 均已被事实了结（Q1 frp→用户裁定移除；Q2 DashScope key→GLM 路径交付未用）。该台账作废，不再尝试工具路径关闭。
+- **跨波次权威账转移**（结构性修复）：ledger.db tickets（机械态）+ longtask-carryover.md（单向投影，N10 期间 checkpoint 1-10，本轮已读回渲染）+ pipecat-poc KG——三处一致性已核。波次状态此后不依赖 goal/long-task 任一会话内工具。
+
+**责任记录（指挥者）**：①VO 波次开了 goal-9a721634 却留 long-task 台账悬空，两会话内状态机并行、后者失养——工具选择错误；②N10 结案核验信了"临时会话全清"未做 fleet 全量对账（28a2/4eeb 漏网，本轮已清账+purge）；③longtask-carryover 消费侧（读回渲染）从未执行至本轮——自立的规矩自己先违。三项均已矫正。
