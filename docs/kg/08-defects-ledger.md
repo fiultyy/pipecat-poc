@@ -49,7 +49,7 @@
 
 ### D-09 【高】relay 看守面无进程活性 + 固定寿命中途到期
 - 现象：①relay 只看守文件事件（报告落地/merge），VO-007 pytest 挂死 2h（CPU 0.1%/ep_poll）零告警；②60 轮寿命在长票未完时先到期，需手工 re-arm（今晚实录）。
-- 现行对策（W6/OF-006 ①② 已落地）：`bin/event-watchd` 常驻守护——文件面（glob+位点推进防回声）+ 进程面（CPU 阈值+日志 mtime 陈旧度**双条件与**判定，单条件不误报）+ 自续期（有活动票顺延寿命）+ alerts.log 升级终点；③SLA/④租约两面已补齐（留位批 2026-08-24：sla-overdue/lease-expired/在飞票 RENEW，maestro c5105b1）；"GM 侧 26/27 RENEW 窗口偏紧"定因=daemon stdout 块缓冲，行缓冲根治，selftest 32/32。relay 实迁 watchd 与真值守待 GM 窗口。〔doc:~/.dsh/maestro/reports/OF-006-report.md〕
+- 现行对策（W6/OF-006 ①② 已落地）：`bin/event-watchd` 常驻守护——文件面（glob+位点推进防回声）+ 进程面（CPU 阈值+日志 mtime 陈旧度**双条件与**判定，单条件不误报）+ 自续期（有活动票顺延寿命）+ alerts.log 升级终点；③SLA/④租约两面已补齐（留位批 2026-08-24：sla-overdue/lease-expired/在飞票 RENEW，maestro c5105b1）；"GM 侧 26/27 RENEW 窗口偏紧"定因=daemon stdout 块缓冲，行缓冲根治，selftest 32/32。**relay 已实迁**（maestro `1b65a7a`）：`maestro-watchd.service` systemd 常驻真值守，首轮即抓 file 面多 entry 共享状态洪水 bug（分桶修复+回归用例，selftest 34/34），真事件（checkpoint file-grew）落日志验证零回声。〔doc:~/.dsh/maestro/reports/OF-006-report.md〕
 
 ### D-10 【低→已解】relay 事件回声
 - 现象：已由编排者处理完的事件（合并后）仍回报（VO-009/merge 回声）。
