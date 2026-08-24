@@ -40,5 +40,13 @@
 | D-05 | P2 | store 20 个 pub fn 零 run 清理方法 | 按终态+年龄 GC 一条 | dais 侧，最后 |
 | new-terminal 依赖 GUI | — | 模块文档自述 headless 明确报错 = 架构使然**非缺陷** | 归消费侧看护（D-02 实例锁已覆盖） | 消费侧已covered |
 | D-14 / D-15 | — | — | 归消费侧 | 消费侧账上 |
+| **D-17**（本轮 live 新捕） | **P0** | LB-002-A V5 跑：head 平铺 1s 消费轮询窗内，真身 send-message 挂 60s/150s SIGTERM **零错误零服务端超时**，create-run 探针 exit=124；轮询窗一关 plane 立即复苏——并发「高频消费轮询+回信写」下编排面挂死且无错误可传导（与 D-03 相关但独立：本例根本没有错误） | 消费侧已修：`await_done` 轮询 ×1.5 退避至 `poll_max_s=8s`（be94ba8，写事务率 ~6× 降）；dais 侧移交：锁公平性/读路径并发实证 + 服务端 per-call 超时 | 消费侧✅ / dais 侧已通报 |
 
 **优先序：D-04 → D-03 → worktree → D-05；D-04/D-03 可并行。** 消费侧已先行交付：DaisLane 13→29 方法（worktree/project/terminal/scheduling 四面，live 校准 gate_ / project_list / worktree-list）+ G3 接线（POC 8e6c279，31+8+40+73 测试全绿）。
+
+## 4. LB-002-A 执行实录（2026-08-24 夜）
+
+- **真身孵化**：live 脚本管线（投影+协议附录+三门+插件 RPC）→ code `<seat>`，mailbox `agent_liaison`，fleet 五键 PASS；head 侧零 diff（纯配置换身）。
+- **V5 首跑 11/12**：唯一 FAIL = phase-2 终稿未到 → 根因 D-17（上表）；真身行为全对：首动作邮箱排空 ✅、真调研（5 次 web_search）✅、终稿落盘 ✅、回信被饿死 ❌。V6（打断/pending 在途/cancel/无迟到终稿）全 PASS。
+- **修复后待复跑**：be94ba8 退避版；复跑窗口避开 dais 侧 D-04 施工期（plane 共享）。
+- **G4 侧产物**：`pool/spawn binding-mode` live 验证通过——vh-liaison@v1 信封注入备援会话 e0e1（`injected:true`，版本钉死不重存）；信封唤醒后 doctrine 行为完整（排空→识别非己→ask 升级，零编造）。G4 剩余：dispatch 携 profile 的正式穿衣路径 + 终稿人格痕迹断言。
