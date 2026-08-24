@@ -81,6 +81,9 @@ class DshBackend:
         on_final: callback invoked with the phase-2 final message (the
             head pipeline wires this to context re-injection).
         await_timeout_s: phase-2 blocking budget per dispatch.
+        poll_max_s: ceiling of the phase-2 poll backoff (consumption
+            polls are write transactions on the daemon store; a flat
+            cadence starves in-flight senders — see DaisLane.await_done).
     """
 
     lane: DaisLane
@@ -95,6 +98,7 @@ class DshBackend:
     on_final: Callable[[str, str], Awaitable[None]] | None = None
     await_timeout_s: float = 1800.0
     poll_s: float = 2.0
+    poll_max_s: float = 8.0
     _runs: dict[str, DshDispatch] = field(default_factory=dict)
     _pending: dict[str, asyncio.Task] = field(default_factory=dict)
 
@@ -233,7 +237,7 @@ class DshBackend:
                 # self-match the intent we sent (live-probed 2026-08-23).
                 body = await self.lane.await_done(
                     self.head_handle, ref, timeout_s=budget,
-                    poll_s=self.poll_s,
+                    poll_s=self.poll_s, poll_max_s=self.poll_max_s,
                     after_seq=dispatch.intent_seq if dispatch.intent_seq >= 0 else None,
                     from_filter=self.orchestrator_handle or None,
                 )

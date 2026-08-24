@@ -166,7 +166,8 @@ class DaisLane:
         return _parse_message_rows(out)
 
     async def await_done(self, handle: str, ref: str, timeout_s: float = 1800.0,
-                         poll_s: float = 2.0, after_seq: int | None = None,
+                         poll_s: float = 2.0, poll_max_s: float = 8.0,
+                         after_seq: int | None = None,
                          from_filter: str | None = None) -> str:
         """Block until a done/status reply carrying ``[ref:<ref>]`` arrives.
 
@@ -177,11 +178,20 @@ class DaisLane:
         each get their own reply — reads consume, so a poll may drain
         several pending replies at once.
 
+        The sleep between polls escalates from ``poll_s`` by ×1.5 up to
+        ``poll_max_s``: each snapshot poll consumes (a write transaction
+        on the daemon store), and a flat cadence keeps the store lock
+        busy enough to starve in-flight senders — live-caught in the
+        LB-002-A V5 run (the liaison's send-message hung 60s/150s behind
+        the head's flat 1s poller; the plane recovered the moment the
+        poller exited).
+
         Returns the reply body (without the ref prefix). Raises
         TimeoutError when still pending — callers turn that into a spoken
         "still running" state.
         """
         deadline = time.monotonic() + timeout_s
+        delay = poll_s
 
         def _take() -> str | None:
             buf = self._inbox.get(handle, [])
@@ -207,10 +217,15 @@ class DaisLane:
             if remaining <= 0:
                 raise TimeoutError(f"no reply for ref {ref} within {timeout_s}s")
             # snapshot poll (consumes unread into the shared buffer), then
-            # sleep — --wait would only catch arrivals inside its window
+            # sleep with escalating backoff — --wait would only catch
+            # arrivals inside its window
             rows = await self.check_messages(handle)
             self._inbox.setdefault(handle, []).extend(rows)
-            await asyncio.sleep(min(poll_s, max(0.05, remaining)))
+            got = _take()
+            if got is not None:
+                return got
+            await asyncio.sleep(min(delay, max(0.05, remaining)))
+            delay = min(delay * 1.5, poll_max_s)
 
     # ---- supervision ----
 

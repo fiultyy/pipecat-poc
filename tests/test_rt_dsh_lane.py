@@ -101,6 +101,43 @@ def test_await_done_timeout_not_error_until_deadline():
         asyncio.run(run())
 
 
+def test_await_done_poll_backoff_escalates_and_caps():
+    """Consumption polls back off ×1.5 up to poll_max_s (LB-002-A: flat
+    cadence starved in-flight senders on the daemon store lock)."""
+    reply = 'seq=11 from=orch to=voice-head type=status body=[ref:vh-b] "Agent Final Message": done 【凭证R-9】'
+    polls = {"n": 0}
+
+    async def runner(argv):
+        polls["n"] += 1
+        if polls["n"] < 8:
+            return ("(no messages)\n", "")
+        return (reply + "\n", "")
+
+    lane = DaisLane(runner=runner)
+    sleeps: list[float] = []
+
+    async def fake_sleep(d):
+        sleeps.append(d)
+
+    async def run():
+        return await lane.await_done(
+            "voice-head", "vh-b", timeout_s=120,
+            poll_s=1.0, poll_max_s=8.0)
+
+    import rt_dsh_lane
+    orig = rt_dsh_lane.asyncio.sleep
+    rt_dsh_lane.asyncio.sleep = fake_sleep
+    try:
+        body = asyncio.run(run())
+    finally:
+        rt_dsh_lane.asyncio.sleep = orig
+    assert body.startswith('"Agent Final Message"')
+    # 7 sleeps before the 8th poll hits: 1.0, 1.5, 2.25, 3.375, 5.0625, 7.59375, 8.0(cap);
+    # the hitting drain returns immediately (no post-hit sleep)
+    assert sleeps == [1.0, 1.5, 2.25, 3.375, 5.0625, 7.59375, 8.0]
+    assert polls["n"] == 8
+
+
 def test_read_worker_cursor_from_stderr():
     lane, _ = make_lane([("line1\nline2\n", "cursor: 42\n")])
     tail, cursor = asyncio.run(lane.read_worker("ctx_x", after=40))

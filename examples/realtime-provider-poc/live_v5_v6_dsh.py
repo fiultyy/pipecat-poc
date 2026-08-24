@@ -653,9 +653,11 @@ async def main() -> int:
         finals.append((ref, message))
 
     # head 侧唯一变化：orchestrator_handle 指向真身邮箱（配置值；逻辑 diff=0）
+    # poll 退避：poll_max_s 上限 8s（LB-002-A live 实捕——平铺 1s 轮询把真身
+    # send-message 饿死 60s/150s，轮询一停 plane 即复苏）
     backend = DshBackend(lane=lane, orchestrator_handle=LIAISON_MAILBOX,
                          head_handle=HEAD, on_final=on_final,
-                         await_timeout_s=540, poll_s=1.0)
+                         await_timeout_s=540, poll_s=1.0, poll_max_s=8.0)
     params = LiveParams(backend)
     params.app_resources["liaison_code"] = code
 
