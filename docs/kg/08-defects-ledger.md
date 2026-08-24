@@ -62,14 +62,13 @@
 
 ## 4. live 测试预算与并发
 
-### D-12 【高】轮询预算未从实测延迟分布推导
+### D-12 【高】轮询预算未从实测延迟分布推导 ✅（OF-009，2026-08-24）
 - 现象：VO-007 manager 回收轮询 60 次×~6s≈360s/域，而 VO-006 实测真实 agent 回合"典型 40–70s、偶发 >5min"——零余量 → 门禁打回实录（文档域 WITNESS=None）。
-- 现行对策：轮询提到 90 次对齐 `await_timeout_s=540`；shell 900 壳不破。
-- 建议：doctrine 固化推导公式 预算 ≥ 实测 P95×2；预算常量与实测记录同文件注释互指。〔doc:evidence/VO-006-report.md〕
+- 修复：impl-specs **G6** 固化公式 `预算 ≥ 实测 P95×2`，预算常量/实测记录/租约告警阈值三处同文件注释互指（P95 基线 VO-006-report）；dispatch-plan 派发模板同步 live 纪律段。证据：evidence/OF-009-report.md §A③。
 
-### D-13 【中】live 测试无并发锁
+### D-13 【中】live 测试无并发锁 ✅（OF-009，2026-08-24）
 - 现象：两个 pytest 实例同邮箱并发互踩（误起重复 gate 需手工清理）。
-- 建议：live 用例引入租约（flock 文件 per mailbox 域）或标记 `pytest -p no:xdist`+串行守卫。
+- 修复：`tests/live_lock.py` flock 域租约（dais-bus/orca-host/邮箱域）+ conftest `@pytest.mark.live` 自动按域取锁（setup→teardown）；`DSH_LIVE_LOCK=skip` 让路跳过留痕；8 个 live 用例已标记。双进程演练不重叠 + skip 确定性：evidence/OF-009-report.md §A①。
 
 ### D-14 【中】live 瞬态容忍语义留在测试层
 - 现象：V5 播报凭证漏报一次靠测试内重试容忍（组合跑复现一次后未再现）。
