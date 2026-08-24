@@ -1,7 +1,7 @@
-# N7 · 车道B · orca ADE：OrcaLane 封装（方法级，建成：VO-008 全方法 + VO-009 live+A/B 对拍）
+# N7 · 车道B · orca ADE：OrcaLane 封装（方法级，建成：VO-008 全方法 + VO-009 live+A/B 对拍 + LB-001 主干收口）
 
 > 上游：`docs/plans/voice-orchestration-head-plan.md§4`（v2）· 索引：[00-INDEX.md](00-INDEX.md)
-> 状态：**设计态**——命令面 2026-08-23 实测探明（`--help` 逐命令），类未实现；开工首步 `orca-ide skills get orca-cli` 拉版本匹配指南后钉死细节。
+> 状态：**建成**——VO-008 全方法 + VO-009 live/A-B 对拍 + LB-001 主干收口（DshBackend `lane_mode="b-orca"` 生产形态，证据 [evidence/LB-001-report.md](evidence/LB-001-report.md)）。
 > R1 纪律：二进制硬编码 `orca-ide`（`/usr/bin/orca-ide`，内部自称 `orca <command>`）；**严禁裸 `orca`**（`/usr/bin/orca` = GNOME 屏读器）。
 
 ## 0. 对接总图
@@ -92,4 +92,15 @@ class OrcaLane:
 | B.3 | live 冒烟：真 spawn 1 worktree（codex/claude）→ wait → read | ✅ VO-009 `test_live_lane_b_smoke`（文件产物契约 13.5-27s；host 掉线确定性 skip） | 全程有界超时无裸等 ✅ |
 | B.4 | A/B conformance 对拍 | ✅ VO-009 扩 `tests/test_rt_conformance.py`（lane 工厂参数化） | 双车道同终稿（统一 dais 邮箱链回传）✅ |
 | B.5 | 分派策略落 manager 模板（N6§1.2） | ✅ VO-007 manager appendix 第 3 条（车道选择断言入 V7 六步） | 车道选择断言入 V7 ✅ |
+| B.6 | 主干收口：DshBackend `lane_mode="b-orca"`（§4） | ✅ LB-001 `test_live_lane_b_orca_backend_mainline`（live 双租约；全文件序列 7P 94–111s，单跑 20s） | 派发→工件终稿→teardown 零残留 ✅ |
+
+## 4. 主干收口：DshBackend b-orca（LB-001，commit `464c7b2`）
+
+head 工具面直接驱动真工作树（不再借测试侧 `_orca_worker` 编舞替身）：
+
+- **派发**〔loc:examples/realtime-provider-poc/rt_dsh_backend.py→DshBackend._fanout_orca〕：spawn `vh-{ref}` 临时工作树（agent 默认 omp，用户裁定 2026-08-24；`ORCA_AGENT` 可覆盖）；**工件契约** = worker 逐字写 `final-{ref}.txt`（`调研完成 {凭证} 结论 41%`）——agent 答文本永不进 scrollback 环，完成判定只认工件**逐字全等**（渲染证明）。
+- **收终稿**〔loc:…→DshBackend._await_orca〕：有界 tui-idle 切片（15s）+ 对话框应答 ≤5 + settle 窗 20s 后**一次** interrupt+重发；瞬态 lane 错误（CLI 挂死/ok:false busy）预算内重试并上 `orch.progress`——phase-2 **永不静默死亡**（`_pending` 任务挂 done-callback tripwire，死亡报 stderr）。
+- **lane-A 对称纪律**：A2A task 被服务端遗忘（-32602 unknown taskId）→ progress 后停轮询（终稿不可知，不空转到预算耗尽）。
+- **取消**〔loc:…→DshBackend.cancel〕：杀本地 phase-2 + `terminal stop` + `worktree rm`。
+- 测试侧红线：失败 attempt 先取消孤儿 phase-2 再 teardown（孤儿会整轮对已删工作树发 wait/read CLI 调饿死重试轮）；teardown 断言工作树/进程零残留。
 
