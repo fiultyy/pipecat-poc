@@ -1,8 +1,9 @@
-# LB-002 · dais 编排面强化补完（DRAFT — 握手后定稿）
+# LB-002 · dais 编排面强化补完（已定稿 2026-08-24 — 握手闭环）
 
-> 触发：用户指令 2026-08-24「等 dais agent 跟你握手，准备强化补完 dais 编排面」
-> 状态：**草稿** —— 等 dais agent 经 maestro-bridge 握手（`cb-send ack` → `~/.dsh/maestro/bridge/inbox.log` → 泵入编排会话）后，按其身份/角色定稿票面。
-> 接收面已验（2026-08-24 22:5x）：HTTP intake `:46855` LISTEN（host-callback-bridge 持有）· `inbox.log` 活跃 · `orch.signature` 在册 · 对仗票：LB-001（车道B主干，已收口）。
+> 触发：用户指令「等 dais agent 跟你握手，准备强化补完 dais 编排面」
+> 握手闭环：dais-iter@warpdotdev（session-c8e0317a，cwd ~/warpdotdev/dais）ack→report→done 三段完成；编排者 fleet 入编（code <seat>, mailbox voice-head）。
+> 接收面已验：HTTP intake `:46855` LISTEN · `inbox.log` 活跃 · `orch.signature` 指向本会话。
+> 人格指派边界（用户裁定 2026-08-24）：**仅 dsh** —— omp/claude 孵化器已门禁（`A2A_CLI_INCUBATION=1` 维护恢复口），向导菜单收缩，selftest 42/42。
 
 ## 1. 现状盘点（源码锚点实证）
 
@@ -23,14 +24,21 @@
 
 - **LB-002-A 真身接线**：池孵化 role=liaison（+manager 群）→ fleet mailbox 注册 → 替换替身上链；验收 = 生产 dispatch → 真回执 → 真终稿（凭证逐字）。
 - **LB-002-B DAG 生产化**（先清 D-04）：manager 拆分 → create-task --dep → start_worker → worker_done 块匹配；验收 = 一意图拆 ≥2 子任务带依赖，终稿聚合回链。
-- **LB-002-C 异常面接线**：query_status 侧 scan_wait_blocked 透出"卡在哪"；cancel/resolve 语义补 resolve_gate；验收 = 人为 gate 阻塞 → head 可见可解。
+- **LB-002-C 异常面接线**（消费侧已交付 8e6c279）：query_status 侧 scan_wait_blocked 透出"卡在哪"（已上链）；resolve() 头工具（已上链）；验收 = 人为 gate 阻塞 → head 可见可解。
 - **LB-002-D profile 穿透（dsh-only）**：dispatch 携 profile → bindProfile 给**在飞 dsh 会话**穿衣（信封 `ORCA-CB] PROFILE-INJECT]`）；验收 = 终稿带 profile 人格痕迹。边界：omp/claude 不参与（原生人格，孵化器已门禁）；orca 工作树 spawn 保持裸 prompt。
 - **LB-002-E 事件流 live 证据**：read_worker/TailReader → orch.progress → WS event；E2E 播报链前置。
 
 依赖序：A → (D-04 清障) → B → C；D/E 可并行；G6 随手清或挂账。
 
-## 3. 握手后定稿动作
+## 3. dais 侧修法裁决（dais-iter@warpdotdev report/done，源码实证 2026-08-24）
 
-1. 读握手 body：agent 身份（from 签名）/ 角色（liaison/manager/worker?）/ mailbox / 是否携 profile；
-2. 对号入座：真身 = G1 解；其自报能力面决定 B/C 范围；
-3. 本文件转正（DRAFT 摘除）+ ledger 落 checkpoint + 开 maestro 票（如需跨域）。
+| 项 | 级 | 实锤（dais 仓锚点） | 修法 | 状态 |
+|---|---|---|---|---|
+| D-04 | **P0** | `StartWorker`(agent_sdk/orchestration.rs:139) 仅 create_dispatch 零绑定；`assignee_handle/pane_key` 两列(db.rs:190) **全仓零写入点**；assign 只注册内存 ViewRegistry 不落库 | start-worker 自动绑 pane + assignee 落库 → 直接解锁 LB-002-B | dais 侧开工 |
+| D-03 | P1 | 转发道 ok:false+executed:true 回 Ok→stdout 打 JSON error 且 exit0(runtime_rpc.rs:668)；直连道 Err→stderr+exit1(lib.rs:2363) | 错误统一 stderr+exit1 + 契约文档化 | dais 侧开工（与 D-04 并行） |
+| worktree 注入面 | P1.5 | worktrees.rs:58 签名仅 (project,name,cx) 双参 | 组合 new-terminal+inject-prompt 成 `--agent/--prompt` 一次到位（三件均已存在，纯组合） | dais 侧，D-03 后 |
+| D-05 | P2 | store 20 个 pub fn 零 run 清理方法 | 按终态+年龄 GC 一条 | dais 侧，最后 |
+| new-terminal 依赖 GUI | — | 模块文档自述 headless 明确报错 = 架构使然**非缺陷** | 归消费侧看护（D-02 实例锁已覆盖） | 消费侧已covered |
+| D-14 / D-15 | — | — | 归消费侧 | 消费侧账上 |
+
+**优先序：D-04 → D-03 → worktree → D-05；D-04/D-03 可并行。** 消费侧已先行交付：DaisLane 13→29 方法（worktree/project/terminal/scheduling 四面，live 校准 gate_ / project_list / worktree-list）+ G3 接线（POC 8e6c279，31+8+40+73 测试全绿）。
