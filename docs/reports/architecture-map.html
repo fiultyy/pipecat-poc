@@ -68,26 +68,27 @@
   <text class="td" x="42" y="294">token 鉴权 · 并发≤2 · 媒体≤64KB/s</text>
   <text class="td" x="42" y="309">音频不落盘 · 会话级内存</text>
   <text class="td" x="42" y="324">TailReader → orch.progress 事件汇总</text>
-  <text class="td" x="42" y="345" fill="#4da3ff">→ head：pipecat 帧（音频↑ / TTS·事件↓）</text>
+  <text class="td" x="42" y="345" fill="#4da3ff">→ head：pipecat 帧（音频↑ / 语音·文本事件↓）</text>
 
   <!-- POC 容器 -->
   <rect x="300" y="90" width="310" height="358" rx="12" fill="rgba(77,163,255,.045)" stroke="#4da3ff" stroke-opacity=".55"/>
   <text class="ct" x="312" y="110" fill="#4da3ff">pipecat-poc · 语音链路</text>
 
   <!-- head -->
-  <rect class="bx" x="330" y="125" width="250" height="85" rx="8" fill="rgba(77,163,255,.08)" stroke="#4da3ff"/>
-  <text class="tt" x="342" y="143">语音 head · pipecat<tspan font-size="10" fill="#e3b341"> ◐ live V5/V6 真身 2/2</tspan></text>
-  <text class="td" x="342" y="161">STT → LLM → TTS · doctrine 注入</text>
-  <text class="td" x="342" y="176">工具四件套（DSH_TOOLS_DOCTRINE）</text>
-  <text class="td" x="342" y="191">dispatch/query_status/cancel/resolve</text>
+  <rect class="bx" x="330" y="125" width="250" height="99" rx="8" fill="rgba(77,163,255,.08)" stroke="#4da3ff"/>
+  <text class="tt" x="342" y="143">语音 head · pipecat<tspan font-size="10" fill="#e3b341"> ◐ 真身链 2/2</tspan></text>
+  <text class="td" x="342" y="159">全模态 realtime · 无分立 STT/TTS</text>
+  <text class="td" x="342" y="175">voice-in 语义原生 text/voice-out</text>
+  <text class="td" x="342" y="191">服务端 VAD 回合提案 · turn 上下文</text>
+  <text class="td" x="342" y="207">工具：dispatch/query/cancel/resolve</text>
 
   <!-- backend -->
   <rect class="bx" x="330" y="238" width="250" height="92" rx="8" fill="rgba(77,163,255,.08)" stroke="#4da3ff"/>
   <text class="tt" x="342" y="256">DshBackend · 两阶段应答</text>
   <text class="td" x="342" y="274">① 受理回执：run_id +【凭证…】</text>
-  <text class="td" x="342" y="289">② FINAL_PREFIX 终稿 re-inject</text>
+  <text class="td" x="342" y="289">② 终稿 re-inject 新回合（turn 驱动）</text>
   <text class="td" x="342" y="304">F7 路由：a │ b │ b-dag │ b-orca</text>
-  <text class="td" x="342" y="319">dispatch_dag 依赖波 · phase-2 D-17 退避</text>
+  <text class="td" x="342" y="319">dispatch_dag 依赖波 · D-17 退避</text>
 
   <!-- lane clients -->
   <rect class="bx" x="330" y="352" width="78" height="60" rx="7" fill="rgba(77,163,255,.08)" stroke="#4da3ff"/>
@@ -244,7 +245,7 @@
   <path d="M280,292 L292,292 L292,170 L330,170" stroke="#4da3ff" stroke-width="1.6" fill="none" marker-start="url(#mB)" marker-end="url(#mB)"/>
 
   <!-- head → backend → lanes -->
-  <path d="M455,210 L455,236" stroke="#4da3ff" stroke-width="1.5" marker-end="url(#mB)"/>
+  <path d="M455,224 L455,236" stroke="#4da3ff" stroke-width="1.5" marker-end="url(#mB)"/>
   <path d="M369,330 L369,350" stroke="#4da3ff" stroke-width="1.5" marker-end="url(#mB)"/>
   <path d="M455,330 L455,350" stroke="#4da3ff" stroke-width="1.5" marker-end="url(#mB)"/>
   <path d="M541,330 L541,350" stroke="#4da3ff" stroke-width="1.5" marker-end="url(#mB)"/>
