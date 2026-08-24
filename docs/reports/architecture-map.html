@@ -27,7 +27,7 @@
 <body>
 <div class="wrap">
 <h1>Voice-Orchestration · 架构总图</h1>
-<div class="sub">pipecat-poc × dsh 本体/插件 × dais × orca × A2A × rt-gateway · 状态截至 2026-08-24（LB-001 车道B主干收口后）· 锚点 docs/kg/00-INDEX.md</div>
+<div class="sub">pipecat-poc × dsh 本体/插件 × dais × orca × A2A × rt-gateway · 状态截至 2026-08-25（LB-002-A 真身收口 · LB-002-B 消费侧接线后）· 锚点 docs/kg/00-INDEX.md</div>
 
 <svg viewBox="0 0 1400 900" xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -76,18 +76,18 @@
 
   <!-- head -->
   <rect class="bx" x="330" y="125" width="250" height="85" rx="8" fill="rgba(77,163,255,.08)" stroke="#4da3ff"/>
-  <text class="tt" x="342" y="143">语音 head · pipecat<tspan font-size="10" fill="#e3b341"> ◐ live V5/V6/V7</tspan></text>
+  <text class="tt" x="342" y="143">语音 head · pipecat<tspan font-size="10" fill="#e3b341"> ◐ live V5/V6 真身 2/2</tspan></text>
   <text class="td" x="342" y="161">STT → LLM → TTS · doctrine 注入</text>
   <text class="td" x="342" y="176">工具四件套（DSH_TOOLS_DOCTRINE）</text>
-  <text class="td" x="342" y="191">dispatch_intent/query_status/cancel</text>
+  <text class="td" x="342" y="191">dispatch/query_status/cancel/resolve</text>
 
   <!-- backend -->
   <rect class="bx" x="330" y="238" width="250" height="92" rx="8" fill="rgba(77,163,255,.08)" stroke="#4da3ff"/>
   <text class="tt" x="342" y="256">DshBackend · 两阶段应答</text>
   <text class="td" x="342" y="274">① 受理回执：run_id +【凭证…】</text>
   <text class="td" x="342" y="289">② FINAL_PREFIX 终稿 re-inject</text>
-  <text class="td" x="342" y="304">F7 路由：lane_mode = a │ b │ b-orca</text>
-  <text class="td" x="342" y="319">phase-2 守护：重试·tripwire·孤儿取消</text>
+  <text class="td" x="342" y="304">F7 路由：a │ b │ b-dag │ b-orca</text>
+  <text class="td" x="342" y="319">dispatch_dag 依赖波 · phase-2 D-17 退避</text>
 
   <!-- lane clients -->
   <rect class="bx" x="330" y="352" width="78" height="60" rx="7" fill="rgba(77,163,255,.08)" stroke="#4da3ff"/>
@@ -105,8 +105,9 @@
   <text class="ct" x="682" y="110" fill="#b587ff">dais · 消息 DAG 编排面<tspan font-size="10" fill="#7ee787"> ● 常驻总线</tspan></text>
 
   <rect class="bx" x="685" y="125" width="275" height="52" rx="8" fill="rgba(181,135,255,.08)" stroke="#b587ff"/>
-  <text class="tt" x="697" y="143">orchestrator · liaison（N6）</text>
-  <text class="td" x="697" y="159">session_* 邮箱 · [ref:] 信封</text>
+  <text class="tt" x="697" y="141">liaison 真身 · vh-liaison@v1（LB-002-A）</text>
+  <text class="td" x="697" y="157">agent_liaison · 9b95 · V5/V6 真身链 PASS</text>
+  <text class="xs" x="697" y="171">备援 e0e1 · PROFILE-INJECT 穿透已验</text>
 
   <rect class="bx" x="685" y="192" width="275" height="52" rx="8" fill="rgba(181,135,255,.08)" stroke="#b587ff"/>
   <text class="tt" x="697" y="210">manager 群</text>
@@ -119,8 +120,8 @@
   <rect class="bx" x="683" y="330" width="279" height="98" rx="8" fill="rgba(181,135,255,.08)" stroke="#b587ff"/>
   <text class="tt" x="695" y="350">dais CLI（DaisLane 子进程）</text>
   <text class="td" x="695" y="366">create-run / create-task / start-worker</text>
-  <text class="xs" x="695" y="382">send-message / check-messages / send-reply</text>
-  <text class="td" x="695" y="398">18 子命令 async 封装 · 单飞锁</text>
+  <text class="xs" x="695" y="382">worker_done 块结算 · --session（be8d9cf3 ◐）</text>
+  <text class="td" x="695" y="398">31 方法 async 封装 · 单飞锁 · D-17 退避</text>
   <text class="td" x="695" y="413">跨进程 flock：live 租约 dais-bus</text>
 
   <!-- dais 内部箭头：下发（左实线）/ 终稿上抛（右虚线） -->
@@ -184,8 +185,9 @@
   <text class="td" x="372" y="650">daemon.mjs 与 dsh 插件同码两形态</text>
 
   <rect class="bx" x="360" y="683" width="190" height="56" rx="8" fill="rgba(227,179,65,.07)" stroke="#e3b341"/>
-  <text class="tt" x="372" y="701" font-size="11.5">三孵化器 dsh/omp/claude</text>
-  <text class="xs" x="372" y="717">base profile→system prompt</text>
+  <text class="tt" x="372" y="699" font-size="11.5">孵化器 dsh-only 门禁</text>
+  <text class="xs" x="372" y="714">base profile→system prompt</text>
+  <text class="xs" x="372" y="728">omp/claude 已禁用·用户裁定</text>
 
   <rect class="bx" x="562" y="683" width="188" height="56" rx="8" fill="rgba(227,179,65,.07)" stroke="#e3b341"/>
   <text class="tt" x="574" y="701" font-size="11.5">executors 执行桥</text>
@@ -194,7 +196,7 @@
   <rect class="bx" x="360" y="752" width="390" height="52" rx="8" fill="rgba(227,179,65,.07)" stroke="#e3b341"/>
   <text class="tt" x="372" y="770">host-callback-bridge</text>
   <text class="td" x="372" y="786">HTTP intake：ack/done/ask/report/ping/status</text>
-  <text class="td" x="372" y="801">（maestro 编排回执面 · ui-agent-pool 等略）</text>
+  <text class="td" x="372" y="801">fleet：编排头 20d0 · 真身 9b95 · 备援 e0e1</text>
 
   <path d="M455,670 L455,681" stroke="#e3b341" stroke-width="1.4" marker-end="url(#mY)"/>
   <path d="M656,670 L656,681" stroke="#e3b341" stroke-width="1.4" marker-end="url(#mY)"/>
@@ -207,7 +209,7 @@
   <text class="td" x="802" y="604">worker/supervisor/queen）</text>
   <text class="td" x="802" y="619">→ AGENTS.md 投影 → 三门 → incubate</text>
   <text class="td" x="802" y="634">queen 派生 --derive · grill 收敛</text>
-  <text class="td" x="802" y="649">孵化目标：dsh / omp / claude</text>
+  <text class="td" x="802" y="649">孵化目标：dsh / dsh-liaison·manager / dry</text>
   <text class="td" x="798" y="668" fill="#7ee787">◂ incubate RPC（HTTP :8790）</text>
 
   <!-- 统一终稿链 -->
@@ -219,7 +221,7 @@
   <rect class="bx" x="1050" y="622" width="310" height="40" rx="7" fill="rgba(148,163,184,.06)" stroke="#94a3b8"/>
   <text class="tt ctr" x="1205" y="647" font-size="11.5">② manager send-reply → 邮箱链</text>
   <rect class="bx" x="1050" y="672" width="310" height="40" rx="7" fill="rgba(148,163,184,.06)" stroke="#94a3b8"/>
-  <text class="tt ctr" x="1205" y="697" font-size="11.5">③ head 邮箱 voice-head · await_done</text>
+  <text class="tt ctr" x="1205" y="697" font-size="11.5">③ head 邮箱 voice-head · await_done 退避</text>
   <rect class="bx" x="1050" y="722" width="310" height="40" rx="7" fill="rgba(148,163,184,.06)" stroke="#94a3b8"/>
   <text class="tt ctr" x="1205" y="747" font-size="11.5">④ FINAL_PREFIX + body → on_final</text>
   <rect class="bx" x="1050" y="772" width="310" height="40" rx="7" fill="rgba(148,163,184,.06)" stroke="#94a3b8"/>
@@ -261,10 +263,9 @@
   <text class="lb" x="377" y="474">A2A JSON-RPC</text>
   <text class="lb" x="377" y="488">message/send → t_*</text>
 
-  <!-- 孵化落位（虚线）：池 → dais / orca -->
+  <!-- 孵化落位（虚线）：池 → dais（dsh 会话）；orca 工作树保持裸 prompt（人格边界） -->
   <path d="M560,536 L560,504 L760,504 L760,452" stroke="#7ee787" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#mG)"/>
-  <path d="M560,504 L1340,504 L1340,452" stroke="#7ee787" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#mG)"/>
-  <text class="lb ctr" x="950" y="517" fill="#7ee787">孵化 agent 落位 ▸ dais 会话 / orca 工作树</text>
+  <text class="lb ctr" x="950" y="517" fill="#7ee787">孵化 agent 落位 ▸ dsh 会话（dais 车道）· orca 工作树保持裸 prompt</text>
 
   <!-- dsh本体 ⇄ 池 -->
   <path d="M310,601 L340,601" stroke="#7ee787" stroke-width="1.4" stroke-dasharray="4 3" marker-start="url(#mG)" marker-end="url(#mG)"/>
@@ -279,7 +280,7 @@
   <!-- ================= 脚注 ================= -->
   <text class="lb" x="30" y="848">部署态：● a2a-profile-daemon / dsh-web / maestro-watchd = systemd user 常驻；◐ rt-gateway 与 head 管线已建未部署（应 systemd 化为独立 voice-gateway.service）</text>
   <text class="lb" x="30" y="866">公网语音：frpc.service 在位（frp v2 已移出架构 · 是否保留待裁决）· R1：严禁裸 orca（GNOME 屏读器）· DSHMSG 信封 v2（msgid/ts）</text>
-  <text class="lb" x="30" y="884">锚点：docs/kg/00-INDEX.md（N1-N10）· F7 路由源：docs/kg/06 §1.2 · 证据：docs/kg/evidence/（最新 LB-001 · 车道B主干）</text>
+  <text class="lb" x="30" y="884">锚点：docs/kg/00-INDEX.md（N1-N10）· F7 路由源：docs/kg/06 §1.2 · 证据：docs/kg/evidence/（最新 LB-002-A · D-17 轮询饿死取证）</text>
 </svg>
 </div>
 </body>
