@@ -676,3 +676,84 @@ async def test_ab_lane_final_conformance(lane_kind):
     assert ref == receipt["ref"]
     assert final == FINAL_PREFIX + _AB_BODY   # 同终稿：前缀 + 同 body
     assert "【凭证R-CONF-AB-8899】" in final  # 凭证一致（逐字）
+
+
+# ---- lane B mainline: DshBackend lane_mode="b-orca" (F7 routing live) ----
+
+@pytest.mark.live("dais-bus", "orca-host")
+@pytest.mark.asyncio
+async def test_live_lane_b_orca_backend_mainline():
+    """Head tool surface over the orca lane: dispatch() phase-1 receipt
+    (run_id=worktree id), phase-2 artifact final re-injected with the
+    FINAL_PREFIX + credential verbatim; cancel/teardown leaves no residue.
+
+    This is the production-shape of the F7 routing decision (worktree/
+    terminal deliveries -> orca): the same DshBackend the head uses, not
+    the test-side _orca_worker choreography."""
+    if not shutil.which(OrcaLane.BIN):
+        pytest.skip("orca-ide absent (lane B host offline)")
+    lane = OrcaLane(default_timeout_s=90)
+    if not await _orca_plane_up(lane):
+        pytest.skip("orca-ide plane down (app/runtime unreachable)")
+    dais = DaisLane(default_timeout_s=10)
+    if not await _bus_healthy(dais):
+        pytest.skip("dais plane down (status/cancel face needs it)")
+
+    finals: list[tuple[str, str]] = []
+
+    async def on_final(ref, message):
+        finals.append((ref, message))
+
+    async def attempt(tag: str):
+        """One dispatch→final→teardown cycle; returns (receipt, message) or
+        None on budget expiry (cold-start transient — one retry allowed)."""
+        finals.clear()
+        backend = DshBackend(lane=dais, lane_mode="b-orca", lane_orca=lane,
+                             orca_repo=f"path:{_repo_root()}",
+                             orca_agent=ORCA_AGENT,
+                             on_final=on_final,
+                             # phase-2 must not expire before the test-side wait
+                             await_timeout_s=ORCA_WORKER_BUDGET_S + 120)
+        receipt = json.loads(await backend.dispatch(f"车道B主干冒烟{tag}"))
+        assert receipt["status"] == "accepted"
+        wt_id = receipt["run_id"]
+        assert "::" in wt_id, f"run_id not a worktree handle: {wt_id!r}"
+        deadline = time.monotonic() + ORCA_WORKER_BUDGET_S
+        while not finals and time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+        if not finals:  # teardown before retry — red line: no residue
+            # kill the orphaned phase-2 first: left alive it keeps issuing
+            # wait/read CLI calls against the removed worktree through the
+            # whole retry, starving the orca host under sequence load
+            task = backend._pending.get(receipt["ref"])
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, OrcaLaneError):
+                    pass
+            await _orca_teardown(lane, wt_id, f"vh-{receipt['ref']}")
+            return None
+        return receipt, finals[0]
+
+    outcome = await attempt("-r1") or await attempt("-r2")
+    assert outcome is not None, (
+        f"phase-2 artifact final never re-injected within budget x2 "
+        f"(cold-start transient; finals={finals!r})")
+    receipt, (got_ref, message) = outcome
+    wt_id = receipt["run_id"]
+    ref = receipt["ref"]
+    cred = receipt["credentials"][0]
+    assert "::" in wt_id and wt_id, f"run_id not a worktree handle: {wt_id!r}"
+    assert cred.startswith("【凭证")
+    assert got_ref == ref
+    assert message == FINAL_PREFIX + f"调研完成 {cred} 结论 41%"
+
+    # run bookkeeping: query_status answers over the dais face (shape only;
+    # attempt()'s backend went out of scope with its _runs bookkeeping)
+    qb = DshBackend(lane=dais)
+    status = json.loads(await qb.query_status(wt_id))
+    assert isinstance(status.get("runs"), list)
+
+    # teardown (production path: worktree stop+rm via lane API)
+    await _orca_teardown(lane, wt_id, f"vh-{ref}")

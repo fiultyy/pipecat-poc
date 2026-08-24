@@ -18,16 +18,36 @@ run; explicit ``cancel()`` does.
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
-from rt_a2a_client import A2aClient
+from rt_a2a_client import A2aClient, A2aError
 from rt_dsh_lane import DaisLane
 from rt_event_bus import EventBus
 from rt_orchestrator import FINAL_PREFIX, BackendResult, make_credential
 
 CLARIFY_NOTE = '{"status": "clarify", "note": "无法拆解该意图，请补充信息"}'
+
+# lane B-orca worker defaults (live-probed 2026-08-24, orca app 1.4.185 +
+# omp on GLM-5.3): the artifact-exactness choreography follows the
+# conformance _orca_worker dance (render-proof completion signal).
+ORCA_AGENT_DEFAULT = "omp"
+ORCA_WORKER_BUDGET_S = 300.0
+ORCA_WAIT_SLICE_MS = 15000
+ORCA_TURN_SETTLE_S = 20.0        # output window before the one interrupt+resend
+
+
+def _report_phase2_death(task: asyncio.Task) -> None:
+    """Tripwire: a dead phase-2 means the final is lost with no signal —
+    surface it instead of an unretrieved-exception warning."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        print(f"[dsh-backend] phase-2 aborted: {exc!r}",
+              file=sys.stderr, flush=True)
 
 
 @dataclass
@@ -66,6 +86,9 @@ class DshBackend:
     lane: DaisLane
     lane_a: A2aClient | None = None
     lane_mode: str = "b"
+    lane_orca: object | None = None     # OrcaLane (typed loose: optional dep)
+    orca_agent: str = ORCA_AGENT_DEFAULT
+    orca_repo: str = ""                 # verbatim selector (path:<p>/id:/name:)
     bus: EventBus = field(default_factory=EventBus)
     orchestrator_handle: str = ""
     head_handle: str = "voice-head"
@@ -93,12 +116,15 @@ class DshBackend:
             "note": "已受理，完成后播报",
         }
         self._pending[ref] = asyncio.create_task(self._phase2(ref, dispatch))
+        self._pending[ref].add_done_callback(_report_phase2_death)
         import json
 
         return json.dumps(receipt, ensure_ascii=False)
 
     async def _fanout(self, raw_intent: str, ref: str) -> DshDispatch | None:
         """Create run + intent message; returns None when unsplittable."""
+        if self.lane_mode == "b-orca":
+            return await self._fanout_orca(raw_intent, ref)
         if self.lane_mode == "a" and self.lane_a is not None:
             task_id = await self.lane_a.send(raw_intent, ref)
             credential = make_credential(ref.upper())
@@ -131,6 +157,45 @@ class DshBackend:
         })
         return dispatch
 
+    async def _fanout_orca(self, raw_intent: str, ref: str) -> DshDispatch:
+        """Lane B-orca fan-out (F7 routing: worktree/terminal deliveries).
+
+        Spawns a scratch worktree with the configured agent (default omp)
+        and a prompt that asks for one verbatim final line plus an artifact
+        write — the artifact is the render-proof completion signal (the
+        agent's answer text never enters the scrollback ring; live-probed
+        2026-08-23). The worktree id doubles as the run handle.
+        """
+        if self.lane_orca is None:
+            raise ValueError("lane_mode='b-orca' requires lane_orca=OrcaLane(...)")
+        if not self.orca_repo:
+            raise ValueError("lane_mode='b-orca' requires orca_repo selector")
+        import json as _json
+
+        credential = make_credential(ref.upper())
+        body = f"{raw_intent} {credential}"
+        artifact = f"final-{ref}.txt"
+        prompt = (
+            f"任务：{raw_intent}\n"
+            f"完成后：①把下面这一行逐字写入当前工作目录的 {artifact} 文件（不要加任何其他内容）：\n"
+            f"调研完成 {credential} 结论 41%\n"
+            f"②同时用一行回复确认。"
+        )
+        created = await self.lane_orca.spawn_worktree(
+            f"vh-{ref}", self.orca_repo, self.orca_agent, prompt, setup="skip")
+        wt_id = created["worktreeId"]
+        dispatch = DshDispatch(run_id=wt_id, task_id=created.get("terminalHandle"),
+                               ref=ref, credentials=[credential])
+        dispatch.artifact = artifact      # type: ignore[attr-defined]
+        dispatch.prompt = prompt          # type: ignore[attr-defined]  (dance resend)
+        self._runs[ref] = dispatch
+        await self.bus.emit("orch.dispatch", {
+            "run_id": wt_id, "task_id": None, "ref": ref,
+            "credentials": dispatch.credentials, "lane": "b-orca",
+            "extra": _json.dumps({"artifact": artifact, "agent": self.orca_agent}),
+        })
+        return dispatch
+
     async def _phase2(self, ref: str, dispatch: DshDispatch) -> None:
         """Await the done body and re-inject the final message.
 
@@ -145,10 +210,23 @@ class DshBackend:
         body: str | None = None
         while body is None:
             budget = max(1.0, deadline - asyncio.get_event_loop().time())
+            if (self.lane_mode == "b-orca"
+                    and dispatch.run_id and "::" in dispatch.run_id):
+                body = await self._await_orca(dispatch, budget)
+                continue
             try:
                 if (self.lane_a is not None and dispatch.run_id
                         and dispatch.run_id.startswith("t_")):
-                    body = await self.lane_a.await_done(dispatch.run_id, timeout_s=budget)
+                    try:
+                        body = await self.lane_a.await_done(
+                            dispatch.run_id, timeout_s=budget)
+                    except A2aError as exc:
+                        # server no longer knows the task (restart/roll):
+                        # its final is unknowable — surface and stop polling
+                        await self.bus.emit("orch.progress",
+                                            {"ref": ref,
+                                             "note": f"lane-a task gone: {exc}"})
+                        return
                     continue
                 # Poll the HEAD's own mailbox: replies are addressed to the
                 # intent's sender; polling the orchestrator handle would
@@ -173,6 +251,82 @@ class DshBackend:
         await self.bus.emit("orch.done", {"ref": ref, "run_id": dispatch.run_id, "artifact": body})
         if self.on_final:
             await self.on_final(ref, final)
+
+    async def _await_orca(self, dispatch: DshDispatch, budget_s: float) -> str | None:
+        """Await the worktree artifact (render-proof) within one budget slice.
+
+        Follows the conformance ``_orca_worker`` choreography in miniature:
+        bounded tui-idle wait slices; completion decided ONLY by the
+        artifact's exact content match (partial writes never satisfy);
+        dialog flashes answered with ``1`` (bounded); ONE interrupt +
+        prompt resend after the settle window passes with output but no
+        artifact (a worker stuck thinking never completes otherwise).
+        Teardown is owned by cancel()/the caller — this coroutine never
+        removes the worktree. Returns the artifact body, or None when
+        the slice budget expired (phase-2 loops back for another slice
+        until await_timeout_s).
+        """
+        from pathlib import Path
+        from rt_orca_lane import OrcaLaneError, OrcaLaneTimeout
+
+        assert self.lane_orca is not None
+        handle = dispatch.task_id
+        wt_id = dispatch.run_id or ""
+        artifact = getattr(dispatch, "artifact", None) or f"final-{dispatch.ref}.txt"
+        prompt = getattr(dispatch, "prompt", "")
+        final_path = Path(wt_id.split("::", 1)[1]) / artifact if "::" in wt_id else None
+        expected = f"调研完成 {dispatch.credentials[0]} 结论 41%"
+        now = asyncio.get_event_loop().time
+        deadline = now() + budget_s
+        dialogs = 0
+        cursor = 0
+        t_output = None
+        danced = False
+
+        async def lane_retry(note: str) -> None:
+            # transient lane failure (CLI hang killed at subprocess bound,
+            # ok:false busy, …): observable pause, retried until budget
+            await self.bus.emit("orch.progress",
+                                {"ref": dispatch.ref, "note": note[:160]})
+            await asyncio.sleep(2.0)
+
+        while now() < deadline:
+            try:
+                await self.lane_orca.wait(handle, what="tui-idle",
+                                          timeout_ms=ORCA_WAIT_SLICE_MS)
+            except OrcaLaneTimeout:
+                pass  # bounded slice consumed — keep polling within budget
+            except OrcaLaneError as exc:
+                msg = str(exc)
+                if not (msg.startswith("exit=1") and '"ok": true' in msg):
+                    await lane_retry(f"lane retry (wait): {msg}")
+                    continue
+            if final_path is not None and final_path.exists():
+                try:
+                    content = final_path.read_text(encoding="utf-8").strip()
+                except OSError:
+                    content = ""  # mid-write/mid-remove race — next pass re-reads
+                if content == expected:  # exact — partial writes never satisfy
+                    return content
+            try:
+                page, cursor = await self.lane_orca.read(handle, cursor=cursor,
+                                                         limit=200)
+                if ("Enter to confirm" in page or "2. No, exit" in page) \
+                        and dialogs < 5:
+                    dialogs += 1
+                    await self.lane_orca.send(handle, "1")
+                    continue
+                if page.strip() and t_output is None:
+                    t_output = now()
+                if (not danced and prompt and t_output is not None
+                        and now() - t_output >= ORCA_TURN_SETTLE_S):
+                    await self.lane_orca.interrupt(handle)
+                    await asyncio.sleep(3)
+                    await self.lane_orca.send(handle, prompt)
+                    danced = True
+            except OrcaLaneError as exc:
+                await lane_retry(f"lane retry (read): {exc}")
+        return None
 
     # ---- head tool 2: query_status ----
 
@@ -202,7 +356,14 @@ class DshBackend:
         task = self._pending.get(ref_or_run) or self._pending.get(run_id)
         if task and not task.done():
             task.cancel()
-        if self.lane_a is not None and run_id.startswith("t_"):
+        if self.lane_mode == "b-orca" and run_id and "::" in run_id:
+            state = "canceled"
+            try:
+                await self.lane_orca.stop(run_id)  # type: ignore[union-attr]
+                await self.lane_orca._run("worktree", "rm", "--worktree", run_id)  # type: ignore[union-attr]
+            except Exception:
+                pass  # teardown best-effort; residual listed by worktree_ps
+        elif self.lane_a is not None and run_id.startswith("t_"):
             state = await self.lane_a.cancel(run_id)
         else:
             # fail-dispatch expects a ctx_ dispatch handle and rejects
