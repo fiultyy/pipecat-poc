@@ -45,6 +45,7 @@ def _dais_plane_up() -> bool:
         return False
 
 
+@pytest.mark.live("dais-bus", "orca-host")
 @pytest.mark.parametrize("name", ["dais runtime json", "dais check-status", "orca-ide status"])
 def test_probe_matrix(name: str):
     if name.startswith("dais") and not _dais_plane_up():
@@ -55,6 +56,7 @@ def test_probe_matrix(name: str):
     assert res.latency_ms < 5000, f"{name} too slow: {res.latency_ms:.0f} ms"
 
 
+@pytest.mark.live("dais-bus", "orca-host")
 def test_evidence_written():
     results = asyncio.run(run_matrix())
     if not all(r.ok for r in results):

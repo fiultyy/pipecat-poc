@@ -4,6 +4,6 @@
 
 | 探针 | 结果 | 时延 | 明细 |
 |---|---|---|---|
-| dais runtime json | PASS | 108 ms | runtime json absent; CLI fallback ok |
-| dais check-status | PASS | 107 ms | 162 runs /   run_<redacted> [voice-head] 查询/查找 WebAssembly 生态报告（WebAssembly ecosystem re /   run_<redacted> [voice-head] |
-| orca-ide status | PASS | 232 ms | running=True v1.4.185 |
+| dais runtime json | PASS | 0 ms | mode=app pid=908653 alive=True |
+| dais check-status | PASS | 169 ms | 357 runs /   run_<redacted> vh-lane smoke: create/status roundtrip /   run_<redacted> [voice-head] A/B 对拍一致性意图：复核调研结论 41 |
+| orca-ide status | PASS | 266 ms | running=True v1.4.185 |

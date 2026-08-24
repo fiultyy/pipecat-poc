@@ -80,6 +80,7 @@ def _dais_plane_up() -> bool:
 @pytest.mark.skipif(not _ready(), reason="GLM creds or dais absent")
 @pytest.mark.skipif(not _plugin_ok(), reason="node or a2a-profile-server plugin absent")
 @pytest.mark.skipif(not _dais_plane_up(), reason="dais orchestration plane down (resident app not running)")
+@pytest.mark.live("dais-bus")
 def test_live_v5_v6():
     proc = subprocess.run(
         [sys.executable, str(HERE / "live_v5_v6_dsh.py")],

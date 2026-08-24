@@ -79,7 +79,10 @@ orca-ide terminal send --terminal <handle> --text "$(cat <<'EOF'
   tests/test_projection_live.py
 测试（本 worktree 无 venv，用主区绝对路径；cwd=本 worktree）：
   ~/workspace-claw-02/pipecat-poc/.venv/bin/python -m pytest tests/test_rt_projector.py -q
-红线：impl-specs G1–G5；不改协议常量（FINAL_PREFIX/[ref:]/凭证格式）；不碰 src/pipecat/；不 push。
+红线：impl-specs G1–G6；不改协议常量（FINAL_PREFIX/[ref:]/凭证格式）；不碰 src/pipecat/；不 push。
+live 纪律（G6）：涉及 live 用例的票——超时/预算常量先实测后定（预算 ≥ 实测 P95 × 2，
+实测记录与常量同文件注释互指，P95 基线 docs/kg/evidence/VO-006-report.md）；并发跑测试
+须让 live 用例走 @pytest.mark.live 声明域（tests/live_lock.py 自动串行，DSH_LIVE_LOCK=skip 让路）。
 完成交付：①测试全绿 ②报告落盘 docs/kg/evidence/VO-001-report.md（A 节贴测试输出原文）
   ③报告末行 done body：`<判定>;报告:docs/kg/evidence/VO-001-report.md;测试:<N>项全绿;备注:<≤40字>`
 EOF

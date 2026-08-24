@@ -12,6 +12,7 @@
 - **G3 范围分治**：改动仅落 `examples/realtime-provider-poc/`、`tests/`、`docs/`、`~/.dsh/plugins/a2a-profile-server/`（对应包）；不碰 pipecat 框架 `src/`、不改 maestro bin/ 既有工具。
 - **G4 文档同步**：实现落地的 `〔new:〕` 即刻转 `〔loc:〕`（KG 维护规则 3）；账本（`docs/kg/evidence/ledger-carryover-round6.md`）每包完成即更新；done body 固定格式。
 - **G5 协议不漂移**：两阶段契约/`[ref:]` 信封/三过滤/FINAL_PREFIX/凭证逐字——任何包不得改动既有协议常量与语义（对拍测试即守卫）。
+- **G6 live 预算公式**（D-12/D-13）：live 用例超时/预算常量 **≥ 实测 P95 × 2**——派发前先实测后定值，实测记录与常量同文件注释互指（P95 基线：`docs/kg/evidence/VO-006-report.md`，典型 40–70s；V7 晚峰 447.9s 全绿见 VO-012-report A.3）。并发互踩由 `tests/live_lock.py` flock 租约机械兜底：`@pytest.mark.live` 用例按声明域自动串行（`DSH_LIVE_LOCK=skip` 让路跳过）；租约等待告警阈值 `warn_after_s` 遵循同一 P95 基。
 
 ---
 

@@ -8,8 +8,11 @@
 
 import dotenv
 import pytest
+from contextlib import ExitStack
 
 from pipecat.utils.deprecation import _warned_read_sites
+
+from live_lock import DEFAULT_DOMAIN, LiveLockUnavailable, live_lease
 
 
 def pytest_configure(config):
@@ -24,6 +27,46 @@ def pytest_configure(config):
     name with ``from dotenv import load_dotenv`` picks up the stub.
     """
     dotenv.load_dotenv = lambda *args, **kwargs: False
+    config.addinivalue_line(
+        "markers",
+        "live([domains]): 占用真实宿主资源（dais 总线/orca 宿主等）的用例；"
+        "conftest 自动按声明域取跨进程 flock 租约（tests/live_lock.py，"
+        "DSH_LIVE_LOCK=skip 时拿不到即跳过让路）",
+    )
+
+
+_LEASES: pytest.StashKey[ExitStack] = pytest.StashKey()
+
+
+def pytest_runtest_setup(item):
+    """Acquire the declared live leases before a marked case runs.
+
+    ``@pytest.mark.live`` / ``@pytest.mark.live("dais-bus", "orca-host")`` /
+    ``@pytest.mark.live(domains=[...])`` — domains default to the shared dais
+    bus. Leases are acquired in sorted order (deadlock-free) and released in
+    ``pytest_runtest_teardown``. With ``DSH_LIVE_LOCK=skip`` a held lease
+    skips the case with a trace instead of waiting.
+    """
+    marker = item.get_closest_marker("live")
+    if marker is None:
+        return
+    domains = sorted(set(marker.args) or set(marker.kwargs.get("domains", ())) or {DEFAULT_DOMAIN})
+    stack = ExitStack()
+    try:
+        for domain in domains:
+            stack.enter_context(live_lease(domain))
+    except LiveLockUnavailable as exc:
+        stack.close()
+        pytest.skip(f"live lease unavailable (DSH_LIVE_LOCK=skip): {exc}")
+    item.stash[_LEASES] = stack
+
+
+def pytest_runtest_teardown(item):
+    """Release the live leases held for this case (setup-to-teardown span)."""
+    stack = item.stash.get(_LEASES, None)
+    if stack is not None:
+        item.stash[_LEASES] = None
+        stack.close()
 
 
 @pytest.fixture(autouse=True)

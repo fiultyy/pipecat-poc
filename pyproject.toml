@@ -225,7 +225,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "--verbose"
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
     "ignore:'audioop' is deprecated:DeprecationWarning",

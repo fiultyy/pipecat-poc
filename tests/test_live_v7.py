@@ -763,6 +763,7 @@ def test_v7_appendix_gate1():
 @pytest.mark.skipif(not _plugin_ok(), reason="node or a2a-profile-server plugin absent")
 @pytest.mark.skipif(not _dais_plane_up(), reason="dais orchestration plane down (resident app not running)")
 @pytest.mark.skipif(not _loopback_up(), reason="dsh main loopback down (incubation/wakeup face unavailable)")
+@pytest.mark.live("dais-bus")
 def test_live_v7():
     LOG.clear()
     assert asyncio.run(asyncio.wait_for(v7_main(), TOTAL_BUDGET + 30)), \

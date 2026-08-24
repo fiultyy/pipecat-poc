@@ -224,7 +224,7 @@ def _mock_projector(outputs):
 
 
 def test_role_templates_cover_four_roles_worker_empty():
-    assert set(ROLE_TEMPLATES) == {"liaison", "manager", "worker", "supervisor"}
+    assert set(ROLE_TEMPLATES) == {"liaison", "manager", "queen", "worker", "supervisor"}
     assert ROLE_TEMPLATES["worker"] == ""  # 现行零变化（回归锚）
 
 
