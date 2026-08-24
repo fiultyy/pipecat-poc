@@ -62,6 +62,28 @@ class DshDispatch:
 
 
 @dataclass
+class DagTaskSpec:
+    """One subtask in a dependency-ordered voice dispatch (lane B DAG).
+
+    Args:
+        spec: self-contained subtask description.
+        deps: indices (into the same dispatch's task list) of prerequisite
+            subtasks; a worker starts only after all deps settle
+            ``succeeded`` — a failed dep skips the dependent task.
+        command: shell block for daemon-driven settlement (exit 0 =
+            worker_done succeeded); mutually informative with ``session``.
+        session: bind the dispatch to a long-lived worker session's pane
+            (``start-worker --session``, dais be8d9cf3) instead of a
+            command block.
+    """
+
+    spec: str
+    deps: list[int] = field(default_factory=list)
+    command: str | None = None
+    session: str | None = None
+
+
+@dataclass
 class DshBackend:
     """Implements the head tool surface: dispatch / query_status / cancel.
 
@@ -124,6 +146,48 @@ class DshBackend:
         import json
 
         return json.dumps(receipt, ensure_ascii=False)
+
+    async def dispatch_dag(self, objective: str, tasks: list[DagTaskSpec]) -> str:
+        """Head tool: split one intent into a dependent task DAG (lane B).
+
+        Creates the run + tasks (``--dep`` wired from spec indices), then
+        a phase-2 walker starts workers in dependency waves — a worker
+        starts only once its deps settled ``succeeded`` (dais-side state
+        kept in step via promote-tasks) — matches each dispatch's
+        worker_done settlement, and aggregates per-task outcomes plus
+        terminal tails into ONE final message for the voice chain.
+        """
+        import json
+
+        if not tasks:
+            return CLARIFY_NOTE
+        ref = "vh-" + uuid.uuid4().hex[:8]
+        run_id = await self.lane.create_run(f"[voice-head] {objective[:200]}")
+        task_ids: list[str] = []
+        for t in tasks:
+            deps = [task_ids[i] for i in t.deps if i < len(task_ids)]
+            task_ids.append(await self.lane.create_task(run_id, t.spec[:2000],
+                                                        deps=deps))
+        credential = make_credential(ref.upper())
+        dispatch = DshDispatch(run_id=run_id, task_id=None, ref=ref,
+                               credentials=[credential])
+        dispatch.dag = [{"task_id": tid, "deps": t.deps, "command": t.command,
+                         "session": t.session, "spec": t.spec}
+                        for tid, t in zip(task_ids, tasks)]  # type: ignore[attr-defined]
+        dispatch.dag_ctx = {}                                  # type: ignore[attr-defined]
+        self._runs[ref] = dispatch
+        await self.bus.emit("orch.dispatch", {
+            "run_id": run_id, "task_id": None, "ref": ref,
+            "credentials": dispatch.credentials, "lane": "b-dag",
+            "extra": json.dumps({"tasks": len(tasks)}, ensure_ascii=False),
+        })
+        self._pending[ref] = asyncio.create_task(self._phase2_dag(ref, dispatch))
+        self._pending[ref].add_done_callback(_report_phase2_death)
+        return json.dumps({
+            "status": "accepted", "run_id": run_id, "ref": ref,
+            "credentials": dispatch.credentials, "tasks": len(tasks),
+            "note": "已按依赖拆分受理，完成后播报",
+        }, ensure_ascii=False)
 
     async def _fanout(self, raw_intent: str, ref: str) -> DshDispatch | None:
         """Create run + intent message; returns None when unsplittable."""
@@ -256,6 +320,108 @@ class DshBackend:
         if self.on_final:
             await self.on_final(ref, final)
 
+    async def _phase2_dag(self, ref: str, dispatch: DshDispatch) -> None:
+        """Walk the DAG in dependency waves; aggregate ONE final message.
+
+        A worker starts only after its deps settled ``succeeded``; a
+        failed dep skips the dependents (recorded, not hidden). Each
+        settlement is matched via the dispatch's worker_done row, the
+        terminal tail is kept as the task's contribution, and
+        promote-tasks keeps dais-side readiness in step. Settlement
+        observation shares the escalating-backoff discipline (D-17).
+        """
+        from rt_dsh_lane import DaisLaneError
+
+        dag: list[dict] = dispatch.dag          # type: ignore[attr-defined]
+        ctx: dict[int, str] = dispatch.dag_ctx  # type: ignore[attr-defined]
+        outcomes: dict[int, dict] = {}
+        tails: dict[int, str] = {}
+        deadline = asyncio.get_event_loop().time() + self.await_timeout_s
+        delay = self.poll_s
+
+        def _deps_done(i: int) -> bool:
+            return all(d in outcomes for d in dag[i]["deps"])
+
+        def _deps_ok(i: int) -> bool:
+            return all(outcomes[d].get("outcome") == "succeeded"
+                       for d in dag[i]["deps"])
+
+        while len(outcomes) < len(dag):
+            left = deadline - asyncio.get_event_loop().time()
+            if left <= 0:
+                await self.bus.emit("orch.progress",
+                                    {"ref": ref, "note": "DAG 仍在途"})
+                return
+            # wave start: ready tasks (deps settled succeeded) get workers
+            for i, t in enumerate(dag):
+                if i in outcomes or i in ctx:
+                    continue
+                if not _deps_done(i):
+                    continue
+                if _deps_ok(i):
+                    try:
+                        ctx[i] = await self.lane.start_worker(
+                            t["task_id"], command=t["command"],
+                            session=t["session"])
+                        await self.bus.emit("orch.progress", {
+                            "ref": ref,
+                            "note": f"task {i + 1}/{len(dag)} worker "
+                                    f"{ctx[i]} started"})
+                    except DaisLaneError:
+                        await asyncio.sleep(min(delay, 1.0))
+                else:
+                    outcomes[i] = {"outcome": "skipped",
+                                   "reason": "dependency failed"}
+            if not ctx:
+                break
+            # observe settlements round-robin with small slices
+            settled_any = False
+            for i, handle in list(ctx.items()):
+                slice_s = min(2.0, max(0.1, deadline - asyncio.get_event_loop().time()))
+                try:
+                    row = await self.lane.await_worker_done(
+                        handle, timeout_s=slice_s, poll_s=0.5,
+                        poll_max_s=2.0)
+                except TimeoutError:
+                    continue
+                except DaisLaneError:
+                    continue  # transient lane errors retry next cycle
+                outcomes[i] = row
+                settled_any = True
+                del ctx[i]
+                try:
+                    tail, _ = await self.lane.read_worker(handle, lines=6)
+                    tails[i] = tail.strip()[-400:]
+                except DaisLaneError:
+                    tails[i] = ""
+                try:
+                    await self.lane.promote_tasks(dispatch.run_id or "")
+                except DaisLaneError:
+                    pass  # dais-side readiness is best-effort bookkeeping
+                await self.bus.emit("orch.progress", {
+                    "ref": ref,
+                    "note": f"task {i + 1}/{len(dag)} settled "
+                            f"{row.get('outcome', '?')}"})
+            if not settled_any:
+                await asyncio.sleep(min(delay, max(0.05, left)))
+                delay = min(delay * 1.5, self.poll_max_s)
+
+        parts = []
+        for i, t in enumerate(dag):
+            outcome = outcomes.get(i, {}).get("outcome", "unsettled")
+            tail = tails.get(i, "")
+            line = f"子任务{i + 1}：{t['spec'][:60]} → {outcome}"
+            if tail:
+                line += f"｜{tail}"
+            parts.append(line)
+        credential = (dispatch.credentials or [""])[0]
+        body = "\n".join(parts) + f"\n【凭证{credential}】"
+        final = f"{FINAL_PREFIX}{body}"
+        await self.bus.emit("orch.done", {"ref": ref, "run_id": dispatch.run_id,
+                                          "artifact": body})
+        if self.on_final:
+            await self.on_final(ref, final)
+
     async def _await_orca(self, dispatch: DshDispatch, budget_s: float) -> str | None:
         """Await the worktree artifact (render-proof) within one budget slice.
 
@@ -356,15 +522,18 @@ class DshBackend:
         for d in self._runs.values():
             if d.ref not in pending:
                 continue
-            handle = getattr(d, "task_id", None)
-            if not (handle and str(handle).startswith("ctx_")):
-                continue
-            try:
-                label = (await self.lane.scan_wait_blocked(str(handle))).strip()
-            except DaisLaneError:
-                continue  # classification is best-effort surfacing
-            if label and label.lower() not in ("none", "ok", ""):
-                lines.append(f"{d.ref}：卡在 {label}")
+            handles = []
+            tid = getattr(d, "task_id", None)
+            if tid and str(tid).startswith("ctx_"):
+                handles.append(str(tid))
+            handles += [c for c in getattr(d, "dag_ctx", {}).values()]
+            for handle in handles:
+                try:
+                    label = (await self.lane.scan_wait_blocked(handle)).strip()
+                except DaisLaneError:
+                    continue  # classification is best-effort surfacing
+                if label and label.lower() not in ("none", "ok", ""):
+                    lines.append(f"{d.ref}：卡在 {label}")
         import json
 
         return json.dumps({"runs": lines, "pending": pending}, ensure_ascii=False)
@@ -388,6 +557,13 @@ class DshBackend:
         task = self._pending.get(ref_or_run) or self._pending.get(run_id)
         if task and not task.done():
             task.cancel()
+        # live DAG dispatches fail individually (best-effort; the pending
+        # kill above is the authoritative stop)
+        for handle in list(getattr(dispatch, "dag_ctx", {}).values()):
+            try:
+                await self.lane.fail_dispatch(handle, "cancelled by voice user")
+            except Exception:
+                pass
         if self.lane_mode == "b-orca" and run_id and "::" in run_id:
             state = "canceled"
             try:

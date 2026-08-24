@@ -199,3 +199,128 @@ async def test_resolve_gate_passthrough(backend, captured):
     assert out == {"status": "resolved", "gate": "gate_1", "resolution": "go"}
     assert any(e[0] == "orch.progress" and "gate_1" in e[1].get("note", "")
                for e in captured["events"])
+
+
+# ---- LB-002-B: dependency-ordered DAG dispatch (lane b-dag) ----
+
+def make_dag_lane(t1_outcome="succeeded"):
+    """Stateful lane mock: two tasks, task 2 depends on task 1.
+
+    Records start-worker order/flags; worker_done rows are per-dispatch
+    one-shots (consumed on first read), mirroring mailbox semantics.
+    """
+    done = {
+        "ctx_a1": [f'seq=1 from=w to=ctx_a1 type=worker_done body={{"task_id":"task_11","dispatch_id":"ctx_a1","outcome":"{t1_outcome}"}}'],
+        "ctx_b2": ['seq=2 from=w to=ctx_b2 type=worker_done body={"task_id":"task_22","dispatch_id":"ctx_b2","outcome":"succeeded"}'],
+    }
+    starts: list[tuple] = []
+    create_task_calls: list[list[str]] = []
+
+    async def runner(argv):
+        sub = argv[2]
+        if sub == "create-run":
+            return ("run_beef\n", "")
+        if sub == "create-task":
+            create_task_calls.append(list(argv))
+            spec = argv[4]
+            return (f"task_{'11' if '甲' in spec else '22'}\n", "")
+        if sub == "start-worker":
+            flags = {argv[i]: argv[i + 1] for i in range(3, len(argv) - 1)
+                     if argv[i].startswith("--")}
+            starts.append((argv[3], flags.get("--command"),
+                           flags.get("--session")))
+            return ("ctx_a1\n" if argv[3] == "task_11" else "ctx_b2\n", "")
+        if sub == "check-messages":
+            rows = done.get(argv[3], [])
+            return ((rows.pop(0) + "\n") if rows else ("no unread messages\n", ""), "")
+        if sub == "read-worker":
+            return (f"tail of {argv[3]}\n", "cursor: 9\n")
+        if sub == "promote-tasks":
+            return ("ok\n", "")
+        return ("", "")
+
+    return DaisLane(runner=runner), starts, create_task_calls
+
+
+@pytest.mark.asyncio
+async def test_dispatch_dag_dependency_waves_and_aggregate(captured):
+    from rt_dsh_backend import DagTaskSpec
+
+    lane, starts, ctc = make_dag_lane()
+    bus = EventBus()
+
+    async def sink(kind, payload):
+        captured["events"].append((kind, payload))
+
+    bus.subscribe(sink)
+
+    async def on_final(ref, message):
+        captured["finals"].append((ref, message))
+
+    b = DshBackend(lane=lane, bus=bus, on_final=on_final, await_timeout_s=4,
+                   poll_s=0.05, poll_max_s=0.2)
+    receipt = json.loads(await b.dispatch_dag(
+        "对比调研甲乙", [
+            DagTaskSpec(spec="调研甲方案", command="echo A"),
+            DagTaskSpec(spec="调研乙方案", deps=[0], command="echo B",
+                        session="session_worker2"),
+        ]))
+    assert receipt["status"] == "accepted" and receipt["tasks"] == 2
+    assert receipt["run_id"] == "run_beef"
+
+    for _ in range(200):
+        if captured["finals"]:
+            break
+        await asyncio.sleep(0.05)
+    assert captured["finals"], "DAG final never arrived"
+    ref, final = captured["finals"][0]
+    assert ref == receipt["ref"]
+    from rt_orchestrator import FINAL_PREFIX
+    assert final.startswith(FINAL_PREFIX)
+    assert "子任务1" in final and "succeeded" in final
+    assert "子任务2" in final and "succeeded" in final
+    assert "【凭证" in final
+    # dependency wiring: task 2's create-task carries --dep task_11
+    dep_calls = [c for c in ctc if "task_22" in c or c[4] == "调研乙方案"]
+    assert any("--dep" in c and c[c.index("--dep") + 1] == "task_11"
+               for c in dep_calls), ctc
+    # wave order: task 1's worker started before task 2's
+    assert [s[0] for s in starts] == ["task_11", "task_22"]
+    # per-task worker flavor: command mode vs session-bound
+    assert starts[0][1] == "echo A" and starts[0][2] is None
+    assert starts[1][2] == "session_worker2"
+    assert any(e[0] == "orch.dispatch" and e[1].get("lane") == "b-dag"
+               for e in captured["events"])
+
+
+@pytest.mark.asyncio
+async def test_dispatch_dag_failed_dep_skips_dependent(captured):
+    from rt_dsh_backend import DagTaskSpec
+
+    lane, starts, _ = make_dag_lane(t1_outcome="failed")
+    bus = EventBus()
+
+    async def sink(kind, payload):
+        captured["events"].append((kind, payload))
+
+    bus.subscribe(sink)
+
+    async def on_final(ref, message):
+        captured["finals"].append((ref, message))
+
+    b = DshBackend(lane=lane, bus=bus, on_final=on_final, await_timeout_s=4,
+                   poll_s=0.05, poll_max_s=0.2)
+    receipt = json.loads(await b.dispatch_dag(
+        "对比调研甲乙", [
+            DagTaskSpec(spec="调研甲方案", command="echo A"),
+            DagTaskSpec(spec="调研乙方案", deps=[0], command="echo B"),
+        ]))
+    for _ in range(200):
+        if captured["finals"]:
+            break
+        await asyncio.sleep(0.05)
+    assert captured["finals"], "DAG final never arrived"
+    final = captured["finals"][0][1]
+    assert "failed" in final and "skipped" in final
+    # the dependent task never got a worker
+    assert [s[0] for s in starts] == ["task_11"]

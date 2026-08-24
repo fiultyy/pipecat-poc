@@ -103,11 +103,23 @@ class DaisLane:
             raise DaisLaneError(f"no task id in output: {out.strip()[:120]!r}")
         return m.group(0)
 
-    async def start_worker(self, task_id: str, command: str | None = None) -> str:
-        """``start-worker <task> [--command <cmd>]`` → ``ctx_<id>`` (dispatch handle)."""
+    async def start_worker(self, task_id: str, command: str | None = None,
+                           session: str | None = None) -> str:
+        """``start-worker <task> [--command <cmd>] [--session <sid>]`` → ``ctx_<id>``.
+
+        ``--command`` arms block settlement: the daemon enqueues
+        worker_done when the exact command block exits (exit 0 =
+        succeeded) — no completion polling needed. ``--session`` (dais
+        be8d9cf3, D-04) binds the dispatch pane by session mailbox key
+        instead of the active pane and dual-writes the assignee columns,
+        so long-lived worker sessions can be addressed deterministically;
+        the first output line stays ``ctx_<id>`` either way.
+        """
         args = ["start-worker", task_id]
         if command:
             args += ["--command", command]
+        if session:
+            args += ["--session", session]
         out = await self._run(*args)
         m = re.search(r"ctx_[0-9a-f]+", out)
         if not m:
@@ -224,6 +236,38 @@ class DaisLane:
             got = _take()
             if got is not None:
                 return got
+            await asyncio.sleep(min(delay, max(0.05, remaining)))
+            delay = min(delay * 1.5, poll_max_s)
+
+    async def await_worker_done(self, dispatch_id: str, timeout_s: float = 300.0,
+                                poll_s: float = 1.0,
+                                poll_max_s: float = 8.0) -> dict:
+        """Block until the dispatch's ``worker_done`` settlement row arrives.
+
+        Settlement is daemon-driven (block settlement with ``--command``
+        enqueues worker_done on the exact command-block exit); this only
+        OBSERVES the settlement mailbox. The ``--type`` filter is
+        client-side, so non-matching rows stay unread for their own
+        consumers. Returns the parsed body JSON
+        ``{task_id, dispatch_id, outcome}``; raises TimeoutError while
+        still unsettled. Polls share the escalating-backoff discipline
+        (D-17).
+        """
+        deadline = time.monotonic() + timeout_s
+        delay = poll_s
+        while True:
+            rows = await self.check_messages(dispatch_id, message_type=WORKER_DONE)
+            for row in rows:
+                try:
+                    data = json.loads(row.get("body", ""))
+                except (ValueError, TypeError):
+                    continue
+                if data.get("dispatch_id") == dispatch_id:
+                    return data
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"no worker_done for {dispatch_id} within {timeout_s}s")
             await asyncio.sleep(min(delay, max(0.05, remaining)))
             delay = min(delay * 1.5, poll_max_s)
 

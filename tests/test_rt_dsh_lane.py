@@ -138,6 +138,47 @@ def test_await_done_poll_backoff_escalates_and_caps():
     assert polls["n"] == 8
 
 
+def test_start_worker_session_flag():
+    lane, _ = make_lane([("ctx_ab12cd34\n", "")])
+    assert asyncio.run(lane.start_worker(
+        "task_x", command="echo hi", session="session_abc")) == "ctx_ab12cd34"
+    argv = lane._call_log[-1]
+    assert argv[argv.index("--session") + 1] == "session_abc"
+    assert argv[argv.index("--command") + 1] == "echo hi"
+
+
+def test_await_worker_done_matches_dispatch_and_skips_bad_rows():
+    """Other dispatches' settlements and non-JSON bodies are skipped;
+    the matching worker_done row parses into its fixed body fields."""
+    other = ('seq=4 from=w to=ctx_a1 type=worker_done '
+             'body={"task_id":"task_9","dispatch_id":"ctx_zz","outcome":"succeeded"}')
+    bad = "seq=6 from=w to=ctx_a1 type=worker_done body=not-json"
+    good = ('seq=5 from=w to=ctx_a1 type=worker_done '
+            'body={"task_id":"task_1","dispatch_id":"ctx_a1","outcome":"succeeded"}')
+    lane, queue = make_lane([(other + "\n" + bad + "\n", ""), (good + "\n", "")])
+
+    async def run():
+        return await lane.await_worker_done("ctx_a1", timeout_s=2, poll_s=0.01)
+
+    row = asyncio.run(run())
+    assert row == {"task_id": "task_1", "dispatch_id": "ctx_a1",
+                   "outcome": "succeeded"}
+    assert queue == []  # first poll skipped both rows, second matched
+
+
+def test_await_worker_done_timeout_while_unsettled():
+    async def runner(argv):
+        return ("no unread messages\n", "")
+
+    lane = DaisLane(runner=runner)
+
+    async def run():
+        await lane.await_worker_done("ctx_a1", timeout_s=0.05, poll_s=0.02)
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(run())
+
+
 def test_read_worker_cursor_from_stderr():
     lane, _ = make_lane([("line1\nline2\n", "cursor: 42\n")])
     tail, cursor = asyncio.run(lane.read_worker("ctx_x", after=40))
