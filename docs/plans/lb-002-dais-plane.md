@@ -15,7 +15,7 @@
 | G1 | **真身缺口**：b 车道 orchestrator_handle 一直由测试替身扮演（conformance `orchestrator_player` session_vhconf）；生产链无真 manager/liaison | V5/V6/V7 live 全是替身；池孵化 role=liaison/manager 的 dsh agent 从未上链 | 本次握手即入口 |
 | G2 | **DAG 面**：create_task(--dep) + start_worker 零生产调用 —— manager 拆分/扇出/依赖编排没有生产路径 | grep：backend 无此二调用 | **D-04**（start-worker pane 自动绑定未完成）先清 |
 | G3 | **异常面**：scan_wait_blocked / resolve_gate 已封装未接线 —— gate 阻塞/等待卡死时 head 只能干等预算耗尽 | cancel 只有 fail_dispatch（ctx_ 限定） | 无 |
-| G4 | **profile 穿透**：bindProfile（在飞穿衣，`~/.dsh/plugins/a2a-profile-server/incubators/real.js:150`）未接语音链 —— dais worker 无换人格路径（车道B 同缺口，见架构问答） | _fanout/_phase2 无 injectionPrompt 信封 | 无 |
+| G4 | **profile 穿透（dsh-only）**：bindProfile（在飞穿衣，`~/.dsh/plugins/a2a-profile-server/incubators/real.js:150`）未接语音链 —— **仅 dais/dsh 会话**；omp/claude CLI agent 一律原生人格（用户裁定 2026-08-24，daemon 侧门禁已生效） | _fanout/_phase2 无 injectionPrompt 信封；omp/claude 孵化器已禁用（`A2A_CLI_INCUBATION=1` 维护恢复口） | 无 |
 | G5 | **监控面**：read_worker 仅 rt_gateway TailReader 引用；orch.progress 事件流无 live 证据（E2E 播报依赖） | — | E2E 前置 |
 | G6 | **台账残留**：D-03（CLI 软错误契约漂移）/ D-05（run 注册表只增不清）/ D-14（live 瞬态容忍语义留在测试层）/ D-15（回环代理坑无共享帮手） | docs/kg/08 | 各自独立 |
 
@@ -24,7 +24,7 @@
 - **LB-002-A 真身接线**：池孵化 role=liaison（+manager 群）→ fleet mailbox 注册 → 替换替身上链；验收 = 生产 dispatch → 真回执 → 真终稿（凭证逐字）。
 - **LB-002-B DAG 生产化**（先清 D-04）：manager 拆分 → create-task --dep → start_worker → worker_done 块匹配；验收 = 一意图拆 ≥2 子任务带依赖，终稿聚合回链。
 - **LB-002-C 异常面接线**：query_status 侧 scan_wait_blocked 透出"卡在哪"；cancel/resolve 语义补 resolve_gate；验收 = 人为 gate 阻塞 → head 可见可解。
-- **LB-002-D profile 穿透**：dispatch 携 profile → bindProfile 给在飞 dais 会话穿衣（信封 `ORCA-CB] PROFILE-INJECT]`）；验收 = 终稿带 profile 人格痕迹。
+- **LB-002-D profile 穿透（dsh-only）**：dispatch 携 profile → bindProfile 给**在飞 dsh 会话**穿衣（信封 `ORCA-CB] PROFILE-INJECT]`）；验收 = 终稿带 profile 人格痕迹。边界：omp/claude 不参与（原生人格，孵化器已门禁）；orca 工作树 spawn 保持裸 prompt。
 - **LB-002-E 事件流 live 证据**：read_worker/TailReader → orch.progress → WS event；E2E 播报链前置。
 
 依赖序：A → (D-04 清障) → B → C；D/E 可并行；G6 随手清或挂账。
