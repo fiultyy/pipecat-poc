@@ -177,7 +177,7 @@
 
 ## 8. 票草案汇总（OF 票板，v4 同构）
 
-> **执行状态（2026-08-23 W6 收口）**：8/10 ☑（001/002/003/005/006/007/008/010，maestro 域 `2f220c4..4652658`）；OF-004 ◐持有（中期窗口）、OF-009 ◐持有（tests 待 VO-012）；留位批=OF-006③④+RENEW15s、OF-007④。权威进度：`~/.dsh/maestro` ledger ticket 面 + `state/wave-checkpoints.jsonl`。
+> **执行状态（2026-08-24 留位批收口）**：10/10 终态——☑ 001/002/003/005/008/009/010/011 + 006/007 merged（含留位批 ③④+RENEW，maestro `c5105b1`）；OF-004 ☐blocked（中期窗口显式持有，唯一非终态）。OF-009=POC `628d97d`/`91f8974`（live 租约+G6 doctrine+laneB 默认 omp）。权威进度：`~/.dsh/maestro` ledger ticket 面 + `state/wave-checkpoints.jsonl`（round5）。
 
 > 状态：☐ 待派 → ◐ 进行中 → ☑ 完成。回报物：`docs/kg/evidence/OF-00x-report.md`。
 > done body 固定格式：`<判定>;报告:docs/kg/evidence/OF-00x-report.md;测试:<N>全绿;台账:D-xx ✅;备注:<≤40字>`
