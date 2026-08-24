@@ -60,6 +60,8 @@ def backend(captured):
         "send-message": ["enqueued seq=1\n"],
         "check-messages": ['seq=5 from=session_orch to=voice-head type=status body=[ref:{ref}] 调研完成 【凭证R-7734】 结论 23%\n'],
         "check-status": ["Run run_<redacted>: 2 tasks\n"],
+        "scan-wait-blocked": ["wait-gate\n"],
+        "resolve-gate": ["ok\n"],
         "fail-dispatch": ["ok\n"],
     }
     lane = make_lane(script)
@@ -148,3 +150,52 @@ async def test_backend_fn_adapter(backend):
     assert "accepted" in result.finding
     for t in b._pending.values():
         t.cancel()
+
+
+# ---- G3: wait-blocked surfacing + gate resolve (LB-002-C consumer side) ----
+
+@pytest.mark.asyncio
+async def test_query_status_surfaces_wait_blocked(backend, captured):
+    # pending ctx_ dispatch → scan-wait-blocked label lands in the lines
+    from rt_dsh_backend import DshDispatch
+
+    b, _ = backend
+    ref = "vh-<redacted>"
+    disp = DshDispatch(run_id="run_<redacted>", task_id="ctx_9f", ref=ref,
+                       credentials=["【凭证X】"])
+
+    async def noop(*a, **k):
+        pass
+
+    b._runs[ref] = disp
+    b._pending[ref] = asyncio.get_event_loop().create_task(noop())
+    out = json.loads(await b.query_status())
+    assert any("卡在 wait-gate" in ln for ln in out["runs"]), out
+    b._pending[ref].cancel()
+
+
+@pytest.mark.asyncio
+async def test_query_status_skips_scan_when_no_ctx_handle(backend, captured):
+    from rt_dsh_backend import DshDispatch
+
+    b, _ = backend
+    ref = "vh-nohandle"
+    disp = DshDispatch(run_id="run_<redacted>", task_id=None, ref=ref, credentials=[])
+
+    async def noop(*a, **k):
+        pass
+
+    b._runs[ref] = disp
+    b._pending[ref] = asyncio.get_event_loop().create_task(noop())
+    out = json.loads(await b.query_status())
+    assert not any("卡在" in ln for ln in out["runs"]), out
+    b._pending[ref].cancel()
+
+
+@pytest.mark.asyncio
+async def test_resolve_gate_passthrough(backend, captured):
+    b, _ = backend
+    out = json.loads(await b.resolve("gate_1", "go"))
+    assert out == {"status": "resolved", "gate": "gate_1", "resolution": "go"}
+    assert any(e[0] == "orch.progress" and "gate_1" in e[1].get("note", "")
+               for e in captured["events"])

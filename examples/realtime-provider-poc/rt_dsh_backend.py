@@ -331,7 +331,13 @@ class DshBackend:
     # ---- head tool 2: query_status ----
 
     async def query_status(self, run_id: str | None = None) -> str:
-        """Spoken-friendly aggregation of dais status (+ pending refs)."""
+        """Spoken-friendly aggregation of dais status (+ pending refs).
+
+        Pending dais dispatches (ctx_ handles) are additionally classified
+        via ``scan-wait-blocked`` so the user hears WHERE a run is stuck,
+        not just that it is."""
+        from rt_dsh_lane import DaisLaneError
+
         status = await self.lane.check_status(run_id)
         lines = []
         for entry in status.get("entries", []):
@@ -343,9 +349,31 @@ class DshBackend:
                    and not self._pending[d.ref].done()]
         if pending:
             lines.append(f"语音头待收终稿 {len(pending)} 项")
+        for d in self._runs.values():
+            if d.ref not in pending:
+                continue
+            handle = getattr(d, "task_id", None)
+            if not (handle and str(handle).startswith("ctx_")):
+                continue
+            try:
+                label = (await self.lane.scan_wait_blocked(str(handle))).strip()
+            except DaisLaneError:
+                continue  # classification is best-effort surfacing
+            if label and label.lower() not in ("none", "ok", ""):
+                lines.append(f"{d.ref}：卡在 {label}")
         import json
 
         return json.dumps({"runs": lines, "pending": pending}, ensure_ascii=False)
+
+    async def resolve(self, gate_id: str, resolution: str) -> str:
+        """Resolve a decision gate (head tool for "unblock it with X")."""
+        await self.lane.resolve_gate(gate_id, resolution)
+        await self.bus.emit("orch.progress",
+                            {"note": f"gate {gate_id} → {resolution}"})
+        import json
+
+        return json.dumps({"status": "resolved", "gate": gate_id,
+                           "resolution": resolution}, ensure_ascii=False)
 
     # ---- head tool 3: cancel ----
 

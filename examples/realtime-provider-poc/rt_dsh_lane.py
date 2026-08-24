@@ -270,6 +270,162 @@ class DaisLane:
         """``resolve-gate <gate> <resolution>`` (unblock the gated task)."""
         await self._run("resolve-gate", gate_id, resolution)
 
+    # ---- worktree / project plane (LB-002; dais >= 2026-08-24 probe) ----
+    # dais itself carries worktree + terminal capabilities the voice link
+    # never wired: these close the plane gap vs the orca lane (isolation,
+    # spawn-into-terminal) while keeping the DAG/mailbox primitives.
+
+    async def worktree_create(self, project_path: str, name: str) -> str:
+        """``worktree-create <project> <name>`` → the new worktree's path
+        (``<project>/../<repo>-<name>``, branch ``<name>`` from HEAD;
+        registered as a project)."""
+        out = await self._run("worktree-create", project_path, name)
+        line = out.strip().splitlines()[-1] if out.strip() else ""
+        if not line.startswith("/"):
+            raise DaisLaneError(f"no worktree path in output: {out.strip()[:120]!r}")
+        return line
+
+    async def worktree_list(self, path: str | None = None) -> list[dict]:
+        """``worktree-list [<path>]`` → rows. Live flavor (probed
+        2026-08-24): one absolute path per line per registered repo (main
+        trees included); a porcelain ``<path> <head> [<branch>]`` line is
+        also accepted."""
+        args = ["worktree-list"]
+        if path:
+            args.append(path)
+        rows: list[dict] = []
+        for line in (await self._run(*args)).splitlines():
+            line = line.strip()
+            if not line or line.startswith(("path", "worktree", "---")):
+                continue
+            if line.startswith("{"):
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        rows.append(obj)
+                        continue
+                except json.JSONDecodeError:
+                    pass
+            parts = line.split()
+            if parts and parts[0].startswith("/"):
+                rows.append({"path": parts[0],
+                             "head": parts[1] if len(parts) > 1 else ""})
+        return rows
+
+    async def worktree_remove(self, path: str, force: bool = False) -> None:
+        """``worktree-remove <path> [--force]`` (force closes referencing
+        terminals first: harness interrupt → PTY shutdown → tab close)."""
+        args = ["worktree-remove", path]
+        if force:
+            args.append("--force")
+        await self._run(*args)
+
+    async def project_add(self, path: str) -> None:
+        """``project-add <path>`` — idempotent (refreshes last_opened_ts)."""
+        await self._run("project-add", path)
+
+    async def project_list(self) -> list[dict]:
+        """``project-list`` → [{path, added_ts, last_opened_ts}] (tab-separated
+        rows: ``path<TAB>added<TAB>last_opened``)."""
+        rows: list[dict] = []
+        for line in (await self._run("project-list")).splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 1 and parts[0].strip().startswith("/"):
+                rows.append({
+                    "path": parts[0].strip(),
+                    "added_ts": parts[1].strip() if len(parts) > 1 else "",
+                    "last_opened_ts": parts[2].strip() if len(parts) > 2 else "",
+                })
+        return rows
+
+    async def project_remove(self, path: str, force: bool = False) -> None:
+        """``project-remove <path> [--force]`` — refuses while terminals
+        reference the project unless forced."""
+        args = ["project-remove", path]
+        if force:
+            args.append("--force")
+        await self._run(*args)
+
+    # ---- terminal plane ----
+
+    async def new_terminal(self, project_path: str, cwd: str | None = None) -> str:
+        """``new-terminal <project> [--cwd]`` → the terminal's session
+        mailbox handle (``session_<sid>``). Requires a running GUI."""
+        args = ["new-terminal", project_path]
+        if cwd:
+            args += ["--cwd", cwd]
+        out = await self._run(*args)
+        m = re.search(r"session_[0-9a-zA-Z-]+", out)
+        if not m:
+            raise DaisLaneError(f"no session handle in output: {out.strip()[:120]!r}")
+        return m.group(0)
+
+    async def close_terminal(self, handle: str, force: bool = False) -> None:
+        """``close-terminal <session_<sid>> [--force]`` (force = Ctrl-C the
+        harness + PTY shutdown before the tab close)."""
+        args = ["close-terminal", handle]
+        if force:
+            args.append("--force")
+        await self._run(*args)
+
+    async def inject_prompt(self, dispatch_id: str, text: str, force: bool = False) -> None:
+        """``inject-prompt <ctx> <text> [--force]`` — bracketed paste into
+        the dispatched worker's terminal; checks idle first unless forced."""
+        args = ["inject-prompt", dispatch_id, text]
+        if force:
+            args.append("--force")
+        await self._run(*args)
+
+    async def answer_prompt(self, dispatch_id: str, text: str | None = None,
+                            enter: bool = False, interrupt: bool = False) -> None:
+        """``answer <ctx> [--text] [--enter] [--interrupt]`` — answer an
+        interactive prompt in the dispatched worker's terminal."""
+        args = ["answer", dispatch_id]
+        if text is not None:
+            args += ["--text", text]
+        if enter:
+            args.append("--enter")
+        if interrupt:
+            args.append("--interrupt")
+        await self._run(*args)
+
+    async def assign(self, dispatch_id: str) -> None:
+        """``assign <ctx>`` — bind the dispatch to the active terminal pane
+        (registers view + session so inject/read/bridge target it)."""
+        await self._run("assign", dispatch_id)
+
+    # ---- scheduling plane ----
+
+    async def promote_tasks(self, run_id: str) -> None:
+        """``promote-tasks <run>`` — pending tasks whose deps are all
+        completed → ready."""
+        await self._run("promote-tasks", run_id)
+
+    async def mark_ready(self, dispatch_id: str) -> None:
+        """``mark-ready <ctx>`` — worker → ready, dispatch → dispatched,
+        task → dispatched."""
+        await self._run("mark-ready", dispatch_id)
+
+    async def transition_worker(self, dispatch_id: str, state: str) -> None:
+        """``transition-worker <ctx> <state>``."""
+        await self._run("transition-worker", dispatch_id, state)
+
+    async def create_gate(self, task_id: str, question: str,
+                          options: list[str] | None = None) -> str:
+        """``create-gate <task> --question <q> [--option <o>]*`` → gate id."""
+        args = ["create-gate", task_id, "--question", question]
+        for opt in options or []:
+            args += ["--option", opt]
+        out = await self._run(*args)
+        m = re.search(r"gate_[0-9a-zA-Z-]+", out)
+        if not m:
+            raise DaisLaneError(f"no gate id in output: {out.strip()[:120]!r}")
+        return m.group(0)
+
+    async def expire_gate(self, gate_id: str) -> None:
+        """``expire-gate <gate>`` — expire it (fails its blocked task)."""
+        await self._run("expire-gate", gate_id)
+
 
 # ---- tolerant output parsers (live two-line + mock kv + json flavors) ----
 

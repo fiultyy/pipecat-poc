@@ -240,3 +240,127 @@ def test_live_dais_roundtrip(missing):
 
     with pytest.raises(DaisLaneError):
         asyncio.run(read_missing())
+
+
+# ---- LB-002: worktree / project / terminal / scheduling plane ----
+
+def test_worktree_create_returns_path():
+    lane, _ = make_lane([("~/orca/repo-vh-wt1\n", "")])
+    assert asyncio.run(lane.worktree_create("~/orca/repo", "vh-wt1")) \
+        == "~/orca/repo-vh-wt1"
+    assert lane._call_log[-1][2:4] == ["worktree-create", "~/orca/repo"]
+
+
+def test_worktree_create_no_path_raises():
+    lane, _ = make_lane([("created ok\n", "")])
+    with pytest.raises(DaisLaneError):
+        asyncio.run(lane.worktree_create("/p", "n"))
+
+
+def test_worktree_list_json_and_porcelain():
+    lane, _ = make_lane([(
+        '{"path": "/w/a", "head": "abc123", "branch": "main"}\n'
+        '/w/b 000000 [vh-x]\n',
+        "",
+    )])
+    rows = asyncio.run(lane.worktree_list())
+    assert rows[0]["path"] == "/w/a"
+    assert rows[1]["path"] == "/w/b" and rows[1]["head"] == "000000"
+
+
+def test_worktree_remove_force_flag():
+    lane, _ = make_lane([("removed\n", "")])
+    asyncio.run(lane.worktree_remove("/w/a", force=True))
+    assert lane._call_log[-1][-1] == "--force"
+
+
+def test_project_list_tab_rows():
+    lane, _ = make_lane([("~/p1\t1700000000\t1700000900\n", "")])
+    rows = asyncio.run(lane.project_list())
+    assert rows == [{"path": "~/p1", "added_ts": "1700000000",
+                     "last_opened_ts": "1700000900"}]
+
+
+def test_project_remove_without_force_has_no_flag():
+    lane, _ = make_lane([("removed\n", "")])
+    asyncio.run(lane.project_remove("/p"))
+    assert "--force" not in lane._call_log[-1]
+
+
+def test_new_terminal_extracts_session_handle():
+    lane, _ = make_lane([("opened session_3f9a1c\n", "")])
+    assert asyncio.run(lane.new_terminal("/p", cwd="/p/sub")) == "session_3f9a1c"
+    argv = lane._call_log[-1]
+    assert argv[argv.index("--cwd") + 1] == "/p/sub"
+
+
+def test_new_terminal_no_handle_raises():
+    lane, _ = make_lane([("opened tab\n", "")])
+    with pytest.raises(DaisLaneError):
+        asyncio.run(lane.new_terminal("/p"))
+
+
+def test_close_terminal_force():
+    lane, _ = make_lane([("closed\n", "")])
+    asyncio.run(lane.close_terminal("session_x", force=True))
+    assert lane._call_log[-1][-1] == "--force"
+
+
+def test_inject_prompt_flags():
+    lane, _ = make_lane([("injected\n", "")])
+    asyncio.run(lane.inject_prompt("ctx_1", "任务：干活", force=True))
+    argv = lane._call_log[-1]
+    assert argv[2:5] == ["inject-prompt", "ctx_1", "任务：干活"]
+    assert argv[-1] == "--force"
+
+
+def test_answer_prompt_text_enter_interrupt():
+    lane, _ = make_lane([("answered\n", "")])
+    asyncio.run(lane.answer_prompt("ctx_1", text="1", enter=True, interrupt=False))
+    argv = lane._call_log[-1]
+    assert argv[argv.index("--text") + 1] == "1"
+    assert "--enter" in argv and "--interrupt" not in argv
+
+
+def test_assign_dispatch():
+    lane, _ = make_lane([("assigned\n", "")])
+    asyncio.run(lane.assign("ctx_1"))
+    assert lane._call_log[-1][2:4] == ["assign", "ctx_1"]
+
+
+def test_promote_and_mark_ready_and_transition():
+    lane, _ = make_lane([("promoted\n", ""), ("ready\n", ""), ("ok\n", "")])
+    asyncio.run(lane.promote_tasks("run_1"))
+    asyncio.run(lane.mark_ready("ctx_1"))
+    asyncio.run(lane.transition_worker("ctx_1", "done"))
+    assert lane._call_log[-3][2:4] == ["promote-tasks", "run_1"]
+    assert lane._call_log[-2][2:4] == ["mark-ready", "ctx_1"]
+    assert lane._call_log[-1][2:5] == ["transition-worker", "ctx_1", "done"]
+
+
+def test_create_gate_options_and_id():
+    lane, _ = make_lane([("gate_4d2f9a\n", "")])
+    gid = asyncio.run(lane.create_gate("task_1", "继续吗？", options=["yes", "no"]))
+    assert gid == "gate_4d2f9a"
+    argv = lane._call_log[-1]
+    assert argv.count("--option") == 2
+
+
+def test_create_gate_no_id_raises():
+    lane, _ = make_lane([("gate created\n", "")])
+    with pytest.raises(DaisLaneError):
+        asyncio.run(lane.create_gate("task_1", "q"))
+
+
+def test_expire_gate():
+    lane, _ = make_lane([("expired\n", "")])
+    asyncio.run(lane.expire_gate("gate_1"))
+    assert lane._call_log[-1][2:4] == ["expire-gate", "gate_1"]
+
+
+def test_worktree_list_live_path_only_flavor():
+    # live flavor (probed 2026-08-24): bare absolute paths, no head
+    lane, _ = make_lane([("~/warpdotdev/dais\n/w/p-wt\n", "")])
+    rows = asyncio.run(lane.worktree_list())
+    assert [r["path"] for r in rows] == ["~/warpdotdev/dais", "/w/p-wt"]
+    assert rows[0]["head"] == ""
