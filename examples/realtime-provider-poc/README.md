@@ -69,3 +69,22 @@ service = create_realtime_head(RealtimeHeadConfig(
     text_only=False,
 ))
 ```
+
+## rt_voice_app.py · 超轻桌面语音客户端（无浏览器引擎）
+
+stdlib tkinter 画布 + sounddevice 原生采集 + numpy FFT + aiohttp WS，替代
+`web/index.html` 的浏览器形态，直连 rt-gateway（帧协议 §1 逐字对齐）：
+
+```bash
+.venv/bin/pip install sounddevice            # 唯一新增依赖（PortAudio 绑定）
+.venv/bin/python examples/realtime-provider-poc/rt_voice_app.py \
+    --url ws://127.0.0.1:8765/ws --token "$VOICE_GATEWAY_TOKEN"
+```
+
+- 频谱显示：24 根对数分频柱（rfft，30fps）+ RMS 电平条（dBFS 标尺）
+- 输入开关：**静音语义**——开关只停采集与上行，WS 会话保持；断线 2s 自动
+  重连（gateway resume 槽续接 transcript）
+- 事件面板：orch.dispatch/progress/done、auth/session 回执；下行二进制音频
+  直送扬声器
+- 自检：`--selftest` 无设备起退；gateway 侧回环验证用
+  `rt_gateway.py --echo --token t-demo`（mic→网关→扬声器）
