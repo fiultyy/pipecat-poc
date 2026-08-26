@@ -40,6 +40,7 @@ import sounddevice as sd
 sys.path.insert(0, str(Path(__file__).parent))
 
 RATE = 16000
+OUT_RATE = 24000  # 网关下行 TTS PCM 码率（Qwen-Omni realtime 头 24k）
 BLOCK_MS = 50
 BLOCK = RATE * BLOCK_MS // 1000          # 800 samples per callback
 BARS = 24
@@ -173,7 +174,7 @@ class VoiceLink:
     def _play(self, pcm: bytes):
         try:
             if self._out is None:
-                self._out = sd.OutputStream(samplerate=RATE, channels=1, dtype="int16")
+                self._out = sd.OutputStream(samplerate=OUT_RATE, channels=1, dtype="int16")
                 self._out.start()
             self._out.write(np.frombuffer(pcm, dtype=np.int16).reshape(-1, 1))
         except Exception:
