@@ -9,6 +9,10 @@
 - ``VoiceGateway`` — web server：``/ws`` + ``/healthz`` + ``GET /`` 静态页
 - ``WsSession``     — 每连接一个；control/media/event 三路复用（§1）
 - ``TailReader``    — dais read-worker 增量尾读协程 → orch.progress（§2）
+- ``FileTailer``    — maestro 侧文件观测源 → topic.*（KG 11 §2：fleet 快照 /
+  inbox 行尾 / tickets 全文快照）
+- ``TurnTrace``     — head pipeline 帧流 → head.turn 事件（KG 11 §1；纯逻辑，
+  帧类注入，离线可测）
 
 帧协议（§1）：JSON 文本帧（control/event）+ 二进制帧（raw PCM16LE/16k/mono，
 推荐 20ms=640B）。握手序：``auth`` → ``auth.ok{session_id}`` →
@@ -61,6 +65,26 @@ ORCH_KINDS = (
     "orch.done",
     "orch.metrics",
 )
+# topic.* 观测事件全集（KG 11 §1；console P1 数据平面）
+TOPIC_KINDS = (
+    "head.turn",         # head 回合生命周期（TurnTrace，KG 11 §1 phase 表）
+    "fleet.snapshot",    # ~/.dsh/maestro/fleet.json 字节变更 → 全量 JSON 快照
+    "bridge.msg",        # ~/.dsh/maestro/bridge/inbox.log 增量行
+    "tickets.snapshot",  # ~/.dsh/maestro/tickets.md 变更 → 全文快照（render 覆写非追加）
+)
+SUBSCRIBABLE_KINDS = ORCH_KINDS + TOPIC_KINDS
+# voice 会话默认订阅：orch.* + 自己的 turn 轨迹（语音壳顺手显示，开销每回合数帧）
+DEFAULT_VOICE_KINDS = ORCH_KINDS + ("head.turn",)
+MAESTRO_DIR = Path(os.path.expanduser("~/.dsh/maestro"))
+DEFAULT_TOPIC_SOURCES: dict[str, dict] = {
+    "fleet.snapshot": {"path": str(MAESTRO_DIR / "fleet.json"), "mode": "snapshot", "parse": "json"},
+    "bridge.msg": {
+        "path": str(MAESTRO_DIR / "bridge" / "inbox.log"),
+        "mode": "lines",
+        "backlog": 8192,  # 起播回看窗：给 console 近期上下文，不重放全史
+    },
+    "tickets.snapshot": {"path": str(MAESTRO_DIR / "tickets.md"), "mode": "snapshot", "parse": "text"},
+}
 RESUME_TTL_S = 600.0
 WEB_DIR = Path(__file__).parent / "web"
 
@@ -99,6 +123,49 @@ def echo_head_provider(session: "WsSession") -> EchoHead:
     return head
 
 
+class TurnTrace:
+    """head pipeline 帧流 → ``head.turn`` 事件（KG 11 §1 phase 表）。
+
+    纯逻辑、帧类注入（build_realtime_head 传 pipecat 真类，单测传 fake
+    类）——本模块保持不依赖 pipecat 导入。判定顺序敏感：Transcription /
+    Interim 是 TextFrame 子类，必须先于 TextFrame 增量累积判定。
+    """
+
+    def __init__(self, ft: dict[str, type]) -> None:
+        self._ft = ft
+        self._text_buf: list[str] = []
+
+    def on_frame(self, frame: Any) -> dict | None:
+        """返回 head.turn payload（无 phase 键约束外的 ts/conv_id 由调用方补）。"""
+        ft = self._ft
+        if isinstance(frame, ft["user_start"]):
+            return {"phase": "user_start"}
+        if isinstance(frame, ft["user_end"]):
+            return {"phase": "user_end"}
+        if isinstance(frame, ft["user_text"]):
+            return {"phase": "user_text", "detail": str(frame.text)[:200]}
+        if isinstance(frame, ft["interim"]):
+            return None  # 中间转录不上报（chatty；权威文本走 user_text）
+        if isinstance(frame, ft["assistant_start"]):
+            self._text_buf.clear()
+            return {"phase": "assistant_start"}
+        if isinstance(frame, ft["text"]):
+            self._text_buf.append(str(frame.text))
+            return None
+        if isinstance(frame, ft["assistant_end"]):
+            detail = "".join(self._text_buf).strip()[:200]
+            self._text_buf.clear()
+            ev: dict = {"phase": "assistant_end"}
+            if detail:
+                ev["detail"] = detail
+            return ev
+        if isinstance(frame, ft["tool_call"]):
+            return {"phase": "tool_call", "detail": str(getattr(frame, "function_name", ""))}
+        if isinstance(frame, ft["interrupted"]):
+            return {"phase": "interrupted"}
+        return None
+
+
 class WsSession:
     """单连接会话：帧协议分派 + 出站队列（慢客户端合并）+ 音频背压。"""
 
@@ -110,6 +177,7 @@ class WsSession:
         self.conv_id: str | None = None         # 会话级 id（重连续接用，不变）
         self.authenticated = False
         self.started = False
+        self.observe = False  # observe 会话：只订阅事件，不建 head pipeline、拒媒体
         self.graceful_end = False
         self.closed = False
         self._token: str | None = None
@@ -205,24 +273,43 @@ class WsSession:
         if self.started:
             await self._send_error("bad_state", "session already started")
             return
+        observe = bool(data.get("observe"))
+        # topics 订阅参数（KG 11 §3）：显式列表校验后生效；缺省 observe=全部
+        # 可订阅面 / voice=orch.* + head.turn（现行客户端零改动兼容）
+        topics = data.get("topics")
+        if topics is not None:
+            if not isinstance(topics, list) or not all(isinstance(k, str) for k in topics):
+                await self._send_error("bad_request", "topics must be a list of strings")
+                return
+            unknown = [k for k in topics if k not in SUBSCRIBABLE_KINDS]
+            if unknown:
+                await self._send_error(
+                    "bad_request", f"unknown topics: {unknown}; valid: {list(SUBSCRIBABLE_KINDS)}"
+                )
+                return
         resume_id = data.get("session_id") or None
         entries: list[TranscriptEntry] = []
         reseeded = False
-        if resume_id:
-            parked = self.gateway.pop_resumable(resume_id)
-            if parked is not None:
-                entries = parked
-                reseeded = True
-        try:
-            await self._build_pipeline(entries)
-        except Exception as e:  # noqa: BLE001 — 握手失败要回错误帧而非裸断
-            log.warning("pipeline build failed: %s", e)
-            await self._send_error("internal", f"head pipeline: {e}"[:200])
-            await self._close()
-            return
+        if observe:
+            kinds = tuple(topics) if topics is not None else SUBSCRIBABLE_KINDS
+        else:
+            if resume_id:
+                parked = self.gateway.pop_resumable(resume_id)
+                if parked is not None:
+                    entries = parked
+                    reseeded = True
+            try:
+                await self._build_pipeline(entries)
+            except Exception as e:  # noqa: BLE001 — 握手失败要回错误帧而非裸断
+                log.warning("pipeline build failed: %s", e)
+                await self._send_error("internal", f"head pipeline: {e}"[:200])
+                await self._close()
+                return
+            kinds = tuple(topics) if topics is not None else DEFAULT_VOICE_KINDS
         self.started = True
+        self.observe = observe
         self.conv_id = resume_id if reseeded else self.session_id
-        self._unsubscribe = self.gateway.bus.subscribe(self.event_sink, *ORCH_KINDS)
+        self._unsubscribe = self.gateway.bus.subscribe(self.event_sink, *kinds)
         self._tasks.append(asyncio.create_task(self._audio_pump()))
         await self._reply(
             {
@@ -230,8 +317,15 @@ class WsSession:
                 "session_id": self.conv_id,
                 "reseeded": reseeded,
                 "entries": len(entries),
+                "observe": observe,
+                "topics": list(kinds),
             }
         )
+        # 快照类 topic 缓存回放：回执先于回放（客户端先知道会话已开，再收状态）
+        for kind in kinds:
+            cached = self.gateway.topic_cache.get(kind)
+            if cached is not None:
+                await self.event_sink(kind, dict(cached))
 
     async def _build_pipeline(self, reseed_entries: list[TranscriptEntry]) -> None:
         """经 gateway.head_provider 建每会话管线，并把重连 transcript 尾重播种。"""
@@ -282,6 +376,11 @@ class WsSession:
             if not self._no_session_warned:
                 self._no_session_warned = True
                 await self._send_error("no_session", "session.start required before media")
+            return
+        if self.observe:
+            if not self._no_session_warned:
+                self._no_session_warned = True
+                await self._send_error("observe_media", "observe session has no media path")
             return
         now = time.monotonic()
         self._media_window.append((now, len(pcm)))
@@ -484,6 +583,105 @@ class TailReader:
             await asyncio.sleep(self.poll_s)
 
 
+class FileTailer:
+    """maestro 侧文件观测源 → topic.*（KG 11 §2）。
+
+    - ``mode="lines"``：行尾读（inbox.log）。stat 轮询 size；只消费到最后一
+      个完整 ``\\n``（写者未收行的残尾等下一轮）；变小=截断/轮转 → cursor
+      归零。起始 cursor = ``max(0, size - backlog)``（回看窗，不重放全史）。
+    - ``mode="snapshot"``：变更即全量（fleet.json / tickets.md——后者是
+      ledger render 覆写非追加）。``(mtime_ns, size)`` 签名变更才读发；
+      ``parse="json"`` 解析失败不更新签名（下轮重试），``"text"`` 原文行。
+    - 文件缺席：静默等待（INFO 一次），出现后照常起播。
+
+    快照 payload 同时写 ``cache``（gateway.topic_cache）——订阅回放用，
+    log 行源不缓存（无"最新状态"语义）。
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        path: str,
+        emit: Callable[[str, dict], Awaitable[None]],
+        *,
+        mode: str = "lines",
+        parse: str | None = None,
+        poll_s: float = 2.0,
+        backlog: int = 0,
+        cache: dict | None = None,
+        line_max_chars: int = 2000,
+    ) -> None:
+        self.kind = kind
+        self.path = path
+        self.emit = emit
+        self.mode = mode
+        self.parse = parse
+        self.poll_s = poll_s
+        self.backlog = backlog
+        self.cache = cache
+        self.line_max_chars = line_max_chars
+
+    async def follow(self, stop: asyncio.Event | None = None) -> None:
+        cursor: int | None = None
+        sig: tuple[int, int] | None = None
+        warned = False
+        while True:
+            if stop is not None and stop.is_set():
+                return
+            try:
+                st = os.stat(self.path)
+            except FileNotFoundError:
+                if not warned:
+                    log.info("topic source %s: %s absent, waiting", self.kind, self.path)
+                    warned = True
+                cursor, sig = None, None
+                await asyncio.sleep(self.poll_s)
+                continue
+            warned = False
+            try:
+                if self.mode == "snapshot":
+                    now_sig = (st.st_mtime_ns, st.st_size)
+                    if now_sig != sig:
+                        with open(self.path, encoding="utf-8", errors="replace") as f:
+                            raw = f.read()
+                        if self.parse == "json":
+                            payload = {"fleet": json.loads(raw)}
+                        else:
+                            payload = {"text": raw, "lines": len(raw.splitlines())}
+                        sig = now_sig
+                        if self.cache is not None:
+                            self.cache[self.kind] = payload
+                        await self.emit(self.kind, payload)
+                else:
+                    if cursor is None:
+                        cursor = max(0, st.st_size - self.backlog)
+                    if st.st_size < cursor:  # 截断/轮转 → 从头
+                        cursor = 0
+                    if st.st_size > cursor:
+                        with open(self.path, "rb") as f:
+                            f.seek(cursor)
+                            data = f.read()
+                        cut = data.rfind(b"\n")
+                        if cut < 0:
+                            await asyncio.sleep(self.poll_s)
+                            continue  # 尚无完整行
+                        off, complete = cursor, data[:cut]
+                        cursor += cut + 1
+                        for raw_line in complete.split(b"\n"):
+                            line = raw_line.decode("utf-8", errors="replace")
+                            if line.strip():
+                                await self.emit(
+                                    self.kind,
+                                    {"line": line[: self.line_max_chars], "offset": off},
+                                )
+                            off += len(raw_line) + 1
+            except (OSError, ValueError) as e:  # noqa: BLE001 — 单轮失败不杀尾读
+                log.warning("topic source %s poll failed: %s", self.kind, e)
+            if stop is not None and stop.is_set():
+                return
+            await asyncio.sleep(self.poll_s)
+
+
 @dataclass
 class VoiceGateway:
     """aiohttp web server + ws；每 WsSession 独占一条管线（会话级资源）。"""
@@ -495,6 +693,9 @@ class VoiceGateway:
     token: str | None = None
     bus: EventBus = field(default_factory=EventBus)
     lane: DaisLane | None = None
+    # topic 观测源（KG 11 §2）：{kind: {path, mode, parse?, backlog?, poll_s?}}；
+    # None=不启用（单测缺省）；main() 注入 DEFAULT_TOPIC_SOURCES
+    topic_sources: dict[str, dict] | None = None
     max_sessions_per_token: int = MAX_SESSIONS_PER_TOKEN
     media_rate_limit: int = PCM_RATE_LIMIT_BYTES
     resume_ttl_s: float = RESUME_TTL_S
@@ -506,6 +707,27 @@ class VoiceGateway:
         self._active: set[WsSession] = set()
         self._token_counts: dict[str, int] = {}
         self._resumable: dict[str, tuple[float, list[TranscriptEntry]]] = {}
+        self.topic_cache: dict[str, dict] = {}   # 快照类 topic 最近 payload（订阅回放）
+        self._tailers: list[asyncio.Task] = []
+
+    def _start_tailers(self) -> None:
+        for kind, cfg in (self.topic_sources or {}).items():
+            tailer = FileTailer(
+                kind,
+                cfg["path"],
+                self.bus.emit,
+                mode=cfg.get("mode", "lines"),
+                parse=cfg.get("parse"),
+                poll_s=cfg.get("poll_s", 2.0),
+                backlog=cfg.get("backlog", 0),
+                cache=self.topic_cache if cfg.get("mode") == "snapshot" else None,
+            )
+            self._tailers.append(asyncio.create_task(tailer.follow()))
+
+    def _stop_tailers(self) -> None:
+        for task in self._tailers:
+            task.cancel()
+        self._tailers = []
 
     # ---- 安全基线（§4）----
 
@@ -589,9 +811,11 @@ class VoiceGateway:
         await site.start()
         if self.port == 0 and self._runner.addresses:
             self.port = self._runner.addresses[0][1]
+        self._start_tailers()
         log.info("rt_gateway listening on ws://%s:%d/ws", self.host, self.port)
 
     async def stop(self) -> None:
+        self._stop_tailers()
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -618,7 +842,16 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         EndFrame,
         Frame,
         FrameDirection,
+        FunctionCallInProgressFrame,
         InputAudioRawFrame,
+        InterimTranscriptionFrame,
+        LLMFullResponseEndFrame,
+        LLMFullResponseStartFrame,
+        ProposedUserStartedSpeakingFrame,
+        ProposedUserStoppedSpeakingFrame,
+        StartInterruptionFrame,
+        TextFrame,
+        TranscriptionFrame,
         TTSAudioRawFrame,
     )
     from pipecat.pipeline.pipeline import Pipeline
@@ -633,15 +866,31 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
 
     transcript = TranscriptState()
     tools = dsh_head_tools()
+    turn_trace = TurnTrace(
+        {
+            "user_start": ProposedUserStartedSpeakingFrame,
+            "user_end": ProposedUserStoppedSpeakingFrame,
+            "user_text": TranscriptionFrame,
+            "interim": InterimTranscriptionFrame,
+            "assistant_start": LLMFullResponseStartFrame,
+            "assistant_end": LLMFullResponseEndFrame,
+            "text": TextFrame,
+            "tool_call": FunctionCallInProgressFrame,
+            "interrupted": StartInterruptionFrame,
+        }
+    )
 
     class _Tap(FrameProcessor):
-        """transcript 镜像 + TTS PCM → ws 下行。"""
+        """transcript 镜像 + TTS PCM → ws 下行 + head.turn 上报（KG 11 §1）。"""
 
         async def process_frame(self, frame: Frame, direction: FrameDirection) -> Frame:
             if isinstance(frame, InputAudioRawFrame):
                 transcript.on_speech_started()
             elif isinstance(frame, TTSAudioRawFrame):
                 session.send_audio(bytes(frame.audio))
+            ev = turn_trace.on_frame(frame)
+            if ev is not None:
+                await bus.emit("head.turn", {"conv_id": session.conv_id, **ev})
             await self.push_frame(frame, direction)
             return frame
 
@@ -692,6 +941,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--loopback-only", action="store_true", help="绑 127.0.0.1（默认 0.0.0.0 局域网可达）")
     ap.add_argument("--token", default=None, help="缺省取 env VOICE_GATEWAY_TOKEN")
     ap.add_argument("--echo", action="store_true", help="回环头（无 pipecat/凭据，mic→网关→扬声器自检）")
+    ap.add_argument(
+        "--no-topics", action="store_true", help="停用 topic 观测源（fleet/bridge/tickets 尾读）"
+    )
     args = ap.parse_args(argv)
 
     token = args.token or os.environ.get("VOICE_GATEWAY_TOKEN")
@@ -720,6 +972,7 @@ def main(argv: list[str] | None = None) -> int:
             token=token,
             head_provider=provider,
             lane=lane,
+            topic_sources=None if args.no_topics else DEFAULT_TOPIC_SOURCES,
         )
         # TailReader 接线：orch.dispatch 携带 dispatch_ids 时逐 worker 起尾读协程
         readers: dict[str, asyncio.Task] = {}

@@ -29,6 +29,7 @@
 | N8 | [08-defects-ledger.md](08-defects-ledger.md) | **编排链缺陷台账**（复盘实录）：dais 面/插件/relay 监控/live 预算/环境坑，现行对策+建议修复锚点 |
 | N9 | [09-orch-hardening-plan.md](09-orch-hardening-plan.md) | **W6 编排链加固方案**（OF-001..010 票草案）：主题 A 信封 v2/租约/steer 两段/凭证 + 主题 B tickets DAG/watchd/checkpoint/longtask 绑定 + 缺陷直修 dais 守卫/live 纪律，含依赖图与 VO-012 后排期 |
 | N10 | [10-pool-selection-queen.md](10-pool-selection-queen.md) | **池选型与派生 ✅已收口**（OF-012/013）：pool/spawn 选型面+策略 + queen grill 派生 + 池→dsh preset 导出；live E2E 全链过（§5）；实施域=~/tools/maestro-preset（HEAD ac9877c）+ 回流 199182d |
+| N11 | [11-console-observation-p1.md](11-console-observation-p1.md) | **Console 观测面 P1 ✅topic 数据平面**：head.turn/fleet.snapshot/bridge.msg/tickets.snapshot 四源 + FileTailer（行尾/快照）+ TurnTrace（帧→phase）+ observe 会话/topics 订阅协议（P1.5 cmd 路由、P2 SPA 待开） |
 
 ## 3. 边表（对接依赖图，按修正架构）
 

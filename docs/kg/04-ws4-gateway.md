@@ -24,12 +24,16 @@ VoiceGateway（〔loc:examples/realtime-provider-poc/rt_gateway.py:488→VoiceGa
 
 | 路 | 方向 | 帧形态 | 类型 |
 |---|---|---|---|
-| control | C→S / S→C | 文本 JSON `{t:"...", ...}` | `auth{token}` `session.start{session_id?}` `session.end` `ping`/`pong` `error{code,msg}` |
+| control | C→S / S→C | 文本 JSON `{t:"...", ...}` | `auth{token}` `session.start{session_id?, topics?, observe?}` `session.end` `ping`/`pong` `error{code,msg}` |
 | media | C→S | **二进制** = raw PCM16LE/16k/mono 块（推荐 20ms=640B） | — |
 | media | S→C | **二进制** = TTS PCM 同格式 | — |
-| event | S→C | 文本 JSON `{t:"...", ...}` | 见 §3 |
+| event | S→C | 文本 JSON `{t:"...", ...}` | 见 §3 + topic.*（KG 11） |
 
 握手序：`auth` → `auth.ok{session_id}` → `session.start`（断线重连带旧 `session_id` 走重播种）→ 媒体/事件双工。
+`session.start` 可选参数（KG 11 §3）：`topics:[kind…]` 显式订阅（校验 ∈ orch.*+topic.*，回执
+`session.started{topics, observe}` 回显）；`observe:true` = console 连接形态——不建 head pipeline、
+拒媒体上行（error `observe_media`）、缺省订阅全部可订阅面；voice 会话缺省 = orch.* + `head.turn`。
+快照类 topic（`fleet.snapshot`/`tickets.snapshot`）订阅时回放缓存最近快照（回执后、无需等变更）。
 
 ## 2. VoiceGateway 类设计
 
