@@ -23,6 +23,7 @@ from rt_head_tools import (  # noqa: E402
     dsh_head_tools,
     cancel_run_tool,
     dispatch_intent_tool,
+    dispatch_plan_tool,
     query_status_tool,
     remain_silent_tool,
 )
@@ -134,16 +135,57 @@ async def test_remain_silent_tool():
     assert params.results == [{"status": "silent"}]
 
 
+@pytest.mark.asyncio
+async def test_dispatch_plan_tool_parses_and_dispatches_dag():
+    import asyncio as _aio
+
+    from rt_dsh_backend import DagTaskSpec
+
+    captured: dict = {}
+
+    async def fake_dispatch_dag(objective, tasks):
+        captured["objective"] = objective
+        captured["tasks"] = tasks
+        return '{"status": "accepted", "tasks": 2}'
+
+    backend, _, _ = make_backend()
+    backend.dispatch_dag = fake_dispatch_dag  # type: ignore[method-assign]
+    params = FakeParams(app_resources={"dsh_backend": backend})
+    subtasks = [{"spec": "统计帧类", "command": "grep -c 'class.*Frame' a.py"},
+                {"spec": "统计处理器", "deps": [0], "cmd": "grep -rc b"}]
+    await dispatch_plan_tool(
+        params, "对比两数",
+        json.dumps(subtasks, ensure_ascii=False))
+    receipt = json.loads(params.results[0])
+    assert receipt["status"] == "accepted"
+    assert captured["objective"] == "对比两数"
+    tasks = captured["tasks"]
+    assert all(isinstance(t, DagTaskSpec) for t in tasks)
+    assert tasks[0].deps == [] and tasks[0].command.startswith("grep")
+    assert tasks[1].deps == [0] and tasks[1].command == "grep -rc b"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_plan_tool_clarify_on_garbage():
+    backend, _, _ = make_backend()
+    params = FakeParams(app_resources={"dsh_backend": backend})
+    await dispatch_plan_tool(params, "目标", "不是JSON")
+    assert json.loads(params.results[0])["status"] == "clarify"
+    for t in backend._pending.values():
+        t.cancel()
+
+
 def test_dsh_head_tools_registry():
     names = {fn.__name__ for fn in dsh_head_tools()}
     assert names == {
-        "dispatch_intent_tool", "query_status_tool",
+        "dispatch_intent_tool", "dispatch_plan_tool", "query_status_tool",
         "cancel_run_tool", "remain_silent_tool",
     }
 
 
 def test_doctrine_covers_all_tools_and_two_phase_rule():
-    for name in ("dispatch_intent", "query_status", "cancel_run", "remain_silent"):
+    for name in ("dispatch_intent", "dispatch_plan", "query_status",
+                 "cancel_run", "remain_silent"):
         assert name in DSH_TOOLS_DOCTRINE
     assert "【凭证" in DSH_TOOLS_DOCTRINE
     assert "Agent Final Message" in DSH_TOOLS_DOCTRINE

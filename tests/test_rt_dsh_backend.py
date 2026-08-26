@@ -214,6 +214,7 @@ def make_dag_lane(t1_outcome="succeeded"):
         "ctx_b2": ['seq=2 from=w to=ctx_b2 type=worker_done body={"task_id":"task_22","dispatch_id":"ctx_b2","outcome":"succeeded"}'],
     }
     starts: list[tuple] = []
+    injects: list[tuple] = []
     create_task_calls: list[list[str]] = []
 
     async def runner(argv):
@@ -230,6 +231,9 @@ def make_dag_lane(t1_outcome="succeeded"):
             starts.append((argv[3], flags.get("--command"),
                            flags.get("--session")))
             return ("ctx_a1\n" if argv[3] == "task_11" else "ctx_b2\n", "")
+        if sub == "inject-prompt":
+            injects.append((argv[3], argv[4]))
+            return ("ok\n", "")
         if sub == "check-messages":
             rows = done.get(argv[3], [])
             return ((rows.pop(0) + "\n") if rows else ("no unread messages\n", ""), "")
@@ -289,8 +293,47 @@ async def test_dispatch_dag_dependency_waves_and_aggregate(captured):
     # per-task worker flavor: command mode vs session-bound
     assert starts[0][1] == "echo A" and starts[0][2] is None
     assert starts[1][2] == "session_worker2"
+    # execution wire: each command block is injected into its bound terminal
+    # (block settlement fires only when the command actually runs there)
+    injected = [(argv[3], argv[4])
+                for argv in lane._call_log if argv[2] == "inject-prompt"]
+    assert ("ctx_a1", "echo A") in injected
+    assert ("ctx_b2", "echo B") in injected
     assert any(e[0] == "orch.dispatch" and e[1].get("lane") == "b-dag"
                for e in captured["events"])
+
+
+@pytest.mark.asyncio
+async def test_dispatch_dag_pool_binds_sessions_round_robin(captured):
+    """dag_workers pool: tasks without explicit session bind round-robin."""
+    from rt_dsh_backend import DagTaskSpec
+
+    lane, starts, _ = make_dag_lane()
+    bus = EventBus()
+
+    async def sink(kind, payload):
+        captured["events"].append((kind, payload))
+
+    bus.subscribe(sink)
+
+    async def on_final(ref, message):
+        captured["finals"].append((ref, message))
+
+    b = DshBackend(lane=lane, bus=bus, on_final=on_final, await_timeout_s=4,
+                   poll_s=0.05, poll_max_s=0.2,
+                   dag_workers=["session_w1", "session_w2"])
+    await b.dispatch_dag("两步链", [
+        DagTaskSpec(spec="调研甲方案", command="echo A"),
+        DagTaskSpec(spec="调研乙方案", deps=[0], command="echo B",
+                    session="session_explicit"),
+    ])
+    for _ in range(200):
+        if captured["finals"]:
+            break
+        await asyncio.sleep(0.05)
+    assert captured["finals"], "DAG final never arrived"
+    sessions = [s[2] for s in starts]
+    assert sessions == ["session_w1", "session_explicit"]
 
 
 @pytest.mark.asyncio

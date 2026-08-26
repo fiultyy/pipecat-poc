@@ -50,6 +50,57 @@ def _report_phase2_death(task: asyncio.Task) -> None:
               file=sys.stderr, flush=True)
 
 
+def _parse_dag_subtasks(raw: str) -> list:
+    """Tolerantly parse a head-authored subtask JSON list.
+
+    Accepts a bare array or a ``{"subtasks"|"tasks"|"items": [...]}``
+    wrapper; per item the spec text, dep indices, settlement command,
+    and worker session are read from any of their known spellings
+    (same tolerance family as ``rt_orchestrator.SplitPlan.subtasks``).
+    Returns ``[]`` on any structural failure; items without usable
+    spec text are dropped.
+    """
+    import json
+
+    if isinstance(raw, (list, dict)):
+        data = raw
+    else:
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+    if isinstance(data, dict):
+        items = next((data[k] for k in ("subtasks", "tasks", "items")
+                      if isinstance(data.get(k), list)), None)
+    elif isinstance(data, list):
+        items = data
+    else:
+        return []
+    out: list[DagTaskSpec] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        spec = str(item.get("spec") or item.get("goal") or item.get("task")
+                   or item.get("description") or "").strip()
+        if not spec:
+            continue
+        deps_raw = item.get("deps") or []
+        if not isinstance(deps_raw, list):
+            deps_raw = []
+        deps = []
+        for d in deps_raw:
+            try:
+                deps.append(int(d))
+            except (ValueError, TypeError):
+                continue
+        command = item.get("command") or item.get("cmd") or None
+        session = item.get("session") or item.get("worker") or None
+        out.append(DagTaskSpec(spec=spec, deps=deps,
+                               command=str(command) if command else None,
+                               session=str(session) if session else None))
+    return out
+
+
 @dataclass
 class DshDispatch:
     """Phase-1 acceptance receipt."""
@@ -106,6 +157,11 @@ class DshBackend:
         poll_max_s: ceiling of the phase-2 poll backoff (consumption
             polls are write transactions on the daemon store; a flat
             cadence starves in-flight senders — see DaisLane.await_done).
+        dag_workers: provisioned worker-session mailbox keys
+            (``session_<sid>``); DAG tasks that carry no explicit
+            ``session`` bind round-robin onto this pool, so the head
+            splits semantically while execution binding stays with the
+            plane.
     """
 
     lane: DaisLane
@@ -121,10 +177,29 @@ class DshBackend:
     await_timeout_s: float = 1800.0
     poll_s: float = 2.0
     poll_max_s: float = 8.0
+    dag_workers: list[str] | None = None
     _runs: dict[str, DshDispatch] = field(default_factory=dict)
     _pending: dict[str, asyncio.Task] = field(default_factory=dict)
 
     # ---- head tool 1: dispatch_intent ----
+
+    async def dispatch_plan(self, objective: str, subtasks_json: str) -> str:
+        """Head-facing DAG entry: tolerant-parse a subtask JSON list.
+
+        Accepts a bare JSON array or ``{"subtasks": [...]}`` (also
+        ``tasks``/``items``); per item the spec text may sit under
+        ``spec``/``goal``/``task``/``description``, deps under ``deps``
+        (indices into the same list), the settlement command under
+        ``command``/``cmd``, and an explicit worker session under
+        ``session``/``worker``. Unparseable or spec-less input returns
+        the clarify note.
+        """
+        import json
+
+        tasks = _parse_dag_subtasks(subtasks_json)
+        if not tasks:
+            return CLARIFY_NOTE
+        return await self.dispatch_dag(objective, tasks)
 
     async def dispatch(self, raw_intent: str) -> str:
         """Phase 1 acceptance now; phase 2 final re-injected on completion."""
@@ -171,9 +246,14 @@ class DshBackend:
         credential = make_credential(ref.upper())
         dispatch = DshDispatch(run_id=run_id, task_id=None, ref=ref,
                                credentials=[credential])
-        dispatch.dag = [{"task_id": tid, "deps": t.deps, "command": t.command,
-                         "session": t.session, "spec": t.spec}
-                        for tid, t in zip(task_ids, tasks)]  # type: ignore[attr-defined]
+        dispatch.dag = [
+            {"task_id": tid, "deps": t.deps, "command": t.command,
+             "session": t.session
+             or (self.dag_workers[i % len(self.dag_workers)]
+                 if self.dag_workers else None),
+             "spec": t.spec}
+            for i, (tid, t) in enumerate(zip(task_ids, tasks))
+        ]  # type: ignore[attr-defined]
         dispatch.dag_ctx = {}                                  # type: ignore[attr-defined]
         self._runs[ref] = dispatch
         await self.bus.emit("orch.dispatch", {
@@ -367,6 +447,10 @@ class DshBackend:
                             "ref": ref,
                             "note": f"task {i + 1}/{len(dag)} worker "
                                     f"{ctx[i]} started"})
+                        if t["command"]:
+                            # block settlement needs the command to RUN in
+                            # the bound terminal — inject it there
+                            await self.lane.inject_prompt(ctx[i], t["command"])
                     except DaisLaneError:
                         await asyncio.sleep(min(delay, 1.0))
                 else:

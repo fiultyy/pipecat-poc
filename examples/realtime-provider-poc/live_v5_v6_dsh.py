@@ -137,12 +137,7 @@ LIAISON_PROTO_APPENDIX = f"""
    在没有任务正文时不要编造任务或回信。
 """
 
-TOOL_FNS = {
-    "dispatch_intent_tool": dispatch_intent_tool,
-    "query_status_tool": query_status_tool,
-    "cancel_run_tool": cancel_run_tool,
-    "remain_silent_tool": remain_silent_tool,
-}
+TOOL_FNS = {fn.__name__: fn for fn in dsh_head_tools()}
 
 
 class LiveParams:
