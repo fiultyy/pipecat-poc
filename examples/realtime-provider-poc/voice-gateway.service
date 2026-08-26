@@ -1,0 +1,23 @@
+[Unit]
+# voice-gateway — WS4 本地语音网关常驻面（KG 04；rt_gateway standalone main）。
+# 端口 8765 是网关规范位，但 live 驱动（live_lb002b_dag 等）会自起同端口
+# 网关 —— 跑 live 前先 `systemctl --user stop voice-gateway`，故本单元
+# 不 enable，按需 start。
+# 凭据链与 rt_env 一致：本单元专属 token 文件 + ~/.dsh/zhipu.env（GLM 键
+# 为裸 KEY=VAL 语法可被 systemd 解析；文件内 export 前缀行被忽略）。
+# token 缺失时 main 退出码 2（即服务起不来是显性的）。
+Description=Voice orchestration WS gateway (rt_gateway, loopback only)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=~/workspace-claw-02/pipecat-poc
+# worker 命令（grep src/... 等）以 repo 根为 cwd 解析相对路径
+ExecStart=~/workspace-claw-02/pipecat-poc/.venv/bin/python ~/workspace-claw-02/pipecat-poc/examples/realtime-provider-poc/rt_gateway.py --loopback-only
+EnvironmentFile=~/.config/voice-gateway/env
+EnvironmentFile=-~/.dsh/zhipu.env
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
