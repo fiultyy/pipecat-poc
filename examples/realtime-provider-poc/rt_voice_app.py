@@ -133,6 +133,11 @@ class VoiceLink:
                                     started = True
                                     self.session_id = data.get("session_id") or self.session_id
                                     self.on_state("open")
+                                elif t == "head.turn":
+                                    if data.get("phase") in ("user_start", "interrupted"):
+                                        self._drop_playback()  # 打断：立刻闭嘴
+                                    self.rx.put("[回合] "
+                                                + json.dumps(data, ensure_ascii=False)[:200])
                                 elif t == "error":
                                     self.rx.put(f"[错误] {data.get('code')}: "
                                                 f"{str(data.get('msg'))[:120]}")
@@ -179,6 +184,16 @@ class VoiceLink:
             self._out.write(np.frombuffer(pcm, dtype=np.int16).reshape(-1, 1))
         except Exception:
             self._out = None  # 无输出设备时静默丢弃
+
+    def _drop_playback(self):
+        """打断：丢弃缓冲中的旧应答音频并停流（下次 _play 重建）。"""
+        out, self._out = self._out, None
+        try:
+            if out is not None:
+                out.abort()   # 丢弃未播样本，立即静音
+                out.close()
+        except Exception:
+            pass
 
 
 class ObserveLink:

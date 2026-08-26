@@ -425,6 +425,21 @@ class WsSession:
             self._out.append(("bytes", bytes(pcm)))
             self._out_wake.set()
 
+    def drop_pending_audio(self) -> None:
+        """打断时丢弃尚未下发的 TTS 音频（保留文本/事件帧）。"""
+        if self._close_sent:
+            return
+        kept = deque(
+            item for item in self._out if item[0] != "bytes" or item[1] is self._progress_slot
+        )
+        dropped = len(self._out) - len(kept)
+        self._out.clear()
+        self._out.extend(kept)
+        if dropped:
+            self.stats["audio_dropped_on_interrupt"] = (
+                self.stats.get("audio_dropped_on_interrupt", 0) + dropped
+            )
+
     # ---- event 路（EventBus → event 帧）----
 
     async def event_sink(self, kind: str, payload: dict) -> None:
@@ -915,6 +930,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
                 session.send_audio(bytes(frame.audio))
             ev = turn_trace.on_frame(frame)
             if ev is not None:
+                if ev.get("phase") == "interrupted":
+                    session.drop_pending_audio()  # 掐断未下发的旧应答音频
                 await bus.emit("head.turn", {"conv_id": session.conv_id, **ev})
 
     observer = _HeadObserver()

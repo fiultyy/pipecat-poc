@@ -277,6 +277,12 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             )
         )
 
+    async def _truncate_current_audio_response(self):
+        # DashScope has no conversation.item.truncate event; response.cancel
+        # (sent on speech_started) is the supported way to stop playback, so
+        # only drop the local tracking state.
+        self._current_audio_response = None
+
     async def _receive_task_handler(self):
         # Copied from OpenAIRealtimeLLMService with three DashScope-specific
         # guards: names are normalized/dropped before parsing, a parse failure
@@ -320,6 +326,16 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             elif evt.type == "response.done":
                 await self._handle_evt_response_done(evt)
             elif evt.type == "input_audio_buffer.speech_started":
+                # Barge-in: cancel the in-flight response before the usual
+                # truncate path. DashScope keeps streaming the old response's
+                # audio deltas unless explicitly cancelled; the OpenAI parent
+                # only cancels in manual turn-detection mode.
+                try:
+                    await self.send_client_event(
+                        openai_realtime.events.ResponseCancelEvent()
+                    )
+                except Exception as e:
+                    logger.debug(f"{self} response.cancel on barge-in: {e}")
                 await self._handle_evt_speech_started(evt)
             elif evt.type == "input_audio_buffer.speech_stopped":
                 await self._handle_evt_speech_stopped(evt)
@@ -375,10 +391,19 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             alias = _SERVER_EVENT_ALIASES.get(evt_type)
             if alias:
                 data["type"] = alias
+            # Input transcription delta: DashScope carries the running preview
+            # in ``stash`` and leaves the OpenAI ``delta`` field absent. The
+            # parent's model requires ``delta``; synthesize it from text+stash.
+            # Interim frames are replace-style, so a full preview is the
+            # correct value.
+            if evt_type == "conversation.item.input_audio_transcription.delta":
+                if not data.get("delta"):
+                    data["delta"] = (data.get("text") or "") + (data.get("stash") or "")
             # response.created/.done: DashScope names usage details with a
             # trailing s and omits status_details/output; rename/fill so the
-            # parent's pydantic model validates (live-probe-verified
-            # 2026-08-22).
+            # parent's pydantic model validates. Usage may also arrive with
+            # no detail sub-objects at all, which must be backfilled or the
+            # whole turn-end event fails validation.
             if evt_type in ("response.created", "response.done") and isinstance(
                 data.get("response"), dict
             ):
@@ -393,4 +418,6 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
                     ):
                         if src in usage:
                             usage[dst] = usage.pop(src)
+                    usage.setdefault("input_token_details", {})
+                    usage.setdefault("output_token_details", {})
         return json.dumps(data)
