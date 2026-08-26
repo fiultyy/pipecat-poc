@@ -923,8 +923,11 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         RealtimeHeadConfig(
             provider=RealtimeProvider.QWEN,
             protocol=RealtimeProtocol.DASHSCOPE_RT,
-            # 空串/缺省→服务默认；非空→覆盖（如 qwen3.5-omni-plus-realtime）
+            # 空串/缺省→服务默认；非空→覆盖（模型与音色，实测 plus 受理
+            # 14 个音色：Tina/Cherry/Serena/Ethan/Lily/Griffin/Dana/Sandy/
+            # Yuanjia/Jada/Alex/Aria/Nofish/Loongzai）
             model=os.environ.get("VOICE_HEAD_MODEL") or None,
+            voice=os.environ.get("VOICE_HEAD_VOICE") or None,
             system_instruction=DSH_TOOLS_DOCTRINE,
             tools=tools,
         )
