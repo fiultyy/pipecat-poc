@@ -28,8 +28,34 @@ RESULT user_start=True assistant_end=True audio_bytes=241920
 
 服务端 VAD 需要尾随静音判定句尾；PTT 松键采集骤停不给尾巴则 VAD 永不触发（18:54 用户实测「说了，没回应」根因之一）。客户端松键补发 14×50ms 静音。
 
+## 即时打断（`895fa6d`，2026-08-26 20:53 实测）
+
+三层链路 + DashScope 方言修复：
+
+1. **llm.py**：`speech_started` 时发 `response.cancel`——DashScope 不打断会继续推旧应答音频 delta；同时覆盖 `_truncate_current_audio_response`（DashScope 无 `conversation.item.truncate` 事件）。
+2. **rt_gateway**：回合 `interrupted` 时 `WsSession.drop_pending_audio()` 丢弃未下发的音频帧（保留文本/事件帧）。
+3. **rt_voice_app**：`VoiceLink` worker 线程收到 `user_start`/`interrupted` head.turn 时 `_drop_playback()`（OutputStream abort+close，下次播放重建）。
+
+细粒度时间线（/tmp/probe_barge_timeline.py）：
+
+```
+3.83s BARGE（抢话，旧音频已播 107KB）
+3.84–4.29s 旧音频残留 ~0.46s（cancel 往返在途字节）
+4.29s assistant_end + user_start + interrupted
+4.29–7.26s 静默 2.97s（零旧音频泄漏，layer 2 生效）
+6.81s 新 assistant_start → 7.26s 新音频 → 8.78s 新应答完整
+bytes_after_interrupt=368640 == 新应答 24帧×15360B
+```
+
+注意：粗探针的 `audio_stopped_after_barge` 判据（从抢话点起 1s 平坦段）含在途字节，口径过严，以时间线探针为准。
+
+## 方言修复（subagent 审计 P0 项，同 commit）
+
+- `input_audio_transcription.delta`：合成 `delta = text + stash`（父类事件模型要求 delta；interim 帧是 replace 语义，全量预览正确）。修复后 journalctl 零 pydantic 告警。
+- `response.created/.done`：usage 补默认 `input/output_token_details`——稀疏 usage 校验失败会丢整个 turn-end。
+
 ## 限制（如实记录）
 
 - 应答语音有字词重复（模型/合成侧），未处理。
 - pipecat 框架层「自定义 processor process 任务不建立」的机制未继续深挖（observer 规避），值得上游报告。
-- DashScope `conversation.item.input_audio_transcription.delta` 带 `stash` 字段、pydantic 校验警告为已知噪音（转录镜像经 completed 事件仍可达，本凭证 user_text 正常）。
+- 审计 P1/P2 项（B2 session.audio 格式块、B3 视频、B4 transcription.failed、B5 服务端 1007 主动关闭、max_output_tokens 改名等）未修，见 `dashscope-dialect-audit.md`。
