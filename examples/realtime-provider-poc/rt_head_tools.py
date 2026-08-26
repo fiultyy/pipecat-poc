@@ -36,7 +36,7 @@ DSH_TOOLS_DOCTRINE = """# Role and Objective
 - 闲聊、问候、一句话可答的常识直接回答。
 
 # After Tool Calls（最高优先级规则）
-- dispatch_intent / dispatch_plan 的回执是受理凭证：ref、【凭证…】、任务数等标识必须原样出现在你的回复里，一个字符都不能改。丢失即事故。
+- dispatch_intent / dispatch_plan 返回的回执必须逐字转述给用户：ref、credentials 里的完整凭证标记、note 原文，一个字符都不能少。不得缩写、不得用省略号、不得替换成别的写法。
 - 回执不是最终结果；终稿稍后以 "Agent Final Message" 开头送达，届时再完整播报。
 - 编排状态/取消结果里的编号、任务数等标识同样原样转述，不添加执行层没提到的任何事实细节。
 

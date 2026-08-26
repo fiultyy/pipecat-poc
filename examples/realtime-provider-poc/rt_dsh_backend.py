@@ -191,6 +191,11 @@ class DshBackend:
     # a turn is in flight (immediate activation), queue otherwise (drives a
     # fresh turn). Finals still return through the voice-head dais mailbox.
     liaison_session: str = ""
+    # Steer waits for the liaison's current step to finish before the message
+    # enters the next LLM call; when timing matters more than the in-flight
+    # step's work, cancel the step on steer so the message drives a fresh
+    # turn immediately.
+    liaison_cancel_step: bool = True
     _runs: dict[str, DshDispatch] = field(default_factory=dict)
     _pending: dict[str, asyncio.Task] = field(default_factory=dict)
     _bound: dict[str, dict] = field(default_factory=dict)
@@ -234,19 +239,36 @@ class DshBackend:
         Returns the delivery mode used: ``steer`` when a turn was in flight
         (the message joins the running turn immediately), ``queue`` when the
         session was idle (the message drives a fresh turn on it).
+
+        Steer normally waits for the current step (one LLM call + its tool
+        executions) to finish before the message enters the next request —
+        latency is bounded by the step's remaining length. With
+        ``liaison_cancel_step`` (default), steer first cancels the in-flight
+        step: ``session.cancel`` aborts the running phase with keep-inbox,
+        and the agent loop reclassifies the wake-up message as next-turn,
+        starting a fresh turn immediately over the full history.
         """
         sid = self._liaison_sid()
         sessions = await self._dsh_api("session.list", {})
         running = any(s.get("sessionId") == sid and s.get("running")
                       for s in sessions.get("items", []))
-        mode = "steer" if running else "queue"
+        if running and self.liaison_cancel_step:
+            # abort the in-flight step; the queued wake-up then reclassifies
+            # to next-turn and drives a fresh turn immediately
+            await self._dsh_api("session.cancel", {"sessionId": sid})
+            mode = "steer-cancel"
+            prompt_mode = "queue"
+        elif running:
+            mode = prompt_mode = "steer"
+        else:
+            mode = prompt_mode = "queue"
         line = "DSHMSG]" + json.dumps({
             "from": self.head_handle, "to": self.liaison_session, "type": "ask",
             "ref": ref, "body": body[:8000],
             "msgid": str(uuid.uuid4()), "ts": int(time.time() * 1000),
         }, ensure_ascii=False)
         await self._dsh_api("session.prompt", {
-            "sessionId": sid, "mode": mode,
+            "sessionId": sid, "mode": prompt_mode,
             "content": [{"type": "text", "text": line}],
         })
         return mode
@@ -262,7 +284,10 @@ class DshBackend:
         receipt = {
             "status": "accepted", "run_id": run_id, "ref": ref,
             "credentials": dispatch.credentials,
-            "note": f"已转对接人（{mode}），完成后播报",
+            "note": {"queue": "已转对接人（新回合），完成后播报",
+                     "steer": "已转对接人（并入在飞回合），完成后播报",
+                     "steer-cancel": "已转对接人（打断当前步立即执行），完成后播报"
+                     }.get(mode, "已转对接人，完成后播报"),
         }
         if extra_receipt:
             receipt.update(extra_receipt)

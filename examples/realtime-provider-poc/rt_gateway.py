@@ -1090,6 +1090,10 @@ def main(argv: list[str] | None = None) -> int:
             lane=lane,
             topic_sources=None if args.no_topics else DEFAULT_TOPIC_SOURCES,
         )
+        # DshBackend 自建私有 EventBus（default_factory）；不回填 gateway.bus
+        # 的话 orch.* 全进无人订阅的总线，语音客户端观测面全瞎。
+        if not args.echo:
+            backend.bus = gateway.bus
         # TailReader 接线：orch.dispatch 携带 dispatch_ids 时逐 worker 起尾读协程
         readers: dict[str, asyncio.Task] = {}
 
