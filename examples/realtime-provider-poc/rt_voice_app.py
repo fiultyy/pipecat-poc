@@ -41,6 +41,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 RATE = 16000
 OUT_RATE = 24000  # 网关下行 TTS PCM 码率（Qwen-Omni realtime 头 24k）
+
+# 播放线程哨兵：清空待播队列并断流（打断用）
+_DROP_PLAYBACK = object()
 BLOCK_MS = 50
 BLOCK = RATE * BLOCK_MS // 1000          # 800 samples per callback
 BARS = 24
@@ -69,19 +72,30 @@ class VoiceLink:
         self._aiohttp = aiohttp
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._out: sd.OutputStream | None = None
+        self._play_q: "queue.Queue" = queue.Queue()
+        self._play_thread: threading.Thread | None = None
+        self._mute = False  # 打断后丢弃下行音频，直到新应答开始（worker 线程内读写）
 
     # ---- lifecycle (called from tkinter thread) ----
 
     def start(self):
         self._stop.clear()
+        while True:  # 丢弃上次会话残留
+            try:
+                self._play_q.get_nowait()
+            except queue.Empty:
+                break
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        self._play_thread = threading.Thread(target=self._playback_worker, daemon=True)
+        self._play_thread.start()
 
     def close(self, graceful: bool):
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=3)
+        if self._play_thread:
+            self._play_thread.join(timeout=3)
 
     # ---- worker ----
 
@@ -119,7 +133,8 @@ class VoiceLink:
                                 except asyncio.TimeoutError:
                                     continue
                                 if msg.type == aiohttp.WSMsgType.BINARY:
-                                    self._play(bytes(msg.data))
+                                    if not self._mute:
+                                        self._play_q.put(bytes(msg.data))
                                     continue
                                 if msg.type != aiohttp.WSMsgType.TEXT:
                                     continue
@@ -134,8 +149,12 @@ class VoiceLink:
                                     self.session_id = data.get("session_id") or self.session_id
                                     self.on_state("open")
                                 elif t == "head.turn":
-                                    if data.get("phase") in ("user_start", "interrupted"):
+                                    ph = data.get("phase")
+                                    if ph in ("user_start", "interrupted"):
+                                        self._mute = True  # 残余旧音频也拦下
                                         self._drop_playback()  # 打断：立刻闭嘴
+                                    elif ph == "assistant_start":
+                                        self._mute = False
                                     self.rx.put("[回合] "
                                                 + json.dumps(data, ensure_ascii=False)[:200])
                                 elif t == "error":
@@ -155,12 +174,6 @@ class VoiceLink:
                 break
             self.rx.put("[链路] 2s 后重连…")
         self.on_state("closed")
-        if self._out:
-            try:
-                self._out.stop()
-                self._out.close()
-            except Exception:
-                pass
 
     async def _pump_up(self, ws, started):
         """tx 队列 → 二进制帧；200ms 合块（32KB/s 码率上限内）。"""
@@ -176,24 +189,66 @@ class VoiceLink:
             if chunks and started():
                 await ws.send_bytes(b"".join(chunks))
 
-    def _play(self, pcm: bytes):
-        try:
-            if self._out is None:
-                self._out = sd.OutputStream(samplerate=OUT_RATE, channels=1, dtype="int16")
-                self._out.start()
-            self._out.write(np.frombuffer(pcm, dtype=np.int16).reshape(-1, 1))
-        except Exception:
-            self._out = None  # 无输出设备时静默丢弃
+    def _playback_worker(self):
+        """播放线程：独占 OutputStream。
+
+        sounddevice 的 write 按设备缓冲节流阻塞——下行音频比实时快时
+        会长期卡在 write 里，不能在收帧循环内直接播（打断事件会排在
+        音频帧后面，永远轮不到处理）。收帧循环只入队，本线程消费；
+        打断经哨兵让本线程自行清队列并断流。
+        """
+        out: sd.OutputStream | None = None
+        while not self._stop.is_set():
+            try:
+                item = self._play_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is _DROP_PLAYBACK:
+                if out is not None:
+                    try:
+                        out.abort()  # 丢弃设备缓冲内未播样本，立即静音
+                        out.close()
+                    except Exception:
+                        pass
+                    out = None
+                while True:  # 丢弃已在队列里的旧音频（含重复哨兵）
+                    try:
+                        self._play_q.get_nowait()
+                    except queue.Empty:
+                        break
+                continue
+            try:
+                if out is None:
+                    out = sd.OutputStream(samplerate=OUT_RATE, channels=1, dtype="int16")
+                    out.start()
+                out.write(np.frombuffer(item, dtype=np.int16).reshape(-1, 1))
+            except Exception:
+                if out is not None:
+                    try:
+                        out.close()
+                    except Exception:
+                        pass
+                out = None  # 无输出设备等异常：丢块继续
+        if out is not None:
+            try:
+                out.stop()
+                out.close()
+            except Exception:
+                pass
 
     def _drop_playback(self):
-        """打断：丢弃缓冲中的旧应答音频并停流（下次 _play 重建）。"""
-        out, self._out = self._out, None
-        try:
-            if out is not None:
-                out.abort()   # 丢弃未播样本，立即静音
-                out.close()
-        except Exception:
-            pass
+        """打断：先清待播队列，再放哨兵让播放线程断流。
+
+        哨兵不能先入队——FIFO 里它会排在旧音频后面，播放线程会把
+        旧音频全部播完才轮到断流。清完队列后线程最多等当前 write
+        返回（≤一个设备缓冲期）即静音。
+        """
+        while True:
+            try:
+                self._play_q.get_nowait()
+            except queue.Empty:
+                break
+        self._play_q.put(_DROP_PLAYBACK)
 
 
 class ObserveLink:
