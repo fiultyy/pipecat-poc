@@ -158,8 +158,9 @@ def _create_openai(config: RealtimeHeadConfig) -> LLMService:
     if config.voice:
         audio_kwargs["output"] = events.AudioOutput(voice=config.voice)
     if config.turn_detection is not None:
-        td = None if config.turn_detection is False else config.turn_detection
-        audio_kwargs["input"] = events.AudioInput(turn_detection=td)
+        # False 原样透传（manual 模式：服务端 VAD 关，回合由外部信号提交）；
+        # None 才表示「用服务端缺省 VAD」。
+        audio_kwargs["input"] = events.AudioInput(turn_detection=config.turn_detection)
 
     sp_kwargs: dict[str, Any] = {}
     if audio_kwargs:
@@ -223,8 +224,9 @@ def _create_qwen(config: RealtimeHeadConfig) -> LLMService:
     if config.voice:
         audio_kwargs["output"] = events.AudioOutput(voice=config.voice)
     if config.turn_detection is not None:
-        td = None if config.turn_detection is False else config.turn_detection
-        audio_kwargs["input"] = events.AudioInput(turn_detection=td)
+        # False 原样透传（manual 模式：服务端 VAD 关，回合由外部信号提交）；
+        # None 才表示「用服务端缺省 VAD」。
+        audio_kwargs["input"] = events.AudioInput(turn_detection=config.turn_detection)
     if audio_kwargs:
         sp_kwargs["audio"] = events.AudioConfiguration(**audio_kwargs)
     if config.text_only:

@@ -63,8 +63,7 @@ class VoiceLink:
                  rx: "queue.Queue[str]", on_state):
         import aiohttp
 
-        self.url, self.token = url, token
-        self.tx, self.rx, self.on_state = tx, rx, on_state
+        self.url, self.token, self.tx, self.rx, self.on_state = url, token, tx, rx, on_state
         self.session_id: str | None = None
         self._aiohttp = aiohttp
         self._stop = threading.Event()
@@ -159,6 +158,7 @@ class VoiceLink:
 
     async def _pump_up(self, ws, started):
         """tx 队列 → 二进制帧；200ms 合块（32KB/s 码率上限内）。"""
+
         while True:
             chunks: list[bytes] = []
             deadline = time.monotonic() + 0.2
@@ -558,6 +558,7 @@ class App:
             return                      # 锁定连续采集：松键不停
         if self.ptt.release() == "stop":
             self._mic_stop()
+            self._send_vad_tail()
 
     def _on_lock(self):
         if self.lock_var.get():
@@ -617,6 +618,17 @@ class App:
             try:
                 self.tx.get_nowait()
             except queue.Empty:
+                break
+
+    def _send_vad_tail(self):
+        """松键后补 0.7s 静音：服务端 VAD 需尾随静音判定句尾并自动提交
+        （PTT 下采集骤停不给尾巴，VAD 永远等不到句尾——18:54 无回应根因）。"""
+        if self.state_var.get() != "open":
+            return
+        for _ in range(14):             # 14 × 50ms
+            try:
+                self.tx.put_nowait(b"\x00\x00" * 800)
+            except queue.Full:
                 break
 
     def _on_audio(self, data, frames, time_info, status):

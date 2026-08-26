@@ -120,8 +120,16 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             headers = {"Authorization": f"Bearer {self.api_key}"}
             if self._workspace_id:
                 headers["X-DashScope-WorkSpace"] = self._workspace_id
+            # Model must ride the URI query (probe-verified 2026-08-26):
+            # without it the endpoint accepts session.update and even
+            # transcribes appended audio, but never emits VAD events
+            # (input_audio_buffer.speech_started/stopped) nor the
+            # auto-committed response — the session is silently half-alive.
+            uri = self.base_url
+            if "?" not in uri:
+                uri = f"{uri}?model={self._settings.model}"
             self._websocket = await openai_realtime.llm.websocket_connect(
-                uri=self.base_url,
+                uri=uri,
                 additional_headers=headers,
             )
             self._receive_task = self.create_task(self._receive_task_handler())
@@ -315,14 +323,31 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
                 await self._handle_evt_function_call_arguments_done(evt)
             elif evt.type == "error":
                 if not await self._maybe_handle_evt_retrieve_conversation_item_error(evt):
-                    if evt.error.code in (
-                        "response_cancel_not_active",
-                        "conversation_already_has_active_response",
-                    ):
+                    if self._is_recoverable_response_error(evt):
                         logger.debug(f"{self} {evt.error.message}")
                     else:
                         await self._handle_evt_error(evt)
                         return
+
+    @staticmethod
+    def _is_recoverable_response_error(evt) -> bool:
+        """Whether a server error is a benign turn-state race, not fatal.
+
+        DashScope sometimes reports these with an empty ``code`` and the
+        semantics only in ``message``, so both are matched: a
+        ``response.create`` racing the server-VAD auto-commit (``Conversation
+        already has an active response``) and a cancel landing after the
+        response finished (``response_cancel_not_active``). Killing the
+        receive loop on either would drop the in-flight response's
+        ``response.done`` and with it the assistant turn-end frames.
+        """
+        code = evt.error.code or ""
+        message = evt.error.message or ""
+        return (
+            code in ("response_cancel_not_active", "conversation_already_has_active_response")
+            or "already has an active response" in message
+            or "no active response" in message.lower()
+        )
 
     @staticmethod
     def _normalize_server_message(message: str | bytes) -> str | None:

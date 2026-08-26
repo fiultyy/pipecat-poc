@@ -32,7 +32,7 @@ import os
 import sys
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -834,20 +834,19 @@ class VoiceGateway:
 async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any):
     """真 Qwen realtime 头接到 ws 会话（形制=poc_t6_pipeline.py）。
 
-    providers 工厂 + dsh_head_tools() 四件套 + transcript 镜像 tap；上行
-    InputAudioRawFrame 入管线；下行 TTSAudioRawFrame → session.send_audio。
-    注意：GLM 文本模式先行（Q2 定案 TTS 通道前，音频下行可能为空）。
+    providers 工厂 + dsh_head_tools() 四件套 + observer（transcript 镜像、
+    TTS 下发、head.turn）；上行 InputAudioRawFrame 入管线，下行
+    TTSAudioRawFrame → session.send_audio。
     """
     from pipecat.frames.frames import (
         EndFrame,
-        Frame,
         FunctionCallInProgressFrame,
         InputAudioRawFrame,
         InterimTranscriptionFrame,
         LLMFullResponseEndFrame,
         LLMFullResponseStartFrame,
-        ProposedUserStartedSpeakingFrame,
-        ProposedUserStoppedSpeakingFrame,
+        UserStartedSpeakingFrame,
+        UserStoppedSpeakingFrame,
         InterruptionFrame,
         TextFrame,
         TranscriptionFrame,
@@ -855,9 +854,10 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     )
     from pipecat.pipeline.pipeline import Pipeline
     from pipecat.pipeline.worker import PipelineWorker
+    from pipecat.observers.base_observer import BaseObserver
     from pipecat.processors.aggregators.llm_context import LLMContext
     from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+    from pipecat.processors.frame_processor import FrameDirection
     from pipecat.workers.runner import WorkerRunner
 
     from providers import RealtimeHeadConfig, RealtimeProtocol, RealtimeProvider, create_realtime_head
@@ -867,8 +867,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     tools = dsh_head_tools()
     turn_trace = TurnTrace(
         {
-            "user_start": ProposedUserStartedSpeakingFrame,
-            "user_end": ProposedUserStoppedSpeakingFrame,
+            "user_start": UserStartedSpeakingFrame,
+            "user_end": UserStoppedSpeakingFrame,
             "user_text": TranscriptionFrame,
             "interim": InterimTranscriptionFrame,
             "assistant_start": LLMFullResponseStartFrame,
@@ -879,10 +879,30 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         }
     )
 
-    class _Tap(FrameProcessor):
-        """transcript 镜像 + TTS PCM → ws 下行 + head.turn 上报（KG 11 §1）。"""
+    class _HeadObserver(BaseObserver):
+        """transcript 镜像 + TTS PCM → ws 下行 + head.turn 上报（KG 11 §1）。
 
-        async def process_frame(self, frame: Frame, direction: FrameDirection) -> Frame:
+        观察者而非管线 processor：自定义 processor 插在 realtime 头与
+        assistant aggregator 之间时，其 process 任务不随 StartFrame 建立，
+        TTS/文本帧会堆积在该 processor 队列无人消费（实测复现）；observer
+        挂在 push 边上，不参与帧流。只看下行边：回合帧是双向广播的，
+        按方向过滤天然去重；同帧跨多段 push 再按 frame.id 去重。
+        """
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._seen: OrderedDict[int, None] = OrderedDict()
+
+        async def on_push_frame(self, data) -> None:
+            if data.direction != FrameDirection.DOWNSTREAM:
+                return
+            frame = data.frame
+            if frame.id in self._seen:
+                return
+            self._seen[frame.id] = None
+            if len(self._seen) > 1024:  # 有界：只留近期 id
+                for _ in range(256):
+                    self._seen.popitem(last=False)
             if isinstance(frame, InputAudioRawFrame):
                 transcript.on_speech_started()
             elif isinstance(frame, TTSAudioRawFrame):
@@ -890,8 +910,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
             ev = turn_trace.on_frame(frame)
             if ev is not None:
                 await bus.emit("head.turn", {"conv_id": session.conv_id, **ev})
-            await self.push_frame(frame, direction)
-            return frame
+
+    observer = _HeadObserver()
 
     head = create_realtime_head(
         RealtimeHeadConfig(
@@ -899,14 +919,14 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
             protocol=RealtimeProtocol.DASHSCOPE_RT,
             system_instruction=DSH_TOOLS_DOCTRINE,
             tools=tools,
-            text_only=True,
         )
     )
     context = LLMContext(tools=tools)
     aggregators = LLMContextAggregatorPair(context)
     worker = PipelineWorker(
-        Pipeline([aggregators.user(), head, _Tap(), aggregators.assistant()]),
+        Pipeline([aggregators.user(), head, aggregators.assistant()]),
         cancel_on_idle_timeout=False,
+        observers=[observer],
         app_resources={"dsh_backend": backend},
     )
     runner = WorkerRunner(handle_sigint=False)
@@ -925,6 +945,7 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
             await worker.queue_frame(
                 InputAudioRawFrame(audio=pcm, sample_rate=16000, num_channels=1)
             )
+
 
     adapter = _RealtimeHeadAdapter()
     adapter.transcript = transcript
