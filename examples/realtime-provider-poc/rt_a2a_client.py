@@ -112,6 +112,32 @@ class A2aClient:
                 },
             })
 
+    async def pool_spawn(self, profile: str, *, strategy: str = "binding-mode",
+                         binding_session_id: str = "",
+                         role: str | None = None,
+                         mailbox: str | None = None,
+                         project: str | None = None) -> dict:
+        """``pool/spawn`` RPC — strategy③ binding-mode dresses an IN-FLIGHT
+        dsh session with a stored profile (the PROFILE-INJECT envelope;
+        dsh-family sessions only, per the G4 boundary).
+
+        Returns the bind receipt
+        ``{target: "binding", name, version, sessionId, injected: true}``.
+        """
+        params: dict = {"profile": profile, "strategy": strategy}
+        if strategy == "binding-mode":
+            if not binding_session_id.strip():
+                raise ValueError("binding_session_id required for binding-mode")
+            params["binding"] = {"sessionId": binding_session_id}
+        for key, value in (("role", role), ("mailbox", mailbox),
+                           ("project", project)):
+            if value is not None:
+                params[key] = value
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.timeout_s)
+        ) as session:
+            return await self._rpc(session, "pool/spawn", params)
+
     async def agent_card(self) -> dict:
         async with aiohttp.ClientSession() as session:
             async with session.get(self.base_url + "/.well-known/agent-card.json") as resp:

@@ -44,14 +44,16 @@ DSH_TOOLS_DOCTRINE = """# Role and Objective
 中文口语，简洁友好，不用 Markdown。"""
 
 
-async def dispatch_intent_tool(params, raw_intent: str):
+async def dispatch_intent_tool(params, raw_intent: str, profile: str | None = None):
     """把用户意图交给 dsh 编排层分派；立即返回受理回执，终稿稍后送达。
 
     Args:
         raw_intent: 用户意图的完整自包含描述，含所有上下文。
+        profile: 可选。库内 profile 名——绑到在飞编排会话穿衣（人格），
+            需要编排会话以特定人格处理本次意图时才传。
     """
     backend: DshBackend = params.app_resources["dsh_backend"]
-    await params.result_callback(await backend.dispatch(raw_intent))
+    await params.result_callback(await backend.dispatch(raw_intent, profile=profile))
 
 
 async def dispatch_plan_tool(params, objective: str, subtasks_json: str):

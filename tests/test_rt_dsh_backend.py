@@ -192,6 +192,70 @@ async def test_query_status_skips_scan_when_no_ctx_handle(backend, captured):
     b._pending[ref].cancel()
 
 
+class _MockA2a:
+    """Lane-a mock recording pool/spawn (binding) and send order."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    async def send(self, raw_intent, ref="-", source="voice-head"):
+        self.calls.append(("send", raw_intent, ref))
+        return "task_mock01"
+
+    async def pool_spawn(self, profile, *, strategy="binding-mode",
+                         binding_session_id="", role=None, mailbox=None,
+                         project=None):
+        self.calls.append(("pool_spawn", profile, strategy,
+                           binding_session_id))
+        return {"target": "binding", "name": profile, "version": "v1",
+                "sessionId": binding_session_id, "injected": True}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_profile_dresses_before_send_idempotent(backend, captured):
+    """G4: a dispatch-carried profile binds onto the in-flight session
+    via pool/spawn binding-mode BEFORE the intent goes out; rebinding
+    the same (profile, session) is a no-op."""
+    b, _ = backend
+    a2a = _MockA2a()
+    b.lane_a = a2a
+    b.lane_mode = "a"
+    b.bind_session_id = "session_dressed01"
+
+    receipt = json.loads(await b.dispatch("调研 X", profile="vh-liaison"))
+    assert receipt["status"] == "accepted"
+    assert receipt["profile"] == {"name": "vh-liaison", "version": "v1",
+                                  "sessionId": "session_dressed01",
+                                  "injected": True}
+    # dressing strictly precedes the intent submission
+    assert a2a.calls[0][:2] == ("pool_spawn", "vh-liaison")
+    assert a2a.calls[0][2:] == ("binding-mode", "session_dressed01")
+    assert a2a.calls[1][0] == "send"
+    # second dispatch with the same profile: no rebind
+    n_calls = len(a2a.calls)
+    await b.dispatch("再调研 Y", profile="vh-liaison")
+    binds = [c for c in a2a.calls if c[0] == "pool_spawn"]
+    assert len(binds) == 1
+    assert len(a2a.calls) == n_calls + 1
+    for t in b._pending.values():
+        t.cancel()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_without_profile_never_binds(backend, captured):
+    b, _ = backend
+    a2a = _MockA2a()
+    b.lane_a = a2a
+    b.lane_mode = "a"
+    b.bind_session_id = "session_dressed01"
+
+    await b.dispatch("普通意图")
+    assert all(c[0] != "pool_spawn" for c in a2a.calls)
+    assert a2a.calls[0][0] == "send"
+    for t in b._pending.values():
+        t.cancel()
+
+
 @pytest.mark.asyncio
 async def test_resolve_gate_passthrough(backend, captured):
     b, _ = backend

@@ -162,6 +162,9 @@ class DshBackend:
             ``session`` bind round-robin onto this pool, so the head
             splits semantically while execution binding stays with the
             plane.
+        bind_session_id: in-flight dsh session (full ``session_<uuid>``)
+            that a dispatch-carried profile is bound to via pool/spawn
+            binding-mode (G4 dressing; dsh sessions only).
     """
 
     lane: DaisLane
@@ -178,8 +181,10 @@ class DshBackend:
     poll_s: float = 2.0
     poll_max_s: float = 8.0
     dag_workers: list[str] | None = None
+    bind_session_id: str = ""
     _runs: dict[str, DshDispatch] = field(default_factory=dict)
     _pending: dict[str, asyncio.Task] = field(default_factory=dict)
+    _bound: dict[str, dict] = field(default_factory=dict)
 
     # ---- head tool 1: dispatch_intent ----
 
@@ -201,9 +206,17 @@ class DshBackend:
             return CLARIFY_NOTE
         return await self.dispatch_dag(objective, tasks)
 
-    async def dispatch(self, raw_intent: str) -> str:
-        """Phase 1 acceptance now; phase 2 final re-injected on completion."""
+    async def dispatch(self, raw_intent: str, profile: str | None = None) -> str:
+        """Phase 1 acceptance now; phase 2 final re-injected on completion.
+
+        ``profile`` (G4 dressing): bind the stored profile onto the
+        configured in-flight dsh session (``bind_session_id``) via
+        pool/spawn binding-mode BEFORE the intent goes out — the dressed
+        session's final then carries the profile's persona traces.
+        Binding is idempotent per (profile, session).
+        """
         ref = "vh-" + uuid.uuid4().hex[:8]
+        bound = await self._bind_profile(profile)
         dispatch = await self._fanout(raw_intent, ref)
 
         if dispatch is None:
@@ -216,11 +229,37 @@ class DshBackend:
             "credentials": dispatch.credentials,
             "note": "已受理，完成后播报",
         }
+        if bound:
+            receipt["profile"] = bound
         self._pending[ref] = asyncio.create_task(self._phase2(ref, dispatch))
         self._pending[ref].add_done_callback(_report_phase2_death)
         import json
 
         return json.dumps(receipt, ensure_ascii=False)
+
+    async def _bind_profile(self, profile: str | None) -> dict | None:
+        """Bind ``profile`` onto ``bind_session_id`` (pool/spawn
+        binding-mode); returns the bind receipt summary or None when not
+        applicable (no profile / no lane-a / no session / already bound).
+
+        Failures are NOT swallowed silently — a dressing request that
+        cannot be honored raises, so the head hears it instead of
+        dispatching an undressed session under a dressed expectation.
+        """
+        if not profile or not self.bind_session_id or self.lane_a is None:
+            return None
+        key = f"{profile}@{self.bind_session_id}"
+        if key in self._bound:
+            return self._bound[key]
+        receipt = await self.lane_a.pool_spawn(
+            profile, strategy="binding-mode",
+            binding_session_id=self.bind_session_id)
+        summary = {"name": receipt.get("name", profile),
+                   "version": receipt.get("version", ""),
+                   "sessionId": receipt.get("sessionId", self.bind_session_id),
+                   "injected": bool(receipt.get("injected"))}
+        self._bound[key] = summary
+        return summary
 
     async def dispatch_dag(self, objective: str, tasks: list[DagTaskSpec]) -> str:
         """Head tool: split one intent into a dependent task DAG (lane B).
