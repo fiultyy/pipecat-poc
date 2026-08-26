@@ -241,14 +241,24 @@ class DaisLane:
 
     async def await_worker_done(self, dispatch_id: str, timeout_s: float = 300.0,
                                 poll_s: float = 1.0,
-                                poll_max_s: float = 8.0) -> dict:
-        """Block until the dispatch's ``worker_done`` settlement row arrives.
+                                poll_max_s: float = 8.0,
+                                run_id: str | None = None,
+                                task_id: str | None = None) -> dict:
+        """Block until the dispatch's settlement is observable.
 
-        Settlement is daemon-driven (block settlement with ``--command``
-        enqueues worker_done on the exact command-block exit); this only
-        OBSERVES the settlement mailbox. The ``--type`` filter is
-        client-side, so non-matching rows stay unread for their own
-        consumers. Returns the parsed body JSON
+        Two observation sources, whichever settles first:
+
+        - mailbox: a ``worker_done`` row in the dispatch's own mailbox
+          (manual ``send-message`` re-injection and the per-dispatch
+          contract); ``--type`` filtering is client-side, so non-matching
+          rows stay unread for their own consumers.
+        - task state (authoritative under the daemon block settlement,
+          D-18 contract): the ``worker_done`` message goes to the GUI-held
+          ``orchestrator`` mailbox and never reaches ``ctx_<id>`` — the
+          externally observable settlement is the task's state flip in
+          ``check-status``. Requires ``run_id``/``task_id``.
+
+        Returns the parsed body JSON shape
         ``{task_id, dispatch_id, outcome}``; raises TimeoutError while
         still unsettled. Polls share the escalating-backoff discipline
         (D-17).
@@ -264,6 +274,22 @@ class DaisLane:
                     continue
                 if data.get("dispatch_id") == dispatch_id:
                     return data
+            if run_id and task_id:
+                try:
+                    status = await self.check_status(run_id)
+                    for entry in status.get("entries", []):
+                        states = entry.get("task_states")
+                        if not isinstance(states, dict) or task_id not in states:
+                            continue
+                        state = states[task_id]
+                        if state in ("completed", "failed"):
+                            return {"task_id": task_id,
+                                    "dispatch_id": dispatch_id,
+                                    "outcome": "succeeded"
+                                    if state == "completed" else "failed",
+                                    "provenance": "task_state"}
+                except DaisLaneError:
+                    pass  # transient status errors retry next cycle
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(
@@ -574,5 +600,14 @@ def _parse_status(out: str) -> dict:
             continue
         m = re.match(r"^Run\s+(run_[0-9a-f]+):\s*(\d+)\s+tasks?$", line)
         if m:
-            entries.append({"id": m.group(1), "tasks": int(m.group(2))})
+            entries.append({"id": m.group(1), "tasks": int(m.group(2)),
+                            "task_states": {}})
+            continue
+        m = re.match(r"^(task_[0-9a-f]+)\s+\[([a-z_]+)\]", line)
+        if m:
+            # attach task states to the run entry parsed just above
+            for e in reversed(entries):
+                if "task_states" in e:
+                    e["task_states"][m.group(1)] = m.group(2)
+                    break
     return {"runs": runs if runs is not None else len({e.get("id") for e in entries if e.get("id")}), "entries": entries}

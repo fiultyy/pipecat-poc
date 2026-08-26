@@ -179,6 +179,74 @@ def test_await_worker_done_timeout_while_unsettled():
         asyncio.run(run())
 
 
+def test_await_worker_done_settles_via_task_state_probe():
+    """Daemon settlement routes worker_done to the GUI-held orchestrator
+    mailbox, so the dispatch mailbox stays empty; the externally
+    observable settlement is the task's state flip in check-status."""
+    status = ("Run run_beef: 1 tasks\n"
+              "  task_11 [completed]\n")
+
+    async def runner(argv):
+        if argv[2] == "check-messages":
+            return ("no unread messages\n", "")
+        assert argv[2] == "check-status" and argv[4] == "run_beef"
+        return (status, "")
+
+    lane = DaisLane(runner=runner)
+
+    async def run():
+        return await lane.await_worker_done(
+            "ctx_a1", timeout_s=2, poll_s=0.01,
+            run_id="run_beef", task_id="task_11")
+
+    row = asyncio.run(run())
+    assert row["task_id"] == "task_11"
+    assert row["dispatch_id"] == "ctx_a1"
+    assert row["outcome"] == "succeeded"
+    assert row["provenance"] == "task_state"
+
+
+def test_await_worker_done_task_state_failed_maps_to_failed():
+    status = ("Run run_beef: 1 tasks\n"
+              "  task_11 [failed]\n")
+
+    async def runner(argv):
+        if argv[2] == "check-messages":
+            return ("no unread messages\n", "")
+        return (status, "")
+
+    lane = DaisLane(runner=runner)
+
+    async def run():
+        return await lane.await_worker_done(
+            "ctx_a1", timeout_s=2, poll_s=0.01,
+            run_id="run_beef", task_id="task_11")
+
+    row = asyncio.run(run())
+    assert row["outcome"] == "failed"
+
+
+def test_await_worker_done_ignores_other_tasks_in_status():
+    """A status listing other tasks' states must not settle this dispatch."""
+    status = ("Run run_beef: 2 tasks\n"
+              "  task_99 [completed]\n")
+
+    async def runner(argv):
+        if argv[2] == "check-messages":
+            return ("no unread messages\n", "")
+        return (status, "")
+
+    lane = DaisLane(runner=runner)
+
+    async def run():
+        await lane.await_worker_done(
+            "ctx_a1", timeout_s=0.1, poll_s=0.02,
+            run_id="run_beef", task_id="task_11")
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(run())
+
+
 def test_read_worker_cursor_from_stderr():
     lane, _ = make_lane([("line1\nline2\n", "cursor: 42\n")])
     tail, cursor = asyncio.run(lane.read_worker("ctx_x", after=40))

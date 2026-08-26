@@ -465,7 +465,8 @@ class DshBackend:
                 try:
                     row = await self.lane.await_worker_done(
                         handle, timeout_s=slice_s, poll_s=0.5,
-                        poll_max_s=2.0)
+                        poll_max_s=2.0, run_id=dispatch.run_id,
+                        task_id=dag[i]["task_id"])
                 except TimeoutError:
                     continue
                 except DaisLaneError:
