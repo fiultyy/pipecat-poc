@@ -8,7 +8,8 @@ stdlib tkinter（Notebook 页签）+ sounddevice 原生采集 + numpy FFT + aioh
 直连 rt-gateway（ws://host:8765/ws）。双连接分面：
 
 - 语音连接（现状保留）：PCM16LE/16k/mono 上行、扬声器下行、24 柱频谱 +
-  RMS 电平；静音语义开关（只控采集上行，WS 会话保持）；断线 2s 重连续接
+  RMS 电平；**按住说话**（全局热键默认 F9 或按住🎤按钮；🔒锁定=连续采集），
+  静音语义只控采集上行，WS 会话保持；断线 2s 重连续接
 - 观测连接（KG 11 §3 observe:true）：独立 WS，缺省订阅全部 topic——
   编排页（orch.* 任务树+时间线）、回合页（head.turn）、席位页
   （fleet.snapshot 表）、消息/票板页（bridge.msg + tickets.snapshot）
@@ -321,16 +322,41 @@ def turn_line(frame: dict) -> str:
     return f"{icon} {phase}{(' ' + detail) if detail else ''}"
 
 
+class PushToTalk:
+    """按住说话状态机：press/release → start/stop 动作。
+
+    重复按下（按键重复/热键与按钮多入口并发）与无持有时的释放均不
+    出动作——采集启停只跟随持有态边沿。
+    """
+
+    def __init__(self) -> None:
+        self.held = False
+
+    def press(self) -> str | None:
+        if self.held:
+            return None
+        self.held = True
+        return "start"
+
+    def release(self) -> str | None:
+        if not self.held:
+            return None
+        self.held = False
+        return "stop"
+
+
 class App:
     """tkinter 主线程：频谱画布 + 开关 + 事件面板。"""
 
-    def __init__(self, root: "tkinter.Tk", url: str, token: str, selftest: bool):
+    def __init__(self, root: "tkinter.Tk", url: str, token: str, selftest: bool,
+                 ptt_key: str = "f9"):
         import tkinter as tk
         from tkinter import scrolledtext, ttk
 
         self.tk, self.ttk = tk, ttk
         self.root = root
         self.url, self.token = url, token
+        self.ptt_key = ptt_key
         self.tx: queue.Queue[bytes] = queue.Queue(maxsize=64)
         self.rx: "queue.Queue[str]" = queue.Queue()
         self.latest = np.zeros(BLOCK, dtype=np.int16)
@@ -381,12 +407,19 @@ class App:
 
         mid = ttk.Frame(voice_tab, padding=(8, 4))
         mid.pack(fill="x")
-        self.mic_var = tk.StringVar(value="🎤 开麦（上行开启）")
-        self.mic_btn = tk.Button(mid, textvariable=self.mic_var, command=self.toggle_mic,
+        self.ptt = PushToTalk()
+        self.lock_var = tk.BooleanVar(value=False)
+        self.mic_var = tk.StringVar(value=f"🎤 按住说话（热键 {ptt_key.upper()}）")
+        self.mic_btn = tk.Button(mid, textvariable=self.mic_var,
                                  font=("system-ui 13",), bg="#1f6f43", fg="white",
                                  activebackground="#2a8f56", activeforeground="white",
                                  relief="flat", padx=18, pady=6, cursor="hand2")
+        # 按钮即 PTT：按下开麦、松开闭麦（无 command——避免与按压语义双触发）
+        self.mic_btn.bind("<ButtonPress-1>", lambda _e: self._ptt_press())
+        self.mic_btn.bind("<ButtonRelease-1>", lambda _e: self._ptt_release())
         self.mic_btn.pack(side="left")
+        ttk.Checkbutton(mid, text="🔒 锁定连续采集", variable=self.lock_var,
+                        command=self._on_lock).pack(side="left", padx=10)
         self.stat_var = tk.StringVar(value="待连接")
         ttk.Label(mid, textvariable=self.stat_var).pack(side="left", padx=12)
 
@@ -431,6 +464,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._draw_spectrum(np.zeros(BARS))
         self._tick()
+        self._bind_ptt_hotkey(ptt_key)
         if not self.token:
             self.log_write("[提示] 未配置令牌——gateway 开启鉴权时会收到 auth 错误")
         if selftest:
@@ -513,20 +547,53 @@ class App:
         self.link.close(graceful=False)
         self._set_state("已断开（可重连续接）")
 
-    # ---- 采集开关（静音语义：WS 保持） ----
+    # ---- 采集（按住说话默认；锁定=连续采集，静音语义：WS 保持） ----
 
-    def toggle_mic(self):
+    def _ptt_press(self):
+        if self.ptt.press() == "start":
+            self._mic_start()
+
+    def _ptt_release(self):
+        if self.lock_var.get():
+            return                      # 锁定连续采集：松键不停
+        if self.ptt.release() == "stop":
+            self._mic_stop()
+
+    def _on_lock(self):
+        if self.lock_var.get():
+            self.ptt.press()            # 锁定即视为持续持有
+            self._mic_start()
+        elif not self.ptt.held:
+            self._mic_stop()
+
+    def _bind_ptt_hotkey(self, key: str):
+        """全局热键（pynput，窗口无焦点也生效）；缺库退化窗口内绑定。"""
+        want = key.lower()
+        try:
+            from pynput import keyboard
+
+            def _on_press(k):
+                if getattr(k, "name", "").lower() == want:
+                    self.root.after(0, self._ptt_press)
+
+            def _on_release(k):
+                if getattr(k, "name", "").lower() == want:
+                    self.root.after(0, self._ptt_release)
+
+            self.ptt_listener = keyboard.Listener(on_press=_on_press,
+                                                  on_release=_on_release)
+            self.ptt_listener.start()
+            self.log_write(f"[热键] 全局按住说话：{key.upper()}（pynput）")
+        except Exception as e:  # noqa: BLE001 — 退化窗口内绑定
+            self.ptt_listener = None
+            self.root.bind(f"<KeyPress-{key.capitalize()}>",
+                           lambda _e: self._ptt_press())
+            self.root.bind(f"<KeyRelease-{key.capitalize()}>",
+                           lambda _e: self._ptt_release())
+            self.log_write(f"[热键] 窗口内按住说话：{key.upper()}（{e}）")
+
+    def _mic_start(self):
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-            self.mic_btn.config(bg="#8a3f3f", activebackground="#a44f4f")
-            self.mic_var.set("🔇 闭麦（上行停发）")
-            while True:
-                try:
-                    self.tx.get_nowait()
-                except queue.Empty:
-                    break
             return
         try:
             self.stream = sd.InputStream(
@@ -534,9 +601,23 @@ class App:
                 blocksize=BLOCK, callback=self._on_audio)
             self.stream.start()
             self.mic_btn.config(bg="#1f6f43", activebackground="#2a8f56")
-            self.mic_var.set("🎤 开麦（上行开启）")
+            self.mic_var.set(f"● 收音中（松开 {self.ptt_key.upper()} 结束）")
         except Exception as e:  # noqa: BLE001 — 无设备/权限要上屏而非崩
             self.log_write(f"[采集] 启动失败: {e}")
+
+    def _mic_stop(self):
+        if not self.stream:
+            return
+        self.stream.stop()
+        self.stream.close()
+        self.stream = None
+        self.mic_btn.config(bg="#8a3f3f", activebackground="#a44f4f")
+        self.mic_var.set(f"🎤 按住说话（热键 {self.ptt_key.upper()}）")
+        while True:
+            try:
+                self.tx.get_nowait()
+            except queue.Empty:
+                break
 
     def _on_audio(self, data, frames, time_info, status):
         self.latest = data.copy()
@@ -616,6 +697,8 @@ class App:
         self.link.close(graceful=False)
         if self.obs_link:
             self.obs_link.close()
+        if getattr(self, "ptt_listener", None):
+            self.ptt_listener.stop()
         if self.stream:
             self.stream.stop()
             self.stream.close()
@@ -628,6 +711,8 @@ def main() -> int:
     ap.add_argument("--token", default="")
     ap.add_argument("--selftest", action="store_true",
                     help="无设备冒烟：UI 起即退（CI/无显示环境验证布局）")
+    ap.add_argument("--ptt-key", default="f9",
+                    help="按住说话热键（pynput 键名，默认 f9；全局生效）")
     args = ap.parse_args()
 
     import tkinter as tk
@@ -638,7 +723,7 @@ def main() -> int:
         ttk.Style(root).theme_use("clam")
     except Exception:
         pass
-    App(root, args.url, args.token, args.selftest)
+    App(root, args.url, args.token, args.selftest, ptt_key=args.ptt_key)
     root.mainloop()
     return 0
 

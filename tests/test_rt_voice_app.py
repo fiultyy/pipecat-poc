@@ -20,7 +20,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "realtime-provider-poc"))
 
-from rt_voice_app import ObserveLink, fleet_rows, orch_tree_lines, turn_line  # noqa: E402
+from rt_voice_app import (  # noqa: E402
+    ObserveLink,
+    PushToTalk,
+    fleet_rows,
+    orch_tree_lines,
+    turn_line,
+)
 
 
 class _FakeWs:
@@ -138,6 +144,15 @@ def test_turn_line_labels_and_detail():
     assert turn_line({"phase": "user_text", "detail": "调研完成"}) == "💬 user_text 调研完成"
     assert turn_line({"phase": "tool_call"}) == "🔧 tool_call"
     assert turn_line({"phase": "unknown_phase"}) == "· unknown_phase"
+
+
+def test_push_totalk_edges_only():
+    ptt = PushToTalk()
+    assert ptt.press() == "start"        # 按下 → 开麦
+    assert ptt.press() is None           # 按住重复事件 → 不动作
+    assert ptt.release() == "stop"       # 松开 → 闭麦
+    assert ptt.release() is None         # 无持有时松开 → 不动作
+    assert ptt.press() == "start"        # 可再次进入
 
 
 @pytest.mark.asyncio

@@ -841,7 +841,6 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     from pipecat.frames.frames import (
         EndFrame,
         Frame,
-        FrameDirection,
         FunctionCallInProgressFrame,
         InputAudioRawFrame,
         InterimTranscriptionFrame,
@@ -849,7 +848,7 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         LLMFullResponseStartFrame,
         ProposedUserStartedSpeakingFrame,
         ProposedUserStoppedSpeakingFrame,
-        StartInterruptionFrame,
+        InterruptionFrame,
         TextFrame,
         TranscriptionFrame,
         TTSAudioRawFrame,
@@ -858,7 +857,7 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     from pipecat.pipeline.worker import PipelineWorker
     from pipecat.processors.aggregators.llm_context import LLMContext
     from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-    from pipecat.processors.frame_processor import FrameProcessor
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
     from pipecat.workers.runner import WorkerRunner
 
     from providers import RealtimeHeadConfig, RealtimeProtocol, RealtimeProvider, create_realtime_head
@@ -876,7 +875,7 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
             "assistant_end": LLMFullResponseEndFrame,
             "text": TextFrame,
             "tool_call": FunctionCallInProgressFrame,
-            "interrupted": StartInterruptionFrame,
+            "interrupted": InterruptionFrame,
         }
     )
 
