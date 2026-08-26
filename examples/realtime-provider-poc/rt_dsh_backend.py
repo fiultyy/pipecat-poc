@@ -18,7 +18,11 @@ run; explicit ``cancel()`` does.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
+import time
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
@@ -182,9 +186,93 @@ class DshBackend:
     poll_max_s: float = 8.0
     dag_workers: list[str] | None = None
     bind_session_id: str = ""
+    # Dedicated liaison session (fleet 4-code or full sessionId): when set,
+    # every head tool call is delivered into that session's turn — steer if
+    # a turn is in flight (immediate activation), queue otherwise (drives a
+    # fresh turn). Finals still return through the voice-head dais mailbox.
+    liaison_session: str = ""
     _runs: dict[str, DshDispatch] = field(default_factory=dict)
     _pending: dict[str, asyncio.Task] = field(default_factory=dict)
     _bound: dict[str, dict] = field(default_factory=dict)
+
+    # ---- liaison-session delivery (all head tools → one agent's turn) ----
+
+    async def _dsh_api(self, method: str, payload: dict) -> dict:
+        """POST one RPC to the dsh web host loopback API."""
+
+        def _call() -> dict:
+            wire = {"type": "client-request", "rpcId": str(uuid.uuid4()),
+                    "method": method, "payload": payload}
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{os.environ.get('DSH_PORT', '3080')}/api/{method}",
+                data=json.dumps(wire).encode(),
+                headers={"content-type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read())["result"]
+            if not result.get("ok"):
+                raise RuntimeError(f"{method}: {result.get('error')}")
+            return result["value"]
+
+        return await asyncio.to_thread(_call)
+
+    def _liaison_sid(self) -> str:
+        """Resolve the configured liaison target to a full sessionId."""
+        key = self.liaison_session
+        if key.startswith("session-"):
+            return key
+        with open(os.path.expanduser(
+                os.environ.get("MAESTRO_FLEET", "~/.dsh/maestro/fleet.json"))) as fh:
+            fleet = json.load(fh)
+        entry = fleet.get("fleet", {}).get(key)
+        if not entry:
+            raise RuntimeError(f"liaison {key!r} not in fleet.json")
+        return entry["sessionId"]
+
+    async def _deliver_liaison(self, ref: str, body: str) -> str:
+        """Drop one DSHMSG envelope into the liaison session's turn.
+
+        Returns the delivery mode used: ``steer`` when a turn was in flight
+        (the message joins the running turn immediately), ``queue`` when the
+        session was idle (the message drives a fresh turn on it).
+        """
+        sid = self._liaison_sid()
+        sessions = await self._dsh_api("session.list", {})
+        running = any(s.get("sessionId") == sid and s.get("running")
+                      for s in sessions.get("items", []))
+        mode = "steer" if running else "queue"
+        line = "DSHMSG]" + json.dumps({
+            "from": self.head_handle, "to": self.liaison_session, "type": "ask",
+            "ref": ref, "body": body[:8000],
+            "msgid": str(uuid.uuid4()), "ts": int(time.time() * 1000),
+        }, ensure_ascii=False)
+        await self._dsh_api("session.prompt", {
+            "sessionId": sid, "mode": mode,
+            "content": [{"type": "text", "text": line}],
+        })
+        return mode
+
+    async def _liaison_roundtrip(self, body: str, run_id: str | None,
+                                 extra_receipt: dict | None = None) -> str:
+        """Deliver to the liaison turn, arm the phase-2 wait, return receipt."""
+        ref = "vh-" + uuid.uuid4().hex[:8]
+        dispatch = DshDispatch(run_id=run_id, task_id=None, ref=ref,
+                               credentials=[make_credential(ref.upper())])
+        self._runs[ref] = dispatch
+        mode = await self._deliver_liaison(ref, body)
+        receipt = {
+            "status": "accepted", "run_id": run_id, "ref": ref,
+            "credentials": dispatch.credentials,
+            "note": f"已转对接人（{mode}），完成后播报",
+        }
+        if extra_receipt:
+            receipt.update(extra_receipt)
+        self._pending[ref] = asyncio.create_task(self._phase2(ref, dispatch))
+        self._pending[ref].add_done_callback(_report_phase2_death)
+        await self.bus.emit("orch.dispatch", {
+            "run_id": run_id, "task_id": None, "ref": ref,
+            "credentials": dispatch.credentials, "lane": "liaison", "mode": mode,
+        })
+        return json.dumps(receipt, ensure_ascii=False)
 
     # ---- head tool 1: dispatch_intent ----
 
@@ -204,6 +292,11 @@ class DshBackend:
         tasks = _parse_dag_subtasks(subtasks_json)
         if not tasks:
             return CLARIFY_NOTE
+        if self.liaison_session:
+            run_id = await self.lane.create_run(f"[voice-head-plan] {objective[:200]}")
+            body = (f"PLAN {objective} run={run_id} || "
+                    + json.dumps(tasks, ensure_ascii=False))
+            return await self._liaison_roundtrip(body, run_id, {"tasks": len(tasks)})
         return await self.dispatch_dag(objective, tasks)
 
     async def dispatch(self, raw_intent: str, profile: str | None = None) -> str:
@@ -217,6 +310,12 @@ class DshBackend:
         """
         ref = "vh-" + uuid.uuid4().hex[:8]
         bound = await self._bind_profile(profile)
+        if self.liaison_session:
+            run_id = await self.lane.create_run(f"[voice-head] {raw_intent[:200]}")
+            body = f"INTENT {raw_intent} run={run_id}"
+            if profile:
+                body += f" profile={profile}"
+            return await self._liaison_roundtrip(body, run_id)
         dispatch = await self._fanout(raw_intent, ref)
 
         if dispatch is None:
@@ -641,6 +740,9 @@ class DshBackend:
         not just that it is."""
         from rt_dsh_lane import DaisLaneError
 
+        if self.liaison_session:
+            body = f"STATUS run={run_id}" if run_id else "STATUS"
+            return await self._liaison_roundtrip(body, run_id)
         status = await self.lane.check_status(run_id)
         lines = []
         for entry in status.get("entries", []):
@@ -690,6 +792,9 @@ class DshBackend:
         task = self._pending.get(ref_or_run) or self._pending.get(run_id)
         if task and not task.done():
             task.cancel()
+        if self.liaison_session:
+            body = f"CANCEL {ref_or_run} run={run_id}"
+            return await self._liaison_roundtrip(body, run_id)
         # live DAG dispatches fail individually (best-effort; the pending
         # kill above is the authoritative stop)
         for handle in list(getattr(dispatch, "dag_ctx", {}).values()):

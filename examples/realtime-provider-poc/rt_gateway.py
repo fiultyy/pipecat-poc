@@ -849,6 +849,9 @@ class VoiceGateway:
 # ---- live 阶段（W4.1 e2e）：真 pipecat 头，惰性导入，单测不触达 ----
 
 
+_live_heads: dict = {"head": None, "pending": []}  # 活 head + 无 head 期到达的终稿
+
+
 async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any):
     """真 Qwen realtime 头接到 ws 会话（形制=poc_t6_pipeline.py）。
 
@@ -949,6 +952,37 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
             tools=tools,
         )
     )
+
+    if getattr(backend, "liaison_session", ""):
+        # Liaison finals come back on the voice-head dais mailbox; re-inject
+        # each as a text user turn so the head speaks it (DashScope accepts
+        # conversation.item.create with input_text content). Finals can land
+        # minutes later, after the arming session closed — inject into the
+        # currently live head instead of the arming one (a dead head's send
+        # silently no-ops, losing the final).
+        from pipecat.services.openai.realtime import events as rt_events
+
+        async def _on_final(ref: str, final: str) -> None:
+            text = (f"[编排终稿 {ref}] {final}\n"
+                    "请把上述终稿口语播报给用户：原样转述，不添加事实。")
+            head = _live_heads["head"]
+            if head is None:
+                # 无活会话（用户已断开）：终稿不丢，等下一个会话接入补投
+                _live_heads["pending"].append(text)
+                print(f"rt_gateway: final {ref} buffered (no live head, "
+                      f"total={len(_live_heads['pending'])})", file=sys.stderr)
+                return
+            try:
+                await head.send_client_event(rt_events.ConversationItemCreateEvent(
+                    item=rt_events.ConversationItem(
+                        type="message", role="user",
+                        content=[rt_events.ItemContent(type="input_text", text=text)])))
+                await head.send_client_event(rt_events.ResponseCreateEvent())
+            except Exception as e:  # noqa: BLE001 — 注入失败不杀 phase-2
+                print(f"rt_gateway: final inject {ref} failed: {e}", file=sys.stderr)
+
+        backend.on_final = _on_final
+
     context = LLMContext(tools=tools)
     aggregators = LLMContextAggregatorPair(context)
     worker = PipelineWorker(
@@ -960,12 +994,43 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)
     run_task = asyncio.create_task(runner.run())
+    _live_heads["head"] = head  # 终稿注入目标切到本会话
+    # 无会话期缓冲的终稿：新会话就绪即补投（session.updated 后注入才生效）
+    if _live_heads["pending"]:
+
+        async def _flush_pending() -> None:
+            from pipecat.services.openai.realtime import events as _rt_ev
+
+            await asyncio.sleep(2.0)  # 等 session.update 完成
+            for text in _live_heads["pending"]:
+                try:
+                    await head.send_client_event(_rt_ev.ConversationItemCreateEvent(
+                        item=_rt_ev.ConversationItem(
+                            type="message", role="user",
+                            content=[_rt_ev.ItemContent(type="input_text", text=text)])))
+                    await head.send_client_event(_rt_ev.ResponseCreateEvent())
+                    await asyncio.sleep(0.5)
+                except Exception as e:  # noqa: BLE001
+                    print(f"rt_gateway: pending flush failed: {e}", file=sys.stderr)
+            _live_heads["pending"].clear()
+
+        asyncio.create_task(_flush_pending())
+
+    # Realtime 模式用户回合不推 context（event-only），工具 handler 注册
+    # 若依赖首个 context 帧会晚于会话第一次函数调用——首个 dispatch 撞上
+    # 未注册窗口拿到占位结果。启动即投 LLMSetToolsFrame：注册 handler +
+    # 服务端 session.update 广告工具，赶在任何音频之前。
+    from pipecat.frames.frames import LLMSetToolsFrame
+
+    await worker.queue_frame(LLMSetToolsFrame(tools=tools))
 
     class _RealtimeHeadAdapter:
         async def start(self) -> None:
             pass  # runner 已随构建启动
 
         async def stop(self) -> None:
+            if _live_heads.get("head") is head:
+                _live_heads["head"] = None  # 陈旧引用会让终稿注入静默 no-op
             await worker.queue_frame(EndFrame())
             run_task.cancel()
 
@@ -1009,7 +1074,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             from rt_dsh_backend import DshBackend
 
-            backend = DshBackend(lane=lane)
+            backend = DshBackend(
+                lane=lane,
+                liaison_session=os.environ.get("VOICE_LIAISON_SESSION") or "",
+            )
 
             async def provider(session: "WsSession"):  # noqa: E306 — live 头闭包
                 return await build_realtime_head(session, gateway.bus, backend)
