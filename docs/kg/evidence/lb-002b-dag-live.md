@@ -27,3 +27,13 @@
 - 消费侧与观察面就绪度：live_lb002b_dag.py（B1–B4 四段断言）
   + rt_dsh_backend 注入接线 + rt_head_tools dispatch_plan + dag_workers 池，
   离线 20P 绿。dais 修复部署后当场复跑收口。
+
+## D-18 第二错位定证（2026-08-26 15:5x，方案裁决依据）
+
+- `store.drain_inbox`（store.rs ~1170）：事务内 select-and-mark——**拉取即全部置 read**；
+  CLI `--type` 过滤在拉取后（orchestration.rs:481），非匹配行被消费后丢弃、无回写。
+- 推论：若消费侧改轮 `orchestrator` 共享邮箱（方案 B），每次 `--type worker_done`
+  轮询都会静默吞掉该邮箱所有其他未读消息（status/escalation/intent 全毁）——B 不可行。
+- 定案建议（已发 dais-iter）：A = block_settle.rs:102 enqueue 的 to_handle 由
+  `orchestrator` 改为 `dispatch_id`（`ctx_<id>`），与 send-message 手工回投面同构，
+  消费侧 `await_worker_done`（轮 `ctx_<id>`）零改动。
