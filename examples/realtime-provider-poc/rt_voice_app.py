@@ -131,6 +131,10 @@ class VoiceLink:
                                     msg = await asyncio.wait_for(
                                         frames_q.get(), timeout=0.5)
                                 except asyncio.TimeoutError:
+                                    # reader 正常结束=连接被服务端关闭（无异常
+                                    # 抛出），必须跳出重连，否则挂在死连接上
+                                    if reader.done():
+                                        break
                                     continue
                                 if msg.type == aiohttp.WSMsgType.BINARY:
                                     if not self._mute:
