@@ -278,10 +278,11 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
         )
 
     async def _receive_task_handler(self):
-        # Copied from OpenAIRealtimeLLMService with two DashScope-specific
-        # guards: names are normalized/dropped before parsing, and a parse
-        # failure on an unknown event logs and continues instead of killing
-        # the receive loop (the parent's parser is a whitelist that raises).
+        # Copied from OpenAIRealtimeLLMService with three DashScope-specific
+        # guards: names are normalized/dropped before parsing, a parse failure
+        # on an unknown event logs and continues, and a handler exception on
+        # one event is contained instead of killing the receive loop (a dead
+        # loop silently stops serving every following turn).
         assert self._websocket is not None
 
         async for message in self._websocket:
@@ -293,6 +294,13 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             except Exception as e:
                 logger.warning(f"{self} skipped unparseable server event: {e}")
                 continue
+            try:
+                if await self._dispatch_server_event(evt) == "fatal":
+                    return
+            except Exception as e:
+                logger.error(f"{self} handler failed on {evt.type}, continuing: {e}")
+
+    async def _dispatch_server_event(self, evt):
             if evt.type == "session.created":
                 await self._handle_evt_session_created(evt)
             elif evt.type == "session.updated":
@@ -327,7 +335,7 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
                         logger.debug(f"{self} {evt.error.message}")
                     else:
                         await self._handle_evt_error(evt)
-                        return
+                        return "fatal"
 
     @staticmethod
     def _is_recoverable_response_error(evt) -> bool:
