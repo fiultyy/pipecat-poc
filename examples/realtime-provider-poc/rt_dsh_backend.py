@@ -449,8 +449,17 @@ class DshBackend:
                                     f"{ctx[i]} started"})
                         if t["command"]:
                             # block settlement needs the command to RUN in
-                            # the bound terminal — inject it there
-                            await self.lane.inject_prompt(ctx[i], t["command"])
+                            # the bound terminal — inject it there. A failed
+                            # injection strands the task (no command block
+                            # → no settlement), so surface it on the
+                            # progress plane instead of swallowing it.
+                            try:
+                                await self.lane.inject_prompt(ctx[i], t["command"])
+                            except DaisLaneError as e:
+                                await self.bus.emit("orch.progress", {
+                                    "ref": ref,
+                                    "note": f"task {i + 1} inject failed: "
+                                            f"{str(e)[:120]}"})
                     except DaisLaneError:
                         await asyncio.sleep(min(delay, 1.0))
                 else:
