@@ -128,7 +128,7 @@ class TurnTrace:
 
     纯逻辑、帧类注入（build_realtime_head 传 pipecat 真类，单测传 fake
     类）——本模块保持不依赖 pipecat 导入。判定顺序敏感：Transcription /
-    Interim 是 TextFrame 子类，必须先于 TextFrame 增量累积判定。
+    Interim 是 TextFrame 子类，必须先于文本增量累积判定。
     """
 
     def __init__(self, ft: dict[str, type]) -> None:
@@ -139,6 +139,10 @@ class TurnTrace:
         """返回 head.turn payload（无 phase 键约束外的 ts/conv_id 由调用方补）。"""
         ft = self._ft
         if isinstance(frame, ft["user_start"]):
+            # 文本缓冲按用户回合清：一次应答内 assistant_start 会触发多次
+            # （response 创建 + 每个 assistant item added），按 start 清会把
+            # 已累积的应答文本抹掉。
+            self._text_buf.clear()
             return {"phase": "user_start"}
         if isinstance(frame, ft["user_end"]):
             return {"phase": "user_end"}
@@ -147,7 +151,6 @@ class TurnTrace:
         if isinstance(frame, ft["interim"]):
             return None  # 中间转录不上报（chatty；权威文本走 user_text）
         if isinstance(frame, ft["assistant_start"]):
-            self._text_buf.clear()
             return {"phase": "assistant_start"}
         if isinstance(frame, ft["text"]):
             self._text_buf.append(str(frame.text))
@@ -845,10 +848,10 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         InterimTranscriptionFrame,
         LLMFullResponseEndFrame,
         LLMFullResponseStartFrame,
+        LLMTextFrame,
         UserStartedSpeakingFrame,
         UserStoppedSpeakingFrame,
         InterruptionFrame,
-        TextFrame,
         TranscriptionFrame,
         TTSAudioRawFrame,
     )
@@ -857,7 +860,6 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     from pipecat.observers.base_observer import BaseObserver
     from pipecat.processors.aggregators.llm_context import LLMContext
     from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-    from pipecat.processors.frame_processor import FrameDirection
     from pipecat.workers.runner import WorkerRunner
 
     from providers import RealtimeHeadConfig, RealtimeProtocol, RealtimeProvider, create_realtime_head
@@ -873,7 +875,9 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
             "interim": InterimTranscriptionFrame,
             "assistant_start": LLMFullResponseStartFrame,
             "assistant_end": LLMFullResponseEndFrame,
-            "text": TextFrame,
+            # 只认 LLMTextFrame：realtime 头对同一段文本同时推 LLMTextFrame
+            # 与 TTSTextFrame（都是 TextFrame 子类），宽匹配会双计。
+            "text": LLMTextFrame,
             "tool_call": FunctionCallInProgressFrame,
             "interrupted": InterruptionFrame,
         }
@@ -885,8 +889,10 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         观察者而非管线 processor：自定义 processor 插在 realtime 头与
         assistant aggregator 之间时，其 process 任务不随 StartFrame 建立，
         TTS/文本帧会堆积在该 processor 队列无人消费（实测复现）；observer
-        挂在 push 边上，不参与帧流。只看下行边：回合帧是双向广播的，
-        按方向过滤天然去重；同帧跨多段 push 再按 frame.id 去重。
+        挂在 push 边上，不参与帧流。回合帧是双向广播的（上下行各一个实
+        例，id 互为 broadcast_sibling_id），同帧跨多段 push 还有同一 id——
+        把帧自身 id 与 sibling id 一起标记为已见，任何一条边再来即跳过，
+        每帧只记一次；上行专属帧（如 TranscriptionFrame）不受影响。
         """
 
         def __init__(self) -> None:
@@ -894,12 +900,12 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
             self._seen: OrderedDict[int, None] = OrderedDict()
 
         async def on_push_frame(self, data) -> None:
-            if data.direction != FrameDirection.DOWNSTREAM:
-                return
             frame = data.frame
-            if frame.id in self._seen:
+            ids = {frame.id, frame.broadcast_sibling_id} - {None}
+            if any(i in self._seen for i in ids):
                 return
-            self._seen[frame.id] = None
+            for i in ids:
+                self._seen[i] = None
             if len(self._seen) > 1024:  # 有界：只留近期 id
                 for _ in range(256):
                     self._seen.popitem(last=False)
@@ -917,6 +923,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         RealtimeHeadConfig(
             provider=RealtimeProvider.QWEN,
             protocol=RealtimeProtocol.DASHSCOPE_RT,
+            # 空串/缺省→服务默认；非空→覆盖（如 qwen3.5-omni-plus-realtime）
+            model=os.environ.get("VOICE_HEAD_MODEL") or None,
             system_instruction=DSH_TOOLS_DOCTRINE,
             tools=tools,
         )
