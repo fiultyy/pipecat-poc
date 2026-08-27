@@ -7,7 +7,11 @@
 
 Two-phase response contract (docs/kg/05-contracts.md §2):
 
-- phase 1 (immediate): ``{"status":"accepted", run_id, tickets, credentials}``
+- phase 1 (immediate): acceptance receipt. Liaison deliveries are slim
+  by default (``{"status","ref","summary"}``, kg/14 §2.3 — run_id and
+  credentials stay in ``_runs``/orch.dispatch only);
+  ``VOICE_RECEIPT_SLIM=0`` restores the legacy full form
+  (run_id/credentials/note).
 - phase 2 (on done):   ``"Agent Final Message":\n\n<done body>`` re-injected
   into the head context via the pending-result callback.
 
@@ -169,6 +173,9 @@ class DshBackend:
         bind_session_id: in-flight dsh session (full ``session_<uuid>``)
             that a dispatch-carried profile is bound to via pool/spawn
             binding-mode (G4 dressing; dsh sessions only).
+        receipt_slim: acceptance-receipt shape override for liaison
+            deliveries; None (default) reads VOICE_RECEIPT_SLIM per call
+            ("0" off, else on).
     """
 
     lane: DaisLane
@@ -196,6 +203,10 @@ class DshBackend:
     # step's work, cancel the step on steer so the message drives a fresh
     # turn immediately.
     liaison_cancel_step: bool = True
+    # Acceptance-receipt shape override (kg/14 #2): None (default) defers
+    # to VOICE_RECEIPT_SLIM read at receipt-assembly time ("0" off, else
+    # on — per-call read, no restart); True/False pin the shape outright.
+    receipt_slim: bool | None = None
     _runs: dict[str, DshDispatch] = field(default_factory=dict)
     _pending: dict[str, asyncio.Task] = field(default_factory=dict)
     _bound: dict[str, dict] = field(default_factory=dict)
@@ -273,22 +284,46 @@ class DshBackend:
         })
         return mode
 
+    def _receipt_slim(self) -> bool:
+        """Whether liaison acceptance receipts take the slim form (kg/14 #2).
+
+        ``receipt_slim`` pins the shape when set; otherwise the env is
+        read fresh at each receipt assembly (no restart), matching the
+        DoctrineSource philosophy.
+        """
+        if self.receipt_slim is not None:
+            return self.receipt_slim
+        return os.environ.get("VOICE_RECEIPT_SLIM", "1") != "0"
+
     async def _liaison_roundtrip(self, body: str, run_id: str | None,
                                  extra_receipt: dict | None = None) -> str:
-        """Deliver to the liaison turn, arm the phase-2 wait, return receipt."""
+        """Deliver to the liaison turn, arm the phase-2 wait, return receipt.
+
+        The receipt is slim by default (kg/14 §2.3): status/ref/summary
+        only (plus ``extra_receipt`` merges such as a plan's task count) —
+        credentials and run_id stay on the observation plane
+        (``_runs`` + orch.dispatch), never in the model-visible JSON.
+        VOICE_RECEIPT_SLIM=0 restores the legacy full form.
+        """
         ref = "vh-" + uuid.uuid4().hex[:8]
         dispatch = DshDispatch(run_id=run_id, task_id=None, ref=ref,
                                credentials=[make_credential(ref.upper())])
         self._runs[ref] = dispatch
         mode = await self._deliver_liaison(ref, body)
-        receipt = {
-            "status": "accepted", "run_id": run_id, "ref": ref,
-            "credentials": dispatch.credentials,
-            "note": {"queue": "已转对接人（新回合），完成后播报",
-                     "steer": "已转对接人（并入在飞回合），完成后播报",
-                     "steer-cancel": "已转对接人（打断当前步立即执行），完成后播报"
-                     }.get(mode, "已转对接人，完成后播报"),
-        }
+        if self._receipt_slim():
+            receipt = {
+                "status": "accepted", "ref": ref,
+                "summary": "已受理，转对接人执行",
+            }
+        else:
+            receipt = {
+                "status": "accepted", "run_id": run_id, "ref": ref,
+                "credentials": dispatch.credentials,
+                "note": {"queue": "已转对接人（新回合），完成后播报",
+                         "steer": "已转对接人（并入在飞回合），完成后播报",
+                         "steer-cancel": "已转对接人（打断当前步立即执行），完成后播报"
+                         }.get(mode, "已转对接人，完成后播报"),
+            }
         if extra_receipt:
             receipt.update(extra_receipt)
         self._pending[ref] = asyncio.create_task(self._phase2(ref, dispatch))

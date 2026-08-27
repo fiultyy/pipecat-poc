@@ -59,14 +59,16 @@ PROGRESS_KIND = "orch.progress"
 AUDIO_QUEUE_MAX = 16               # ~320ms；忙时丢最老块（实时性>完整性）
 MAX_SESSIONS_PER_TOKEN = 2
 
-# orch.* 事件全集（KG 04 §3；显式订阅而非 wildcard——EventBus 的无 kinds
-# 订阅会把同一 entry 双挂 "*" 造成双投递，见 VO-011 报告"发现"节）
+# orch.* 事件全集（KG 04 §3；orch.failed 终点失败面见 KG 14 §2.2；显式订阅
+# 而非 wildcard——EventBus 的无 kinds 订阅会把同一 entry 双挂 "*" 造成双投递，
+# 见 VO-011 报告"发现"节）
 ORCH_KINDS = (
     "orch.dispatch",
     "orch.ack",
     "orch.progress",
     "orch.gate",
     "orch.done",
+    "orch.failed",
     "orch.metrics",
 )
 # 台账轻通知（KG 14 §2.2）：正文只走 body.push（裁决 #3）；形态

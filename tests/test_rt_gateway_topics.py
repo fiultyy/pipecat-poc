@@ -6,7 +6,8 @@
 
 覆盖：TurnTrace phase 映射（帧类注入）、FileTailer 行尾/快照两模式、
 observe 会话握手（topics 回显/无 pipeline/拒媒体）、voice 会话默认订阅含
-head.turn、topics 校验、快照缓存订阅回放。
+head.turn、observe 订阅面含 orch.failed（终点失败事件转发）、topics 校验、
+快照缓存订阅回放。
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "realt
 from rt_gateway import (  # noqa: E402
     DEFAULT_VOICE_KINDS,
     FileTailer,
+    SUBSCRIBABLE_KINDS,
     TurnTrace,
 )
 
@@ -353,6 +355,23 @@ async def test_voice_session_default_subscription_includes_head_turn(tmp_path):
         await fx.gw.bus.emit("head.turn", {"conv_id": "s-x", "phase": "user_start"})
         ev = await recv_until(ws, lambda d: d.get("t") == "head.turn", timeout=3.0)
         assert ev["phase"] == "user_start" and ev["conv_id"] == "s-x"
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_observe_session_receives_orch_failed(tmp_path):
+    """orch.failed 是订阅面内的终点失败事件：observe 缺省订阅含它，bus emit
+    后照常 event 帧转发（台账落账在 _store_bridge，另测）。"""
+    from tests.test_rt_gateway import GatewayFixture, close_ws, recv_until
+
+    assert "orch.failed" in SUBSCRIBABLE_KINDS
+    async with GatewayFixture(**_fixture_kwargs(tmp_path)) as fx:
+        ws = await fx.ws()
+        started = await _handshake(ws, start_extra={"observe": True})
+        assert "orch.failed" in started["topics"]  # 缺省订阅 = SUBSCRIBABLE_KINDS
+        await fx.gw.bus.emit("orch.failed", {"ref": "vh-f", "error": "lane dead"})
+        ev = await recv_until(ws, lambda d: d.get("t") == "orch.failed", timeout=3.0)
+        assert ev["ref"] == "vh-f" and ev["error"] == "lane dead"
         await close_ws(ws)
 
 

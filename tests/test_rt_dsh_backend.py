@@ -484,6 +484,116 @@ async def test_dispatch_plan_liaison_body_is_json(backend):
         t.cancel()
 
 
+# ---- PR2 (kg/14 §2.3): liaison acceptance receipt slimming ----
+
+def make_liaison_backend(**overrides):
+    """Backend wired to a mock liaison session: ``_dsh_api`` faked (no
+    fleet.json read, no loopback HTTP), the lane answers create-run only."""
+    script = {"create-run": ["run_<redacted>\n"]}
+    prompts: list[dict] = []
+
+    async def fake_dsh_api(method, payload):
+        if method == "session.prompt":
+            prompts.append(payload)
+        return {"items": []} if method == "session.list" else {}
+
+    b = DshBackend(lane=make_lane(script), bus=EventBus(),
+                   liaison_session="session-3499test", **overrides)
+    b._dsh_api = fake_dsh_api
+    return b, prompts
+
+
+@pytest.mark.asyncio
+async def test_liaison_receipt_slim_default(monkeypatch):
+    """缺省 SLIM=1：受理回执仅 status/ref/summary —— run_id/credentials
+    不进模型上下文，只留观测面（_runs + orch.dispatch）。"""
+    monkeypatch.delenv("VOICE_RECEIPT_SLIM", raising=False)
+    b, _ = make_liaison_backend()
+    receipt = json.loads(await b.dispatch("调研 X"))
+    assert set(receipt) == {"status", "ref", "summary"}
+    assert receipt["status"] == "accepted"
+    assert receipt["ref"].startswith("vh-")
+    assert receipt["summary"] == "已受理，转对接人执行"
+    # credentials 仍在进程内登记（cancel/对账锚点不丢）
+    assert b._runs[receipt["ref"]].credentials[0] == \
+        f"【凭证{receipt['ref'].upper()}】"
+    for t in b._pending.values():
+        t.cancel()
+
+
+@pytest.mark.asyncio
+async def test_liaison_receipt_full_when_slim_off(monkeypatch):
+    """VOICE_RECEIPT_SLIM=0：逐字段回旧全形，字节级不变（回退路径）。"""
+    monkeypatch.setenv("VOICE_RECEIPT_SLIM", "0")
+    b, _ = make_liaison_backend()
+    raw = await b.dispatch("调研 X")
+    receipt = json.loads(raw)
+    ref = receipt["ref"]
+    expected = {
+        "status": "accepted",
+        "run_id": "run_<redacted>",
+        "ref": ref,
+        "credentials": [f"【凭证{ref.upper()}】"],
+        "note": "已转对接人（新回合），完成后播报",  # session idle → queue
+    }
+    assert receipt == expected
+    assert raw == json.dumps(expected, ensure_ascii=False)
+    for t in b._pending.values():
+        t.cancel()
+
+
+@pytest.mark.asyncio
+async def test_liaison_receipt_slim_switch_resolution(monkeypatch):
+    """开关解析：字段缺省读 env（"0" 关、其余开）；构造参置位时钉死，
+    不受 env 影响。"""
+    b, _ = make_liaison_backend()
+    monkeypatch.setenv("VOICE_RECEIPT_SLIM", "0")
+    assert b._receipt_slim() is False
+    monkeypatch.setenv("VOICE_RECEIPT_SLIM", "1")
+    assert b._receipt_slim() is True
+    monkeypatch.delenv("VOICE_RECEIPT_SLIM", raising=False)
+    assert b._receipt_slim() is True  # 缺省 1
+    pinned_on, _ = make_liaison_backend(receipt_slim=True)
+    monkeypatch.setenv("VOICE_RECEIPT_SLIM", "0")
+    assert pinned_on._receipt_slim() is True
+    pinned_off, _ = make_liaison_backend(receipt_slim=False)
+    monkeypatch.delenv("VOICE_RECEIPT_SLIM", raising=False)
+    assert pinned_off._receipt_slim() is False
+
+
+@pytest.mark.asyncio
+async def test_liaison_receipt_slim_plan_carries_tasks(monkeypatch):
+    """dispatch_plan 路径：slim 形并入 extra_receipt 的 tasks 数量。"""
+    monkeypatch.delenv("VOICE_RECEIPT_SLIM", raising=False)
+    b, prompts = make_liaison_backend()
+    receipt = json.loads(await b.dispatch_plan(
+        "生成对比报告",
+        '[{"spec":"收集数据","command":"echo A"},'
+        '{"spec":"分析差异","deps":[0],"command":"echo B"}]'))
+    assert set(receipt) == {"status", "ref", "summary", "tasks"}
+    assert receipt["tasks"] == 2
+    assert prompts, "liaison turn never prompted"
+    for t in b._pending.values():
+        t.cancel()
+
+
+@pytest.mark.asyncio
+async def test_liaison_receipt_full_plan_keeps_tasks(monkeypatch):
+    """SLIM=0 时 plan 回执沿用旧全形 + tasks 并入（机制不变）。"""
+    monkeypatch.setenv("VOICE_RECEIPT_SLIM", "0")
+    b, _ = make_liaison_backend()
+    receipt = json.loads(await b.dispatch_plan(
+        "生成对比报告",
+        '[{"spec":"收集数据","command":"echo A"},'
+        '{"spec":"分析差异","deps":[0],"command":"echo B"}]'))
+    assert set(receipt) == {"status", "run_id", "ref", "credentials",
+                            "note", "tasks"}
+    assert receipt["tasks"] == 2
+    assert receipt["run_id"] == "run_<redacted>"
+    for t in b._pending.values():
+        t.cancel()
+
+
 # ---- PR1 (kg/14): orch.done 无 artifact / 终点失败面 orch.failed ----
 
 def make_phase2_backend(captured, check_messages_reply="", lane_error=False):
