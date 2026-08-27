@@ -24,7 +24,7 @@ import sys
 import time
 import urllib.request
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Awaitable, Callable
 
 from rt_a2a_client import A2aClient, A2aError
@@ -320,7 +320,8 @@ class DshBackend:
         if self.liaison_session:
             run_id = await self.lane.create_run(f"[voice-head-plan] {objective[:200]}")
             body = (f"PLAN {objective} run={run_id} || "
-                    + json.dumps(tasks, ensure_ascii=False))
+                    + json.dumps([asdict(t) for t in tasks],
+                                 ensure_ascii=False))
             return await self._liaison_roundtrip(body, run_id, {"tasks": len(tasks)})
         return await self.dispatch_dag(objective, tasks)
 

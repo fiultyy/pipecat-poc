@@ -431,3 +431,43 @@ async def test_dispatch_dag_failed_dep_skips_dependent(captured):
     assert "failed" in final and "skipped" in final
     # the dependent task never got a worker
     assert [s[0] for s in starts] == ["task_11"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_plan_liaison_body_is_json(backend):
+    """Regression (2026-08-27 live): the liaison branch of dispatch_plan
+    json.dumps'd DagTaskSpec dataclasses and raised TypeError — the tool
+    died in 3ms and nothing ever reached the liaison session. With a
+    liaison configured, the PLAN body must carry plain dicts."""
+    b, script = backend
+    b.liaison_session = "session-3499test"
+    prompts: list[dict] = []
+
+    async def fake_dsh_api(method, payload):
+        if method == "session.prompt":
+            prompts.append(payload)
+        return {"items": []} if method == "session.list" else {}
+
+    b._dsh_api = fake_dsh_api
+
+    receipt = json.loads(await b.dispatch_plan(
+        "生成对比报告",
+        '[{"spec":"收集数据","command":"echo A"},'
+        '{"spec":"分析差异","deps":[0],"command":"echo B"}]'))
+    assert receipt["status"] == "accepted"
+    assert receipt["tasks"] == 2
+    assert prompts, "liaison turn never prompted"
+    text = prompts[0]["content"][0]["text"]
+    assert text.startswith("DSHMSG]"), text[:80]
+    inner = json.loads(text[len("DSHMSG]"):])
+    assert inner["type"] == "ask"
+    plan_body = inner["body"]
+    head, _, payload = plan_body.partition(" || ")
+    assert head.startswith("PLAN 生成对比报告 run=run_<redacted>")
+    tasks = json.loads(payload)
+    assert tasks == [
+        {"spec": "收集数据", "deps": [], "command": "echo A", "session": None},
+        {"spec": "分析差异", "deps": [0], "command": "echo B", "session": None},
+    ]
+    for t in b._pending.values():
+        t.cancel()
