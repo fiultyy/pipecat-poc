@@ -89,7 +89,7 @@ dispatch_plan 加 `"tasks":3`。终稿投递由 `VOICE_FINAL_MODE` 分支（✅P
 1. ✅ **PR1**（c82bed4）`rt_session_store.py`（SQLite）+`_store_bridge` 唯一写入面+body.push/body.get 帧；缺省 fulltext，store 静默积累。验证：派发后 body.get 命中；回退：零行为变化。
 2. ✅ **PR2**（3a27293）回执瘦身（VOICE_RECEIPT_SLIM 缺省开）+doctrine 四段式+`_phase2` orch.failed 入观测面；no 序号。验证：播报一句话；回退：SLIM=0。
 3. ✅ **PR3** split 交付：orch.done 载 `body`（cancel 路径无）；bridge body 优先/artifact 哨兵兜底，台账 body 落库；`_on_final` 按 VOICE_FINAL_MODE 分流（split 纯数据通报+store 降级）；`_phase2` lane-a task 消失与 `_phase2_dag` deadline 到期两处静默 return 补 orch.failed；tests 同步（backend/gateway）。回退：MODE=fulltext。
-4. ✅ **PR4**（commit 待填）工具面七件套（read_body/list_bodies 裁决签名实录见 §2.3）+cancel_run ref-only+接线（app_resources `voice_store`、`DEFAULT_VOICE_KINDS += body.push`）+live 探针断言刷新（瘦回执一句话、通报一句话）。验证：「查看任务2」可取正文；list_bodies 列索引。回退：纯代码回退——七件套缩回五件套（去两 handler+doctrine 两条款）、`voice_store` 出 app_resources、kinds 去 body.push、探针断言回旧稿；工具只读台账，无数据迁移。
+4. ✅ **PR4**（d262e21）工具面七件套（read_body/list_bodies 裁决签名实录见 §2.3）+cancel_run ref-only+接线（app_resources `voice_store`、`DEFAULT_VOICE_KINDS += body.push`）+live 探针断言刷新（瘦回执一句话、通报一句话）。验证：「查看任务2」可取正文；list_bodies 列索引。回退：纯代码回退——七件套缩回五件套（去两 handler+doctrine 两条款）、`voice_store` 出 app_resources、kinds 去 body.push、探针断言回旧稿；工具只读台账，无数据迁移。
 5. **PR5** 详情页（Treeview+右栏只读正文）+notify 相+head.compact 快照；翻缺省 split。回退矩阵：两开关+doctrine 指回旧稿。
 
 ## 3. 开放问题（已全部裁决，2026-08-27 用户拍板）
