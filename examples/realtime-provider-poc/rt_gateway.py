@@ -913,7 +913,7 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     from pipecat.workers.runner import WorkerRunner
 
     from providers import RealtimeHeadConfig, RealtimeProtocol, RealtimeProvider, create_realtime_head
-    from rt_head_tools import DSH_TOOLS_DOCTRINE, dsh_head_tools
+    from rt_head_tools import DoctrineSource, dsh_head_tools
 
     transcript = TranscriptState()
     tools = dsh_head_tools()
@@ -980,7 +980,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
             # Yuanjia/Jada/Alex/Aria/Nofish/Loongzai）
             model=os.environ.get("VOICE_HEAD_MODEL") or None,
             voice=os.environ.get("VOICE_HEAD_VOICE") or None,
-            system_instruction=DSH_TOOLS_DOCTRINE,
+            # VOICE_HEAD_DOCTRINE 指外置 doctrine 文件；缺省回落内置常量
+            system_instruction=DoctrineSource().load(),
             tools=tools,
         )
     )

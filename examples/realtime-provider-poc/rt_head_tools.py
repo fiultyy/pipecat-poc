@@ -44,6 +44,46 @@ DSH_TOOLS_DOCTRINE = """# Role and Objective
 中文口语，简洁友好，不用 Markdown。"""
 
 
+class DoctrineSource:
+    """Head system-instruction source: env-pointed file, built-in fallback.
+
+    ``VOICE_HEAD_DOCTRINE=/path/to/file.md`` points the head at an external
+    doctrine file (edit behavior without a code change; takes effect on the
+    next head build, i.e. client reconnect — no gateway restart needed).
+    Unset, unreadable, or blank falls back to ``DSH_TOOLS_DOCTRINE`` with a
+    stderr warning: a bad doctrine config must never keep the voice head
+    from starting.
+    """
+
+    ENV_KEY = "VOICE_HEAD_DOCTRINE"
+
+    def __init__(self, env=None, default: str = DSH_TOOLS_DOCTRINE, warn=None):
+        import os
+        import sys
+
+        self._env = env if env is not None else os.environ
+        self._default = default
+        self._warn = warn or (lambda msg: print(f"rt_head_tools: {msg}",
+                                                file=sys.stderr))
+
+    def load(self) -> str:
+        """Return the effective doctrine text for one head build."""
+        path = (self._env.get(self.ENV_KEY) or "").strip()
+        if not path:
+            return self._default
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError as e:
+            self._warn(f"{self.ENV_KEY}={path} unreadable ({e}); "
+                       "using built-in doctrine")
+            return self._default
+        if not text.strip():
+            self._warn(f"{self.ENV_KEY}={path} is blank; using built-in doctrine")
+            return self._default
+        return text
+
+
 async def dispatch_intent_tool(params, raw_intent: str, profile: str | None = None):
     """把用户意图交给 dsh 编排层分派；立即返回受理回执，终稿稍后送达。
 

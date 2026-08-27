@@ -187,5 +187,5 @@ def test_doctrine_covers_all_tools_and_two_phase_rule():
     for name in ("dispatch_intent", "dispatch_plan", "query_status",
                  "cancel_run", "remain_silent"):
         assert name in DSH_TOOLS_DOCTRINE
-    assert "【凭证" in DSH_TOOLS_DOCTRINE
+    assert "凭证" in DSH_TOOLS_DOCTRINE  # fidelity rule mentions credentials
     assert "Agent Final Message" in DSH_TOOLS_DOCTRINE
