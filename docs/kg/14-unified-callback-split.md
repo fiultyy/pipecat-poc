@@ -32,12 +32,12 @@
 - `no`：backend 全局自增，受理时分配，入回执+orch.dispatch；跨重连稳定。
 - `conv_id` 由 bridge 按当前活会话尽力回填，仅作保留配额，可 null。
 - summary/title 机械生成（正文首非空行截 60/16 字），零 LLM。
-- 保留：LRU 500 + append-only JSONL（5MB 轮转、重启重放）；dais 信箱读即消费，不作恢复源。
+- 保留：LRU 500 + **SQLite**（`~/.local/state/voice-gateway/store.db`，WAL；裁决 #4）；dais 信箱读即消费，不作恢复源。
 - query/cancel 的 liaison roundtrip 不入库（body 前缀 STATUS/CANCEL 过滤）。
 
 ### 2.2 分流协议（写入面=`main._bridge` 单点）
 
-orch.dispatch→put(accepted)；orch.done→update(done, body=artifact)+emit body.push+通报注入；新增 orch.failed（`_phase2`/`_phase2_dag` 两处静默 return 处 emit）→update(failed)+通报；cancel 的 orch.done artifact="(已取消)"→status=cancelled。orch.done 保留 artifact 不动（回退期观测面兜底；split 下与 body.push 短暂双写，PR5 后再议）。progress 零注入 head；心跳 `VOICE_NOTICE_PROGRESS_S` 缺省关。
+orch.dispatch→put(accepted)；orch.done→update(done, body=artifact)+emit body.push+通报注入；新增 orch.failed（`_phase2`/`_phase2_dag` 两处静默 return 处 emit）→update(failed)+通报；cancel 的 orch.done artifact="(已取消)"→status=cancelled。orch.done **不带 artifact**（裁决 #3：正文只走 body.push，无双写期）。progress 零注入 head；心跳不做（裁决 #5），状态留 store 随时查。
 
 ### 2.3 head 面
 
@@ -79,10 +79,10 @@ dispatch_plan 加 `"tasks":3`。完成通报（split 模式，走 `_inject_final
 4. **PR4** read_body/list_bodies+kinds 扩展。验证：「查看任务2」可取正文。
 5. **PR5** 详情页+notify 相+head.compact 快照；翻缺省 split。回退矩阵：两开关+doctrine 指回旧稿。
 
-## 3. 开放问题
+## 3. 开放问题（已全部裁决，2026-08-27 用户拍板）
 
-1. credentials 是否退出模型上下文（裁决=退出；金丝雀对账迁观测面机器比对，请确认）。
-2. `no` 全局 vs 会话内编号（裁决=全局；口播「任务N」是否够用）。
-3. orch.done.artifact 去留（双写期观测帧体积再定）。
-4. JSONL 路径与保留量（500 条/5MB）是否合部署形态。
-5. 心跳通报是否需要（缺省关，观察 query_status 频率再定）。
+1. credentials 退出模型上下文——**确认**。念出来本来就多余；对账迁观测面机器比对。
+2. `no` 全局编号，口播直接叫「任务N」——**确认**。
+3. orch.done.artifact——**立即停发**，正文只走 body.push 新通道（不留双写期；`_phase2` emit 处去 artifact）。
+4. 台账载体——**SQLite**（`~/.local/state/voice-gateway/store.db`，WAL；替原 JSONL 方案），LRU 500 条照做。
+5. progress 主动播报——**不做**；状态留在 store（status 字段随时可查），用户问走 query_status。
