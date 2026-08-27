@@ -22,6 +22,7 @@ from rt_gateway import (  # noqa: E402
     VoiceGateway,
     echo_head_provider,
 )
+import rt_gateway  # noqa: E402
 from rt_transcript import TranscriptState  # noqa: E402
 
 TOKEN = "unit-token"
@@ -737,3 +738,173 @@ async def test_final_inject_serializes_concurrent_finals():
     head.turn_idle.set()
     assert await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2.0)
     assert head.sent.count("ResponseCreateEvent") == 2
+
+
+# ---- I. 台账写入面 + body.get / body.push（KG 14 §2.2，PR1）----
+
+
+@pytest.fixture(autouse=True)
+def _isolate_store_singleton():
+    """台账单例测试隔离：前置清空、后置关闭并复位（绝不触达真实库）。"""
+    rt_gateway._store = None
+    yield
+    if rt_gateway._store is not None:
+        try:
+            rt_gateway._store.close()
+        except Exception:
+            pass
+        rt_gateway._store = None
+
+
+async def observe_handshake(ws, token: str = TOKEN) -> dict:
+    await ws.send_str(json.dumps({"t": "auth", "token": token}))
+    auth = await recv_json(ws)
+    assert auth["t"] == "auth.ok"
+    await ws.send_str(json.dumps({"t": "session.start", "observe": True}))
+    started = await recv_json(ws)
+    assert started["t"] == "session.started"
+    return started
+
+
+async def _open_store(fx, tmp_path, monkeypatch):
+    """tmp 台账 + 挂唯一写入面（与 main() 同一条 attach_store_bridge 路径）。"""
+    monkeypatch.setenv("VOICE_STORE_DB", str(tmp_path / "store.db"))
+    store = rt_gateway.init_store()
+    assert store is not None, "rt_session_store 必须可用（PR1 并行产物）"
+    assert await rt_gateway.attach_store_bridge(fx.gw) is not None
+    return store
+
+
+@pytest.mark.asyncio
+async def test_body_get_hit_after_dispatch_done(tmp_path, monkeypatch):
+    body = "采纳方案B，收益约41%\n对比明细……"
+    async with GatewayFixture() as fx:
+        store = await _open_store(fx, tmp_path, monkeypatch)
+        ws = await fx.ws()
+        await handshake(ws)
+        await fx.gw.bus.emit("orch.dispatch", {
+            "run_id": "run_x", "ref": "vh-1",
+            "credentials": ["【凭证R-1】"], "lane": "b",
+        })
+        await fx.gw.bus.emit("orch.done", {
+            "ref": "vh-1", "run_id": "run_x", "artifact": body,
+        })
+        await ws.send_str(json.dumps({"t": "body.get", "ref": "vh-1"}))
+        item = await recv_until(ws, lambda d: d.get("t") == "body.item")
+        assert item["ref"] == "vh-1"
+        assert item["title"] == body.splitlines()[0][:16]
+        assert item["text"] == body and item["chars"] == len(body)
+        assert isinstance(item["ts"], float)
+        # 台账侧对账：dispatch 进账 accepted→done 覆写，no 全局自增首号
+        rec = store.get("vh-1")
+        assert rec["status"] == "done" and rec["body"] == body
+        assert rec["summary"] == body.splitlines()[0][:60]
+        assert rec["chars"] == len(body) and rec["no"] == 1
+        assert rec["run_id"] == "run_x" and rec["credentials"] == ["【凭证R-1】"]
+        # PR1：body.push 不进 DEFAULT_VOICE_KINDS——语音会话收不到轻通知
+        left = await drain_text(ws)
+        assert all(d.get("t") != "body.push" for d in left)
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_body_get_miss_returns_body_miss_error(tmp_path, monkeypatch):
+    async with GatewayFixture() as fx:
+        await _open_store(fx, tmp_path, monkeypatch)
+        ws = await fx.ws()
+        await handshake(ws)
+        await ws.send_str(json.dumps({"t": "body.get", "ref": "vh-nobody"}))
+        err = await recv_json(ws)
+        assert err["t"] == "error" and err["code"] == "body_miss"
+        assert "vh-nobody" in err["msg"]
+        await ws.send_str(json.dumps({"t": "body.get"}))
+        err = await recv_json(ws)
+        assert err["code"] == "bad_request"
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_body_push_live_frame_and_replay_to_new_observers(tmp_path, monkeypatch):
+    body = "第一行结论\n第二行详情"
+    async with GatewayFixture() as fx:
+        await _open_store(fx, tmp_path, monkeypatch)
+        ws = await fx.ws()
+        started = await observe_handshake(ws)
+        assert "body.push" in started["topics"]  # SUBSCRIBABLE_KINDS 扩容回显
+        await fx.gw.bus.emit("orch.dispatch", {
+            "run_id": "run_y", "ref": "vh-9", "credentials": ["【凭证R-9】"],
+        })
+        await fx.gw.bus.emit("orch.done", {
+            "ref": "vh-9", "run_id": "run_y", "artifact": body,
+        })
+        push = await recv_until(ws, lambda d: d.get("t") == "body.push")
+        assert push["ref"] == "vh-9" and push["no"] == 1 and push["status"] == "done"
+        assert push["title"] == "第一行结论" and push["summary"] == "第一行结论"
+        assert push["chars"] == len(body) and push["inline"] == body
+        assert isinstance(push["ts"], float)
+
+        # 第二个 observe 接入 → topic_cache 索引回放（{t,items,ts}，无 body/inline）
+        ws2 = await fx.ws()
+        await observe_handshake(ws2)
+        replay = await recv_until(ws2, lambda d: d.get("t") == "body.push")
+        assert isinstance(replay.get("items"), list) and replay["items"]
+        entry = replay["items"][-1]
+        assert entry["ref"] == "vh-9" and entry["no"] == 1 and entry["status"] == "done"
+        assert set(entry) == {"ref", "no", "status", "title", "summary", "chars", "ts"}
+        await close_ws(ws)
+        await close_ws(ws2)
+
+
+@pytest.mark.asyncio
+async def test_body_push_cancel_failed_oversize_and_unknown_ref(tmp_path, monkeypatch):
+    big = "结" * 5000
+    async with GatewayFixture() as fx:
+        store = await _open_store(fx, tmp_path, monkeypatch)
+        ws = await fx.ws()
+        await observe_handshake(ws)
+        # cancel 语义：artifact="(已取消)" → status=cancelled
+        await fx.gw.bus.emit("orch.dispatch", {"ref": "vh-a", "run_id": "r1"})
+        await fx.gw.bus.emit("orch.done", {"ref": "vh-a", "artifact": "(已取消)"})
+        p = await recv_until(ws, lambda d: d.get("t") == "body.push" and d["ref"] == "vh-a")
+        assert p["status"] == "cancelled" and p["inline"] == "(已取消)"
+        # orch.failed → status=failed，错误文本入台账正文
+        await fx.gw.bus.emit("orch.dispatch", {"ref": "vh-b", "run_id": "r2"})
+        await fx.gw.bus.emit("orch.failed", {"ref": "vh-b", "error": "lane dead"})
+        p = await recv_until(ws, lambda d: d.get("t") == "body.push" and d["ref"] == "vh-b")
+        assert p["status"] == "failed" and p["inline"] == "lane dead"
+        assert p["summary"] == "lane dead"
+        # 超长正文：inline=null（全文只入台账，body.get 取）
+        await fx.gw.bus.emit("orch.dispatch", {"ref": "vh-c", "run_id": "r3"})
+        await fx.gw.bus.emit("orch.done", {"ref": "vh-c", "artifact": big})
+        p = await recv_until(ws, lambda d: d.get("t") == "body.push" and d["ref"] == "vh-c")
+        assert p["inline"] is None and p["chars"] == 5000
+        await ws.send_str(json.dumps({"t": "body.get", "ref": "vh-c"}))
+        item = await recv_until(ws, lambda d: d.get("t") == "body.item")
+        assert item["text"] == big and item["chars"] == 5000
+        # 未见 dispatch 的 ref：台账无行（update miss），轻通知照发
+        await fx.gw.bus.emit("orch.done", {"ref": "vh-ghost", "artifact": "迟到的终稿"})
+        p = await recv_until(ws, lambda d: d.get("t") == "body.push" and d["ref"] == "vh-ghost")
+        assert p["status"] == "done" and p["no"] is None
+        assert store.get("vh-ghost") is None
+        # 台账终态对账
+        assert store.get("vh-a")["status"] == "cancelled"
+        assert store.get("vh-b")["status"] == "failed"
+        assert store.get("vh-c")["body"] == big
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_body_push_cancel_via_status_field(tmp_path, monkeypatch):
+    """backend 现行 cancel 形态（orch.done 带 status="cancelled"、无
+    artifact——裁决 #10）→ 台账/轻通知均落 cancelled，不误判 done。"""
+    async with GatewayFixture() as fx:
+        store = await _open_store(fx, tmp_path, monkeypatch)
+        ws = await fx.ws()
+        await observe_handshake(ws)
+        await fx.gw.bus.emit("orch.dispatch", {"ref": "vh-cx", "run_id": "r9"})
+        await fx.gw.bus.emit("orch.done", {
+            "ref": "vh-cx", "run_id": "r9", "status": "cancelled"})
+        p = await recv_until(ws, lambda d: d.get("t") == "body.push" and d["ref"] == "vh-cx")
+        assert p["status"] == "cancelled"
+        assert store.get("vh-cx")["status"] == "cancelled"
+        await close_ws(ws)

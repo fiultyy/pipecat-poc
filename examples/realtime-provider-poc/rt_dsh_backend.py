@@ -513,8 +513,10 @@ class DshBackend:
 
         Transient lane errors (``database is locked`` under cross-process
         contention with the resident daemon) are retried until the
-        overall budget expires; only a clean TimeoutError surfaces as
-        "still running".
+        overall budget expires. Both terminal dead-ends (clean
+        TimeoutError, lane errors until deadline) emit ``orch.failed``
+        — the body itself only ever leaves via ``on_final``; bus
+        subscribers get ref/run_id, never the artifact text (kg/14 #3).
         """
         from rt_dsh_lane import DaisLaneError
 
@@ -550,17 +552,22 @@ class DshBackend:
                     from_filter=self.orchestrator_handle or None,
                 )
             except TimeoutError:
-                await self.bus.emit("orch.progress", {"ref": ref, "note": "still running"})
+                # ts is stamped bus-wide (EventBus.emit setdefault)
+                await self.bus.emit("orch.failed", {
+                    "ref": ref, "run_id": dispatch.run_id,
+                    "reason": "still running"})
                 return
             except DaisLaneError:
                 if asyncio.get_event_loop().time() >= deadline:
-                    await self.bus.emit("orch.progress", {"ref": ref, "note": "lane errors until deadline"})
+                    await self.bus.emit("orch.failed", {
+                        "ref": ref, "run_id": dispatch.run_id,
+                        "reason": "lane errors until deadline"})
                     return
                 await asyncio.sleep(min(self.poll_s, 1.0))
         if body.startswith(FINAL_PREFIX):
             body = body[len(FINAL_PREFIX):]
         final = f"{FINAL_PREFIX}{body}"
-        await self.bus.emit("orch.done", {"ref": ref, "run_id": dispatch.run_id, "artifact": body})
+        await self.bus.emit("orch.done", {"ref": ref, "run_id": dispatch.run_id})
         if self.on_final:
             await self.on_final(ref, final)
 
@@ -675,8 +682,7 @@ class DshBackend:
         credential = (dispatch.credentials or [""])[0]
         body = "\n".join(parts) + f"\n【凭证{credential}】"
         final = f"{FINAL_PREFIX}{body}"
-        await self.bus.emit("orch.done", {"ref": ref, "run_id": dispatch.run_id,
-                                          "artifact": body})
+        await self.bus.emit("orch.done", {"ref": ref, "run_id": dispatch.run_id})
         if self.on_final:
             await self.on_final(ref, final)
 
@@ -844,7 +850,10 @@ class DshBackend:
             if run_id.startswith("ctx_"):
                 await self.lane.fail_dispatch(run_id, "cancelled by voice user")
             state = "canceled"
-        await self.bus.emit("orch.done", {"ref": ref_or_run, "run_id": run_id, "artifact": "(已取消)"})
+        # kg/14 #3: no artifact text on the bus — the cancelled outcome
+        # rides the status field (store maps it to status=cancelled)
+        await self.bus.emit("orch.done", {"ref": ref_or_run, "run_id": run_id,
+                                          "status": "cancelled"})
         import json
 
         return json.dumps({"status": state, "run_id": run_id}, ensure_ascii=False)

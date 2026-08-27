@@ -14,7 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "realtime-provider-poc"))
 
 from rt_dsh_backend import DshBackend  # noqa: E402
-from rt_dsh_lane import DaisLane  # noqa: E402
+from rt_dsh_lane import DaisLane, DaisLaneError  # noqa: E402
 from rt_event_bus import EventBus  # noqa: E402
 
 
@@ -119,6 +119,9 @@ async def test_two_phase_final_injection(backend, captured):
     assert "【凭证R-7734】" in message
     kinds = [k for k, _ in captured["events"]]
     assert "orch.done" in kinds
+    # kg/14 #3: 终稿正文不走 orch.done（无 artifact 键），只经 on_final 回注
+    dones = [p for k, p in captured["events"] if k == "orch.done"]
+    assert dones and all("artifact" not in p for p in dones)
 
 
 @pytest.mark.asyncio
@@ -139,6 +142,11 @@ async def test_cancel_by_ref(backend, captured):
     assert result["status"] == "canceled"
     kinds = [k for k, _ in captured["events"]]
     assert kinds.count("orch.done") >= 1
+    # kg/14 #3: 取消语义不再走 artifact="(已取消)"，由 status 字段承载
+    dones = [p for k, p in captured["events"] if k == "orch.done"]
+    assert dones and all("artifact" not in p for p in dones)
+    assert dones[-1]["status"] == "cancelled"
+    assert dones[-1]["ref"] == receipt["ref"]
 
 
 @pytest.mark.asyncio
@@ -365,6 +373,9 @@ async def test_dispatch_dag_dependency_waves_and_aggregate(captured):
     assert ("ctx_b2", "echo B") in injected
     assert any(e[0] == "orch.dispatch" and e[1].get("lane") == "b-dag"
                for e in captured["events"])
+    # kg/14 #3: DAG 聚合终稿同样只走 on_final，orch.done 无 artifact
+    dones = [p for k, p in captured["events"] if k == "orch.done"]
+    assert dones and all("artifact" not in p for p in dones)
 
 
 @pytest.mark.asyncio
@@ -471,3 +482,103 @@ async def test_dispatch_plan_liaison_body_is_json(backend):
     ]
     for t in b._pending.values():
         t.cancel()
+
+
+# ---- PR1 (kg/14): orch.done 无 artifact / 终点失败面 orch.failed ----
+
+def make_phase2_backend(captured, check_messages_reply="", lane_error=False):
+    """Backend purpose-built for direct ``_phase2`` drives: the lane only
+    answers ``check-messages`` (fixed reply, or a DaisLaneError every
+    call); the bus sink and on_final both record into ``captured``."""
+    from rt_dsh_backend import DshBackend
+
+    async def runner(argv):
+        if argv[2] == "check-messages":
+            if lane_error:
+                raise DaisLaneError(
+                    'exit=1 check-messages…: database is locked')
+            return (check_messages_reply, "")
+        return ("", "")
+
+    bus = EventBus()
+
+    async def sink(kind, payload):
+        captured["events"].append((kind, payload))
+
+    bus.subscribe(sink)
+
+    async def on_final(ref, message):
+        captured["finals"].append((ref, message))
+
+    return DshBackend(lane=DaisLane(runner=runner), bus=bus,
+                      on_final=on_final, poll_s=0.05, poll_max_s=0.2)
+
+
+@pytest.mark.asyncio
+async def test_phase2_done_emits_orch_done_without_artifact(captured):
+    """裁决 #3：orch.done 只带 ref/run_id——正文经 on_final 全文回注
+    （PR1 缺省 fulltext 行为不变），不再随事件外发。"""
+    from rt_dsh_backend import DshDispatch
+
+    ref = "vh-<redacted>"
+    b = make_phase2_backend(
+        captured,
+        check_messages_reply=(
+            f"seq=5 from=session_orch to=voice-head type=status "
+            f"body=[ref:{ref}] 调研完成 【凭证R-AB12CD34】 结论 23%\n"))
+    disp = DshDispatch(run_id="run_<redacted>", task_id=None, ref=ref,
+                       credentials=["【凭证R-AB12CD34】"])
+    await b._phase2(ref, disp)
+    dones = [p for k, p in captured["events"] if k == "orch.done"]
+    assert len(dones) == 1
+    assert "artifact" not in dones[0]
+    # 只剩 ref/run_id + 总线统一加盖的 ts
+    assert set(dones[0]) == {"ref", "run_id", "ts"}
+    assert dones[0]["ref"] == ref and dones[0]["run_id"] == "run_<redacted>"
+    assert captured["finals"], "on_final fulltext re-injection was lost"
+    assert "调研完成" in captured["finals"][0][1]
+    assert not any(k == "orch.failed" for k, _ in captured["events"])
+
+
+@pytest.mark.asyncio
+async def test_phase2_timeout_emits_orch_failed(captured):
+    """邮箱一直空 → await_done TimeoutError → orch.failed(reason="still
+    running")，不再静默 return（写入面据此落 status=failed）。"""
+    from rt_dsh_backend import DshDispatch
+
+    b = make_phase2_backend(captured, check_messages_reply="(no messages)\n")
+    b.await_timeout_s = 0.2
+    ref = "vh-to012345"
+    disp = DshDispatch(run_id="run_to012345", task_id=None, ref=ref,
+                       credentials=[])
+    await b._phase2(ref, disp)
+    fails = [p for k, p in captured["events"] if k == "orch.failed"]
+    assert len(fails) == 1
+    assert fails[0]["ref"] == ref
+    assert fails[0]["run_id"] == "run_to012345"
+    assert fails[0]["reason"] == "still running"
+    assert isinstance(fails[0]["ts"], float)
+    assert not any(k == "orch.done" for k, _ in captured["events"])
+    assert not captured["finals"]
+
+
+@pytest.mark.asyncio
+async def test_phase2_lane_errors_until_deadline_emit_orch_failed(captured):
+    """check-messages 每次 DaisLaneError 且撑到预算终点 → orch.failed
+    (reason="lane errors until deadline")。"""
+    from rt_dsh_backend import DshDispatch
+
+    b = make_phase2_backend(captured, lane_error=True)
+    b.await_timeout_s = 0.2
+    ref = "vh-le012345"
+    disp = DshDispatch(run_id="run_le012345", task_id=None, ref=ref,
+                       credentials=[])
+    await b._phase2(ref, disp)
+    fails = [p for k, p in captured["events"] if k == "orch.failed"]
+    assert len(fails) == 1
+    assert fails[0]["ref"] == ref
+    assert fails[0]["run_id"] == "run_le012345"
+    assert fails[0]["reason"] == "lane errors until deadline"
+    assert isinstance(fails[0]["ts"], float)
+    assert not any(k == "orch.done" for k, _ in captured["events"])
+    assert not captured["finals"]

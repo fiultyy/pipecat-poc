@@ -13,6 +13,10 @@
   inbox 行尾 / tickets 全文快照）
 - ``TurnTrace``     — head pipeline 帧流 → head.turn 事件（KG 11 §1；纯逻辑，
   帧类注入，离线可测）
+- 台账接线（KG 14 §2.2 PR1）— ``init_store()`` 模块级 ``SessionStore`` 单例 +
+  ``attach_store_bridge`` 唯一写入面（orch.dispatch→put、orch.done/orch.failed
+  →update+emit ``body.push`` 轻通知）；``body.get``→``body.item``/``error
+  body_miss``；轻通知索引入 ``topic_cache`` 回放（最近 50 条、无 body）
 
 帧协议（§1）：JSON 文本帧（control/event）+ 二进制帧（raw PCM16LE/16k/mono，
 推荐 20ms=640B）。握手序：``auth`` → ``auth.ok{session_id}`` →
@@ -65,12 +69,20 @@ ORCH_KINDS = (
     "orch.done",
     "orch.metrics",
 )
+# 台账轻通知（KG 14 §2.2）：正文只走 body.push（裁决 #3）；形态
+# {t,ref,no,status,title,summary,chars,inline|null,ts}，chars≤4096 附 inline
+# 全文；索引入 topic_cache 回放（{t:"body.push",items:[…无 body],ts}）
+BODY_PUSH_KIND = "body.push"
+BODY_INDEX_LIMIT = 50               # 回放索引条数（兼掉 list 帧，裁决 #3）
+BODY_INLINE_MAX_CHARS = 4096        # ≤ 此长度轻通知附 inline 全文
+CANCEL_ARTIFACT = "(已取消)"         # orch.done 的 cancel 语义标记 → status=cancelled
 # topic.* 观测事件全集（KG 11 §1；console P1 数据平面）
 TOPIC_KINDS = (
     "head.turn",         # head 回合生命周期（TurnTrace，KG 11 §1 phase 表）
     "fleet.snapshot",    # ~/.dsh/maestro/fleet.json 字节变更 → 全量 JSON 快照
     "bridge.msg",        # ~/.dsh/maestro/bridge/inbox.log 增量行
     "tickets.snapshot",  # ~/.dsh/maestro/tickets.md 变更 → 全文快照（render 覆写非追加）
+    BODY_PUSH_KIND,      # 台账轻通知（KG 14 §2.2；bridge 发、索引回放，非文件源）
 )
 SUBSCRIBABLE_KINDS = ORCH_KINDS + TOPIC_KINDS
 # voice 会话默认订阅：orch.* + 自己的 turn 轨迹（语音壳顺手显示，开销每回合数帧）
@@ -246,6 +258,8 @@ class WsSession:
             await self._reply({"t": "pong", "ts": time.time()})
         elif t == "gate.resolve":
             await self._on_gate_resolve(data)
+        elif t == "body.get":
+            await self._on_body_get(data)
         else:
             await self._send_error("bad_type", f"unknown t={t!r}")
 
@@ -370,6 +384,26 @@ class WsSession:
             await self._send_error("lane", str(e)[:160])
             return
         await self._reply({"t": "gate.resolved", "gate_id": gate_id})
+
+    async def _on_body_get(self, data: dict) -> None:
+        """body.get{ref} → body.item 全文（KG 14 §2.2 裁决 #4；miss→body_miss）。"""
+        ref = data.get("ref")
+        if not ref:
+            await self._send_error("bad_request", "body.get needs ref")
+            return
+        store = _get_store()
+        rec = await _store_call(store.get, str(ref)) if store is not None else None
+        if not isinstance(rec, dict) or not rec:
+            await self._send_error("body_miss", f"no stored body for ref {ref}")
+            return
+        await self._reply({
+            "t": "body.item",
+            "ref": rec.get("ref") or ref,
+            "title": rec.get("title") or "",
+            "text": rec.get("body") or "",
+            "chars": rec.get("chars") or 0,
+            "ts": rec.get("updated_ts") or rec.get("ts") or time.time(),
+        })
 
     # ---- media ----
 
@@ -768,6 +802,10 @@ class VoiceGateway:
             else:
                 self._token_counts.pop(session._token, None)
 
+    def active_conv_id(self) -> str | None:
+        """任一在席语音会话的 conv_id（台账 conv_id 尽力回填用；可 None）。"""
+        return next((s.conv_id for s in self._active if s.conv_id), None)
+
     # ---- 断线续接槽（§4 take_tail 重播种）----
 
     def park_resumable(self, conv_id: str, entries: list[TranscriptEntry]) -> None:
@@ -844,6 +882,153 @@ class VoiceGateway:
             await asyncio.Event().wait()
         finally:
             await self.stop()
+
+
+# ---- 台账接线（KG 14 §2.1/§2.2，PR1）----
+
+_store: Any = None  # SessionStore 模块级单例（main() 实例化；None=不可用）
+
+
+def init_store() -> Any:
+    """实例化台账单例；main()（与单测）入口调用，幂等。
+
+    路径由 :class:`rt_session_store.SessionStore` 自取 env ``VOICE_STORE_DB``、
+    缺省 ``~/.local/state/voice-gateway/store.db``。失败只 stderr 告警并保持
+    None——台账缺席不影响网关与派发链路（PR1 硬约束）。
+    """
+    global _store
+    if _store is None:
+        try:
+            from rt_session_store import SessionStore
+
+            _store = SessionStore()
+            log.info("session store at %s", _store.path)
+        except Exception as e:  # noqa: BLE001 — 台账是可选件
+            print(f"rt_gateway: session store unavailable: {e}", file=sys.stderr)
+    return _store
+
+
+def _get_store() -> Any:
+    """台账单例读取；不在此处创建（未初始化=不可用，防止单测触达真实库）。"""
+    return _store
+
+
+async def _store_call(fn: Callable, *a, **kw) -> Any:
+    """store 调用统一包装：``asyncio.to_thread`` 包裹（store 为同步 API，
+    见其模块头约定）；任何失败只 stderr 告警、返回 None，绝不抛——
+    写入失败不得影响派发链路（PR1 硬约束）。"""
+    try:
+        return await asyncio.to_thread(fn, *a, **kw)
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"rt_gateway: store {getattr(fn, '__name__', '?')} failed: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _first_line(text: str | None, limit: int) -> str:
+    """正文首非空行截 ``limit`` 字（title=16/summary=60 机械生成，零 LLM）。"""
+    line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
+    return line[:limit]
+
+
+def _index_entry(rec: dict) -> dict:
+    """回放索引条目：轻字段、无 body/inline（与 store.list 形态对齐）。"""
+    return {k: rec.get(k) for k in ("ref", "no", "status", "title", "summary", "chars", "ts")}
+
+
+def _remember_body_index(gateway: "VoiceGateway", rec: dict) -> None:
+    """台账条目入 ``topic_cache[BODY_PUSH_KIND]`` 索引：按 ref 去重、只留
+    最近 :data:`BODY_INDEX_LIMIT` 条（订阅回放，兼掉 list 帧——裁决 #3）。"""
+    items = gateway.topic_cache.setdefault(BODY_PUSH_KIND, {}).setdefault("items", [])
+    items[:] = [e for e in items if e.get("ref") != rec.get("ref")]
+    items.append(_index_entry(rec))
+    del items[:-BODY_INDEX_LIMIT]
+
+
+async def _store_bridge(kind: str, payload: dict, gateway: "VoiceGateway") -> None:
+    """台账唯一写入面（KG 14 §2.2；裁决 #8，backend 不感知 store）。
+
+    - ``orch.dispatch`` → ``put(accepted)``：no 由 store 受理时分配并回填入
+      台账，事件本身不改不发
+    - ``orch.done`` → ``update(done|cancelled)`` + emit ``body.push`` 轻通知
+      ——正文只走 body.push（裁决 #3）。cancel 语义两形态：
+      ``status:"cancelled"``（backend 现行，裁决 #10）或旧哨兵
+      ``artifact="(已取消)"``（兼容保留）
+    - ``orch.failed`` → ``update(failed)`` + emit ``body.push``
+
+    store 调用全部经 ``_store_call`` 吞并；轻通知照发（字段尽力）。
+    """
+    if kind not in ("orch.dispatch", "orch.done", "orch.failed"):
+        return
+    store = _get_store()
+    ref = payload.get("ref")
+    if store is None or not ref:
+        return
+    ts = float(payload.get("ts") or time.time())
+    if kind == "orch.dispatch":
+        rec = await _store_call(store.put, {
+            "ref": ref,
+            "no": payload.get("no"),
+            "status": "accepted",
+            "run_id": payload.get("run_id"),
+            "credentials": payload.get("credentials") or [],
+            "summary": payload.get("summary") or "已受理，转对接人执行",
+            "conv_id": gateway.active_conv_id(),
+            "ts": ts,
+        })
+        if isinstance(rec, dict):
+            _remember_body_index(gateway, rec)
+        return
+    if kind == "orch.failed":
+        status = "failed"
+        text = str(payload.get("error") or payload.get("reason")
+                   or payload.get("note") or "执行失败")
+    else:
+        text = str(payload.get("artifact") or "")
+        status = ("cancelled"
+                  if text == CANCEL_ARTIFACT or payload.get("status") == "cancelled"
+                  else "done")
+    title, summary = _first_line(text, 16), _first_line(text, 60)
+    rec = await _store_call(store.update, ref, status=status, body=text,
+                            title=title, summary=summary)
+    src = rec if isinstance(rec, dict) else {}
+    push = {
+        "ref": ref,
+        "no": src.get("no") if src else payload.get("no"),
+        "status": status,
+        "title": title,
+        "summary": summary,
+        "chars": src.get("chars", len(text)),
+        "inline": text if len(text) <= BODY_INLINE_MAX_CHARS else None,
+        "ts": ts,
+    }
+    await gateway.bus.emit(BODY_PUSH_KIND, push)
+    if isinstance(rec, dict):
+        _remember_body_index(gateway, rec)
+
+
+async def attach_store_bridge(gateway: "VoiceGateway") -> Callable[[], None] | None:
+    """把台账写入面挂上总线——main() 与单测共用同一条路径（唯一写入面）。
+
+    挂接时把 ``store.list`` 最近 :data:`BODY_INDEX_LIMIT` 条播种进
+    ``topic_cache``（重启后续接回放索引）。台账未初始化时 stderr 告警并
+    返回 None（body.push/body.get 静默停用）。
+    """
+    store = _get_store()
+    if store is None:
+        print("rt_gateway: body store not initialized; body.push/body.get disabled",
+              file=sys.stderr)
+        return None
+    rows = await _store_call(store.list, BODY_INDEX_LIMIT)
+    if rows:
+        gateway.topic_cache[BODY_PUSH_KIND] = {"items": [_index_entry(r) for r in rows]}
+
+    async def _bridge(kind: str, payload: dict) -> None:
+        await _store_bridge(kind, payload, gateway)
+
+    return gateway.bus.subscribe(_bridge)
 
 
 # ---- live 阶段（W4.1 e2e）：真 pipecat 头，惰性导入，单测不触达 ----
@@ -1115,6 +1300,11 @@ def main(argv: list[str] | None = None) -> int:
         # 的话 orch.* 全进无人订阅的总线，语音客户端观测面全瞎。
         if not args.echo:
             backend.bus = gateway.bus
+        # 台账接线（KG 14 §2.2，PR1）：main() 实例化模块级 SessionStore 单例
+        # （env VOICE_STORE_DB 覆写路径）；写入面=attach_store_bridge 总线订阅
+        # （裁决 #8 单点）。store 缺席只 stderr 告警，派发链路不受影响。
+        init_store()
+        await attach_store_bridge(gateway)
         # TailReader 接线：orch.dispatch 携带 dispatch_ids 时逐 worker 起尾读协程
         readers: dict[str, asyncio.Task] = {}
 
