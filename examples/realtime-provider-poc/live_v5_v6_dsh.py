@@ -6,7 +6,7 @@
 now against the REAL dsh-liaison agent (VO-006; KG 06 §3).
 
 GLM text mode (Q2 decision: DASHSCOPE_API_KEY absent — documented fallback
-path). The head is a GLM chat loop with the four rt_head_tools wired onto
+path). The head is a GLM chat loop with the rt_head_tools wired onto
 a real DshBackend (lane B) against the real dais bus; the orchestrator
 side is no longer the in-script stand-in player — it is a genuinely
 incubated dsh-liaison session (plugin incubate RPC, role=liaison,
@@ -17,7 +17,8 @@ finals come back from real agent work.
       + DSHMSG push wakeup -> liaison first action = mailbox snapshot
       drain -> real work -> F10 done reply ([ref:] envelope + FINAL_PREFIX
       verbatim + credentials verbatim) -> phase-2 re-injection -> head
-      broadcast with the credential marker VERBATIM.
+      one-sentence notification (spoken channel carries no ref/credential;
+      the verbatim final stays on the orchestration plane).
   V6  in-flight run + barge-in question -> query_status (pending>=1,
       run still alive) -> cancel_run -> canceled receipt, no late
       broadcast.
@@ -660,7 +661,7 @@ async def main() -> int:
     messages_v5: list[dict] = [
         {"role": "system", "content": DSH_TOOLS_DOCTRINE},
         {"role": "user", "content":
-            "帮我调研 WebGPU 在生产环境的采用情况，办好了把凭证号念给我。"},
+            "帮我调研 WebGPU 在生产环境的采用情况，办好了告诉我结论。"},
     ]
     ack, calls5 = await head_turn(glm, messages_v5, params)
     dispatches = [c for c in calls5 if c["name"] == "dispatch_intent_tool"]
@@ -674,7 +675,8 @@ async def main() -> int:
                        and receipt5["run_id"].startswith("run_"),
                        "phase-1 受理回执（head 本地即时生成）",
                        f"ref={ref} run={receipt5.get('run_id')}")
-        ok5 &= verdict(ref and ref in ack, "回执 ref 原样出现在口语回执", f"ack={ack[:80]!r}")
+        ok5 &= verdict(bool(ack) and ref not in ack and "【凭证" not in ack,
+                       "受理口语回执一句话（不念 ref/凭证）", f"ack={ack[:80]!r}")
 
     ok5 &= verdict(not finals, "phase-1 阶段终稿未到（两阶段时序）")
 
@@ -691,17 +693,19 @@ async def main() -> int:
                        "终稿 = FINAL_PREFIX + done body（[ref:] 信封三过滤命中）",
                        f"final[:60]={fmsg[:60]!r}")
         ok5 &= verdict(f"【凭证{V5_CRED}】" in fmsg, "终稿凭证逐字回显")
+        # 终稿注入：生产 fulltext 形态由 gateway 包裹播报指令；此处直注
+        # 正文，验的是 doctrine 的一句话通报纪律（与注入形态无关）。
         messages_v5.append({"role": "user", "content": finals[0][1]})
         broadcast, _ = await head_turn(glm, messages_v5, params)
-        if f"【凭证{V5_CRED}】" not in broadcast:
+        if not broadcast:
             # live sampling variance: the model occasionally re-acks the
-            # phase-1 receipt instead of reading the final aloud. One
-            # corrective re-turn (contract check below stays verbatim-strict).
+            # phase-1 receipt instead of notifying. One corrective re-turn
+            # (the doctrine check below stays strict).
             messages_v5.append({"role": "assistant", "content": broadcast})
-            messages_v5.append({"role": "user", "content": "终稿已送达。请按 doctrine 播报终稿全文，逐字保留其中全部【凭证…】标记。"})
+            messages_v5.append({"role": "user", "content": "终稿已送达。请按 doctrine 用一句话向用户通报结果。"})
             broadcast, _ = await head_turn(glm, messages_v5, params)
-        ok5 &= verdict(f"【凭证{V5_CRED}】" in broadcast,
-                       "播报含凭证标记（逐字）", f"broadcast={broadcast[:80]!r}")
+        ok5 &= verdict(bool(broadcast) and f"【凭证{V5_CRED}】" not in broadcast,
+                       "播报 = 一句话通报（不念凭证标记）", f"broadcast={broadcast[:80]!r}")
 
         wake_calls = _wakeup_turn_actions(receipt["sessionId"], ref)
         exec_calls = [c for c in wake_calls if c["name"] in ("bash", "shell", "exec")]

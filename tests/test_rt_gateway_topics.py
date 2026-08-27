@@ -6,8 +6,8 @@
 
 覆盖：TurnTrace phase 映射（帧类注入）、FileTailer 行尾/快照两模式、
 observe 会话握手（topics 回显/无 pipeline/拒媒体）、voice 会话默认订阅含
-head.turn、observe 订阅面含 orch.failed（终点失败事件转发）、topics 校验、
-快照缓存订阅回放。
+head.turn 与 body.push（PR4 轻通知）、observe 订阅面含 orch.failed（终点
+失败事件转发）、topics 校验、快照缓存订阅回放。
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "realtime-provider-poc"))
 
 from rt_gateway import (  # noqa: E402
+    BODY_PUSH_KIND,
     DEFAULT_VOICE_KINDS,
     FileTailer,
     SUBSCRIBABLE_KINDS,
@@ -355,6 +356,26 @@ async def test_voice_session_default_subscription_includes_head_turn(tmp_path):
         await fx.gw.bus.emit("head.turn", {"conv_id": "s-x", "phase": "user_start"})
         ev = await recv_until(ws, lambda d: d.get("t") == "head.turn", timeout=3.0)
         assert ev["phase"] == "user_start" and ev["conv_id"] == "s-x"
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_voice_session_default_subscription_includes_body_push(tmp_path):
+    """PR4（KG 14 §2.6/裁决 #9）：body.push 轻通知进语音会话缺省订阅——
+    语音页迷你行自动收；正文仍只走 body.get / read_body，不入语音帧。"""
+    from tests.test_rt_gateway import GatewayFixture, close_ws, recv_until
+
+    assert BODY_PUSH_KIND in DEFAULT_VOICE_KINDS
+    async with GatewayFixture(**_fixture_kwargs(tmp_path)) as fx:
+        ws = await fx.ws()
+        started = await _handshake(ws)  # 普通语音会话，零改动客户端
+        assert BODY_PUSH_KIND in started["topics"]
+        await fx.gw.bus.emit(BODY_PUSH_KIND, {
+            "ref": "vh-p4", "no": 7, "status": "done", "title": "调研结论",
+            "summary": "采纳方案B", "chars": 12, "inline": None, "ts": 1759300000.0})
+        ev = await recv_until(ws, lambda d: d.get("t") == BODY_PUSH_KIND, timeout=3.0)
+        assert ev["ref"] == "vh-p4" and ev["no"] == 7 and ev["status"] == "done"
+        assert ev["summary"] == "采纳方案B" and ev["inline"] is None
         await close_ws(ws)
 
 

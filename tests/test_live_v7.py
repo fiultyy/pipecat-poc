@@ -451,7 +451,8 @@ async def v7_main() -> bool:
                           and run_id.startswith("run_"),
                           "phase-1 受理回执（head 本地即时生成）",
                           f"ref={ref} run={run_id}")
-            ok &= verdict(ref and ref in ack, "回执 ref 原样出现在口语回执",
+            ok &= verdict(bool(ack) and ref not in ack,
+                          "受理口语回执一句话（不念 ref）",
                           f"ack={ack[:70]!r}")
         ok &= verdict(not finals, "phase-1 阶段终稿未到（两阶段时序）")
 
@@ -646,16 +647,18 @@ async def v7_main() -> bool:
                           f"{wb.group(0) if wb else None}")
             ok &= verdict(DOMAINS[0]["domain"] in fmsg and DOMAINS[1]["domain"] in fmsg,
                           "终稿含双域结论（聚合）")
-            # F10 head 播报
+            # F10 head 播报：一句话通报（doctrine：不整段播报正文、凭证
+            # 不上口语；编排通道的凭证在场由上面的 fmsg 断言保证）
             messages.append({"role": "user", "content": fmsg})
             broadcast, _ = await live.head_turn(glm, messages, params)
-            if CRED_MARK not in broadcast:
+            if not broadcast:
                 messages.append({"role": "assistant", "content": broadcast})
                 messages.append({"role": "user", "content":
-                                 "终稿已送达。请按 doctrine 播报终稿全文，"
-                                 "逐字保留其中全部【凭证…】标记。"})
+                                 "终稿已送达。请按 doctrine 用一句话向用户"
+                                 "通报结果。"})
                 broadcast, _ = await live.head_turn(glm, messages, params)
-            ok &= verdict(CRED_MARK in broadcast, "播报含凭证标记（逐字）",
+            ok &= verdict(bool(broadcast) and CRED_MARK not in broadcast,
+                          "播报 = 一句话通报（不念凭证标记）",
                           f"broadcast={broadcast[:70]!r}")
 
         # ---- step 6: 全链 ref/凭证断言汇总 ----

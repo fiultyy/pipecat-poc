@@ -789,6 +789,10 @@ async def test_body_get_hit_after_dispatch_done(tmp_path, monkeypatch):
         await fx.gw.bus.emit("orch.done", {
             "ref": "vh-1", "run_id": "run_x", "artifact": body,
         })
+        # PR4：body.push 进 DEFAULT_VOICE_KINDS——语音会话自动收轻通知
+        push = await recv_until(ws, lambda d: d.get("t") == "body.push")
+        assert push["ref"] == "vh-1" and push["status"] == "done"
+        assert push["inline"] == body and push["chars"] == len(body)
         await ws.send_str(json.dumps({"t": "body.get", "ref": "vh-1"}))
         item = await recv_until(ws, lambda d: d.get("t") == "body.item")
         assert item["ref"] == "vh-1"
@@ -801,9 +805,8 @@ async def test_body_get_hit_after_dispatch_done(tmp_path, monkeypatch):
         assert rec["summary"] == body.splitlines()[0][:60]
         assert rec["chars"] == len(body) and rec["no"] == 1
         assert rec["run_id"] == "run_x" and rec["credentials"] == ["【凭证R-1】"]
-        # PR1：body.push 不进 DEFAULT_VOICE_KINDS——语音会话收不到轻通知
         left = await drain_text(ws)
-        assert all(d.get("t") != "body.push" for d in left)
+        assert all(d.get("t") != "body.push" for d in left)  # 轻通知只此一条
         await close_ws(ws)
 
 
@@ -1017,3 +1020,71 @@ async def test_final_split_notice_degrades_without_record(tmp_path, monkeypatch,
         assert "no" not in payload and payload["ref"] == "vh-ghost2"
         assert payload["summary"] == body.splitlines()[0][:60]
         assert payload["chars"] == len(body)
+
+
+# ---- K. live 头接线（KG 14 §2.3，PR4）：voice_store 进 app_resources ----
+
+
+@pytest.mark.asyncio
+async def test_realtime_head_wires_voice_store_into_app_resources(monkeypatch):
+    """build_realtime_head 组 PipelineWorker 时 app_resources 同时携带
+    dsh_backend 与 voice_store（=_get_store() 构建时快照，可能 None 由工具侧
+    C 降级兜住）。providers 与 PipelineWorker/WorkerRunner 均以替身注入——
+    真实 worker 生命周期不属于单测面（live 阶段惰性导入的既定边界）。"""
+    import types
+
+    from pipecat.pipeline import worker as worker_mod
+    from pipecat.processors.frame_processor import FrameProcessor
+    from pipecat.workers import runner as runner_mod
+
+    wired: dict = {}
+
+    class _PassthroughHead(FrameProcessor):
+        async def process_frame(self, frame, direction):
+            await self.push_frame(frame, direction)
+
+    class _FakeWorker:
+        def __init__(self, pipeline, **kwargs):
+            wired["app_resources"] = kwargs.get("app_resources")
+            wired["pipeline"] = pipeline
+
+        async def queue_frame(self, frame):
+            pass
+
+    class _FakeRunner:
+        def __init__(self, handle_sigint=False):
+            pass
+
+        async def add_workers(self, *workers):
+            pass
+
+        async def run(self):
+            await asyncio.Event().wait()  # 挂起等 stop 侧 cancel
+
+    def _fake_config(**kw):
+        return types.SimpleNamespace(**kw)
+
+    def _fake_create(config):
+        return _PassthroughHead()
+
+    fake_providers = types.ModuleType("providers")
+    fake_providers.RealtimeProvider = types.SimpleNamespace(QWEN="qwen")
+    fake_providers.RealtimeProtocol = types.SimpleNamespace(DASHSCOPE_RT="dashscope-rt")
+    fake_providers.RealtimeHeadConfig = _fake_config
+    fake_providers.create_realtime_head = _fake_create
+    monkeypatch.setitem(sys.modules, "providers", fake_providers)
+    monkeypatch.setattr(worker_mod, "PipelineWorker", _FakeWorker)
+    monkeypatch.setattr(runner_mod, "WorkerRunner", _FakeRunner)
+
+    async def _noop(*a, **k):
+        pass
+
+    session = types.SimpleNamespace(conv_id="s-wire", send_audio=_noop,
+                                    drop_pending_audio=_noop)
+    backend = types.SimpleNamespace(liaison_session="")
+    adapter = await rt_gateway.build_realtime_head(session, EventBus(), backend)
+    await adapter.stop()
+
+    res = wired["app_resources"]
+    assert res["dsh_backend"] is backend
+    assert res["voice_store"] is rt_gateway._get_store()

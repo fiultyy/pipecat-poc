@@ -99,7 +99,8 @@ TOPIC_KINDS = (
 )
 SUBSCRIBABLE_KINDS = ORCH_KINDS + TOPIC_KINDS
 # voice 会话默认订阅：orch.* + 自己的 turn 轨迹（语音壳顺手显示，开销每回合数帧）
-DEFAULT_VOICE_KINDS = ORCH_KINDS + ("head.turn",)
+# + body.push 轻通知（KG 14 §2.6 PR4/裁决 #9：语音页迷你行自动收，不进 head 上下文）
+DEFAULT_VOICE_KINDS = ORCH_KINDS + ("head.turn", BODY_PUSH_KIND)
 MAESTRO_DIR = Path(os.path.expanduser("~/.dsh/maestro"))
 DEFAULT_TOPIC_SOURCES: dict[str, dict] = {
     "fleet.snapshot": {"path": str(MAESTRO_DIR / "fleet.json"), "mode": "snapshot", "parse": "json"},
@@ -1257,7 +1258,7 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         Pipeline([aggregators.user(), head, aggregators.assistant()]),
         cancel_on_idle_timeout=False,
         observers=[observer],
-        app_resources={"dsh_backend": backend},
+        app_resources={"dsh_backend": backend, "voice_store": _get_store()},
     )
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)

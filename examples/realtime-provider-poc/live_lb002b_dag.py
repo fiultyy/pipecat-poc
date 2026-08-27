@@ -11,7 +11,8 @@ Acceptance (docs/plans/lb-002-dais-plane.md §2 LB-002-B + gen3 handoff §6.1):
   bound to REAL dais terminal sessions (start-worker --session, dais
   be8d9cf3 D-04 first live use) -> daemon block settlement
   (worker_done) -> wave walker aggregates ONE final -> phase-2
-  re-injection -> head broadcast with the credential marker VERBATIM.
+  re-injection -> head one-sentence notification (spoken channel carries
+  no ref/credential; the verbatim aggregated final stays on the bus).
 
 The whole orchestration runs against a REAL VoiceGateway (:8765) whose
 EventBus is the shared spine: an observe WS client (session.start
@@ -67,7 +68,7 @@ OBSERVE_TOPICS = [
 INTENT = (
     "帮我建立本仓库 pipecat 的规模基线：第一步数出 src/pipecat/frames/frames.py "
     "里有多少个帧类定义；第二步在第一步基础上数出 src/pipecat/processors/ 目录"
-    "所有 .py 文件里的类定义总数，并与第一步的数字对比。办好了把凭证号念给我。"
+    "所有 .py 文件里的类定义总数，并与第一步的数字对比。办好了告诉我。"
 )
 
 
@@ -309,9 +310,8 @@ async def main() -> int:
         has_dep = any(t.get("deps") for t in head_tasks
                       if isinstance(t, dict))
         ok1 &= verdict(has_dep, "拆分携带依赖（deps 非空）")
-        ok1 &= verdict(bool(ack) and receipt["ref"] in ack
-                       and str(receipt.get("tasks")) in ack,
-                       "口语回执含 ref 与任务数（逐字）", f"ack={ack[:90]!r}")
+        ok1 &= verdict(bool(ack) and receipt["ref"] not in ack,
+                       "受理口语回执一句话（不念 ref）", f"ack={ack[:90]!r}")
     print(f"B1 {'PASS' if ok1 else 'FAIL'}")
 
     print("== B2: dependency waves -> worker_done -> aggregated final ==")
@@ -340,19 +340,18 @@ async def main() -> int:
                        f"{run_line[:120]!r}")
     print(f"B2 {'PASS' if ok2 else 'FAIL'}")
 
-    print("== B3: re-injection broadcast (credential verbatim) ==")
+    print("== B3: re-injection broadcast (one-sentence notice) ==")
     ok3 = True
     if finals and ref:
         messages.append({"role": "user", "content": final})
         broadcast, _ = await head_turn(glm, messages, params)
-        if cred and cred not in (broadcast or ""):
+        if not (broadcast or "").strip():
             messages.append({"role": "assistant", "content": broadcast})
             messages.append({"role": "user", "content":
-                             "终稿已送达。请按 doctrine 播报终稿全文，"
-                             "逐字保留其中全部【凭证…】标记。"})
+                             "终稿已送达。请按 doctrine 用一句话向用户通报结果。"})
             broadcast, _ = await head_turn(glm, messages, params)
-        ok3 = verdict(cred and cred in (broadcast or ""),
-                      "播报含凭证标记（逐字）", f"broadcast={broadcast[:90]!r}")
+        ok3 = verdict(bool((broadcast or "").strip()) and cred not in (broadcast or ""),
+                      "播报 = 一句话通报（不念凭证标记）", f"broadcast={broadcast[:90]!r}")
     else:
         ok3 = False
         verdict(False, "播报（终稿缺席，跳过）")
