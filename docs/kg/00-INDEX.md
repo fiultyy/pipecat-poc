@@ -31,8 +31,8 @@
 | N10 | [10-pool-selection-queen.md](10-pool-selection-queen.md) | **池选型与派生 ✅已收口**（OF-012/013）：pool/spawn 选型面+策略 + queen grill 派生 + 池→dsh preset 导出；live E2E 全链过（§5）；实施域=~/tools/maestro-preset（HEAD ac9877c）+ 回流 199182d |
 | N11 | [11-console-observation-p1.md](11-console-observation-p1.md) | **Console 观测面 P1 ✅topic 数据平面**：head.turn/fleet.snapshot/bridge.msg/tickets.snapshot 四源 + FileTailer（行尾/快照）+ TurnTrace（帧→phase）+ observe 会话/topics 订阅协议（P1.5 cmd 路由、P2 SPA 待开） |
 | N12 | [12-voice-client-one.md](12-voice-client-one.md) | **rt-voice ONE 桌面客户端**：语音面 + 观测面双连接分面、Notebook 页签（rt_voice_app 建成） |
-| N13 | [13-head-persona-receipt-slimming.md](13-head-persona-receipt-slimming.md) | **Head 人格配置化与回执精简化（设计稿）**：回执 status+summary、凭证移出模型上下文、[编排通报] 一句话终稿、read_body 第 6 工具、模糊编号协议、VOICE_RECEIPT_SLIM/VOICE_FINAL_DELIVERY 回退开关 |
-| N14 | [14-unified-callback-split.md](14-unified-callback-split.md) | **回调分流统一框架（A/B/C/D 合并裁决稿）**：rt_session_store（key=ref+JSONL 落盘）、body.push 单 topic+body.get 帧、[编排通报] JSON 载荷、read_body/list_bodies 七件套、零 LLM state.snapshot 压缩、VOICE_FINAL_MODE/VOICE_RECEIPT_SLIM 双开关、PR1–PR5 迁移序 |
+| N13 | [13-head-persona-receipt-slimming.md](13-head-persona-receipt-slimming.md) | **Head 人格配置化与回执精简化（子设计附录，落地形态以 N14 裁决为准）**：回执 status+summary、凭证移出模型上下文、[编排通报] 一句话终稿、read_body 第 6 工具、模糊编号协议、VOICE_RECEIPT_SLIM/VOICE_FINAL_MODE 回退开关 |
+| N14 | [14-unified-callback-split.md](14-unified-callback-split.md) | **回调分流统一框架（A/B/C/D 合并裁决稿，PR1–PR3 ✅落地）**：rt_session_store（key=ref+SQLite 落盘）、orch.done 载 body 直载台账（`_store_bridge` 唯一写入面）、body.push 单 topic+body.get 帧、VOICE_FINAL_MODE=fulltext\|split 终稿分流（[编排通报] 纯数据 JSON+store 降级）、VOICE_RECEIPT_SLIM 回执瘦身、零 LLM state.snapshot 压缩、PR4（read_body/list_bodies 七件套）/PR5（详情页+head.compact+翻缺省）待办 |
 
 ## 3. 边表（对接依赖图，按修正架构）
 

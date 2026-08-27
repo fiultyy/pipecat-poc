@@ -1,4 +1,4 @@
-# 13 · 回调一分为二分流协议（设计稿，未实施）
+# 13 · 回调一分为二分流协议（子设计附录；N14 收编裁决为准，PR1–PR3 已落地）
 
 现状：liaison 终稿 → `DshBackend._phase2` → `on_final(ref, final)` →
 `rt_gateway.build_realtime_head._on_final` 全文注入 head。痛点：realtime

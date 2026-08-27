@@ -548,10 +548,13 @@ class DshBackend:
 
         Transient lane errors (``database is locked`` under cross-process
         contention with the resident daemon) are retried until the
-        overall budget expires. Both terminal dead-ends (clean
-        TimeoutError, lane errors until deadline) emit ``orch.failed``
-        — the body itself only ever leaves via ``on_final``; bus
-        subscribers get ref/run_id, never the artifact text (kg/14 #3).
+        overall budget expires. All terminal dead-ends (clean
+        TimeoutError, lane errors until deadline, a lane-a task the
+        server no longer knows) emit ``orch.failed``. A settled run
+        emits ``orch.done`` carrying the raw final body (FINAL_PREFIX
+        stripped) for the gateway's store bridge (kg/14 §2.2); the
+        full final still re-enters the head via ``on_final`` only —
+        the legacy ``artifact`` key stays gone (kg/14 #3).
         """
         from rt_dsh_lane import DaisLaneError
 
@@ -571,10 +574,11 @@ class DshBackend:
                             dispatch.run_id, timeout_s=budget)
                     except A2aError as exc:
                         # server no longer knows the task (restart/roll):
-                        # its final is unknowable — surface and stop polling
-                        await self.bus.emit("orch.progress",
-                                            {"ref": ref,
-                                             "note": f"lane-a task gone: {exc}"})
+                        # its final is unknowable — settle the ref as
+                        # failed and stop polling
+                        await self.bus.emit("orch.failed", {
+                            "ref": ref, "run_id": dispatch.run_id,
+                            "reason": f"lane-a task gone: {str(exc)[:160]}"})
                         return
                     continue
                 # Poll the HEAD's own mailbox: replies are addressed to the
@@ -602,7 +606,8 @@ class DshBackend:
         if body.startswith(FINAL_PREFIX):
             body = body[len(FINAL_PREFIX):]
         final = f"{FINAL_PREFIX}{body}"
-        await self.bus.emit("orch.done", {"ref": ref, "run_id": dispatch.run_id})
+        await self.bus.emit("orch.done", {"ref": ref, "run_id": dispatch.run_id,
+                                          "body": body})
         if self.on_final:
             await self.on_final(ref, final)
 
@@ -615,6 +620,8 @@ class DshBackend:
         terminal tail is kept as the task's contribution, and
         promote-tasks keeps dais-side readiness in step. Settlement
         observation shares the escalating-backoff discipline (D-17).
+        Budget expiry with tasks still unsettled emits ``orch.failed``
+        (same payload shape as ``_phase2``'s dead-ends).
         """
         from rt_dsh_lane import DaisLaneError
 
@@ -635,8 +642,9 @@ class DshBackend:
         while len(outcomes) < len(dag):
             left = deadline - asyncio.get_event_loop().time()
             if left <= 0:
-                await self.bus.emit("orch.progress",
-                                    {"ref": ref, "note": "DAG 仍在途"})
+                await self.bus.emit("orch.failed", {
+                    "ref": ref, "run_id": dispatch.run_id,
+                    "reason": "still running"})
                 return
             # wave start: ready tasks (deps settled succeeded) get workers
             for i, t in enumerate(dag):
@@ -717,7 +725,8 @@ class DshBackend:
         credential = (dispatch.credentials or [""])[0]
         body = "\n".join(parts) + f"\n【凭证{credential}】"
         final = f"{FINAL_PREFIX}{body}"
-        await self.bus.emit("orch.done", {"ref": ref, "run_id": dispatch.run_id})
+        await self.bus.emit("orch.done", {"ref": ref, "run_id": dispatch.run_id,
+                                          "body": body})
         if self.on_final:
             await self.on_final(ref, final)
 

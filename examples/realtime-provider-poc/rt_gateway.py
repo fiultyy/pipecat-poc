@@ -17,6 +17,9 @@
   ``attach_store_bridge`` 唯一写入面（orch.dispatch→put、orch.done/orch.failed
   →update+emit ``body.push`` 轻通知）；``body.get``→``body.item``/``error
   body_miss``；轻通知索引入 ``topic_cache`` 回放（最近 50 条、无 body）
+- 终稿投递形态（KG 14 §2.3 PR3）— ``VOICE_FINAL_MODE=split|fulltext``（缺省
+  fulltext）：split 注入 ``[编排通报]`` 单行 JSON（字段取台账，缺席降级从终稿
+  本体算，不接指令句）；fulltext 保持旧全文串
 
 帧协议（§1）：JSON 文本帧（control/event）+ 二进制帧（raw PCM16LE/16k/mono，
 推荐 20ms=640B）。握手序：``auth`` → ``auth.ok{session_id}`` →
@@ -48,6 +51,11 @@ from rt_dsh_lane import DaisLane, DaisLaneError
 from rt_event_bus import EventBus
 from rt_transcript import TranscriptEntry, TranscriptState
 
+try:  # 协议常量单点定义（G5: no drift）；openai 缺席的回环部署照常起网关
+    from rt_orchestrator import FINAL_PREFIX
+except Exception:  # noqa: BLE001
+    FINAL_PREFIX = '"Agent Final Message":\n\n'
+
 log = logging.getLogger("rt_gateway")
 
 # ---- 协议/基线常量（KG 04 §1/§3/§4）----
@@ -78,6 +86,9 @@ BODY_PUSH_KIND = "body.push"
 BODY_INDEX_LIMIT = 50               # 回放索引条数（兼掉 list 帧，裁决 #3）
 BODY_INLINE_MAX_CHARS = 4096        # ≤ 此长度轻通知附 inline 全文
 CANCEL_ARTIFACT = "(已取消)"         # orch.done 的 cancel 语义标记 → status=cancelled
+# split 完成通报前缀（KG 14 §2.3/裁决 #7）：注入载荷是纯数据、单行 JSON，
+# 不接任何指令句——行为约定只在 doctrine，载荷嵌指令即漂移源
+FINAL_NOTICE_PREFIX = "[编排通报] "
 # topic.* 观测事件全集（KG 11 §1；console P1 数据平面）
 TOPIC_KINDS = (
     "head.turn",         # head 回合生命周期（TurnTrace，KG 11 §1 phase 表）
@@ -955,10 +966,11 @@ async def _store_bridge(kind: str, payload: dict, gateway: "VoiceGateway") -> No
     - ``orch.dispatch`` → ``put(accepted)``：no 由 store 受理时分配并回填入
       台账，事件本身不改不发
     - ``orch.done`` → ``update(done|cancelled)`` + emit ``body.push`` 轻通知
-      ——正文只走 body.push（裁决 #3）。cancel 语义两形态：
-      ``status:"cancelled"``（backend 现行，裁决 #10）或旧哨兵
-      ``artifact="(已取消)"``（兼容保留）
-    - ``orch.failed`` → ``update(failed)`` + emit ``body.push``
+      ——正文取载荷 ``body``（PR3），旧 ``artifact`` 键兜底；正文只走
+      body.push（裁决 #3）。cancel 语义两形态：``status:"cancelled"``
+      （backend 现行，裁决 #10）或旧哨兵 ``artifact="(已取消)"``（兼容保留）
+    - ``orch.failed`` → ``update(failed)`` + emit ``body.push``（错误文本
+      取 body/artifact/error/reason/note 之首个非空）
 
     store 调用全部经 ``_store_call`` 吞并；轻通知照发（字段尽力）。
     """
@@ -985,10 +997,11 @@ async def _store_bridge(kind: str, payload: dict, gateway: "VoiceGateway") -> No
         return
     if kind == "orch.failed":
         status = "failed"
-        text = str(payload.get("error") or payload.get("reason")
+        text = str(payload.get("body") or payload.get("artifact")
+                   or payload.get("error") or payload.get("reason")
                    or payload.get("note") or "执行失败")
     else:
-        text = str(payload.get("artifact") or "")
+        text = str(payload.get("body") or payload.get("artifact") or "")
         status = ("cancelled"
                   if text == CANCEL_ARTIFACT or payload.get("status") == "cancelled"
                   else "done")
@@ -1041,6 +1054,45 @@ _live_heads: dict = {"head": None, "pending": []}  # 活 head + 无 head 期到�
 # 终稿注入串行锁：并发的终稿（phase-2 多路 + 会话补投）排队走同一个
 # active-response 槽，否则后到的 response.create 撞前一个被服务端静默丢弃。
 _final_inject_lock: asyncio.Lock = asyncio.Lock()
+
+
+def _final_mode() -> str:
+    """终稿投递形态（KG 14 裁决 #2）：仅 ``VOICE_FINAL_MODE`` 精确等于
+    ``"split"`` 时走台账通报，其余值（含未设）回落全文注入——policy 只在
+    gateway，backend 不感知；改 env 即切形态，无需重启即回退。"""
+    return "split" if os.environ.get("VOICE_FINAL_MODE") == "split" else "fulltext"
+
+
+async def _final_injection_text(ref: str, final: str) -> str:
+    """组终稿注入串（fulltext/split 两形态；KG 14 §2.3，PR3）。
+
+    - fulltext：``[编排终稿]`` 全文 + 播报指令——回退路径，字节级保持旧形。
+    - split：``[编排通报]`` + 单行 JSON（no/ref/status/summary/chars），字段
+      取台账——backend 先 emit ``orch.done`` 再调 ``on_final``，store 此时已
+      终态。store 不可用或查不到时降级：ref 照旧、status/summary/chars 从
+      final 本体算（剥 FINAL_PREFIX 后取首行 60 字与长度），no 省略，stderr
+      告警。通报后不接任何指令句（裁决 #7）——播报行为只在 doctrine（PR2
+      已有 ``[编排通报]`` 条款），载荷嵌指令即漂移源。
+
+    pending 缓冲/补投在调用方，两形态共用（本函数返回时注入串已定形）。
+    """
+    if _final_mode() != "split":
+        return (f"[编排终稿 {ref}] {final}\n"
+                "请把上述终稿口语播报给用户：原样转述，不添加事实。")
+    store = _get_store()
+    rec = await _store_call(store.get, ref) if store is not None else None
+    if isinstance(rec, dict):
+        notice = {"no": rec.get("no"), "ref": ref, "status": rec.get("status"),
+                  "summary": rec.get("summary"), "chars": rec.get("chars")}
+    else:
+        body = final[len(FINAL_PREFIX):] if final.startswith(FINAL_PREFIX) else final
+        notice = {"ref": ref, "status": "done", "summary": _first_line(body, 60),
+                  "chars": len(body)}
+        print(f"rt_gateway: final {ref} notice degraded "
+              "(store unavailable or ref miss); summary/chars from final body",
+              file=sys.stderr)
+    line = json.dumps(notice, ensure_ascii=False, separators=(",", ":"))
+    return f"{FINAL_NOTICE_PREFIX}{line}"
 
 
 async def _inject_final_when_idle(head: Any, text: str, *, idle_wait_s: float = 120.0) -> bool:
@@ -1179,10 +1231,11 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         # conversation.item.create with input_text content). Finals can land
         # minutes later, after the arming session closed — inject into the
         # currently live head instead of the arming one (a dead head's send
-        # silently no-ops, losing the final).
+        # silently no-ops, losing the final). Payload form per VOICE_FINAL_MODE
+        # (fulltext legacy string / split store notice), shaped in
+        # _final_injection_text — pending buffering below is mode-agnostic.
         async def _on_final(ref: str, final: str) -> None:
-            text = (f"[编排终稿 {ref}] {final}\n"
-                    "请把上述终稿口语播报给用户：原样转述，不添加事实。")
+            text = await _final_injection_text(ref, final)
             head = _live_heads["head"]
             if head is None:
                 # 无活会话（用户已断开）：终稿不丢，等下一个会话接入补投

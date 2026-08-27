@@ -119,9 +119,13 @@ async def test_two_phase_final_injection(backend, captured):
     assert "【凭证R-7734】" in message
     kinds = [k for k, _ in captured["events"]]
     assert "orch.done" in kinds
-    # kg/14 #3: 终稿正文不走 orch.done（无 artifact 键），只经 on_final 回注
+    # kg/14 #3: orch.done 无 artifact 键；PR3 起 body 键携带原始正文
+    # （台账桥数据源），全文回注仍只经 on_final
     dones = [p for k, p in captured["events"] if k == "orch.done"]
     assert dones and all("artifact" not in p for p in dones)
+    assert dones[0]["run_id"] == "run_<redacted>"
+    assert dones[0]["body"] == "调研完成 【凭证R-7734】 结论 23%"
+    assert not dones[0]["body"].startswith('"Agent Final Message"')
 
 
 @pytest.mark.asyncio
@@ -147,6 +151,8 @@ async def test_cancel_by_ref(backend, captured):
     assert dones and all("artifact" not in p for p in dones)
     assert dones[-1]["status"] == "cancelled"
     assert dones[-1]["ref"] == receipt["ref"]
+    # cancel 形态不带 body（无终稿正文可落台账，正文面只有正常完成路径）
+    assert "body" not in dones[-1]
 
 
 @pytest.mark.asyncio
@@ -373,9 +379,12 @@ async def test_dispatch_dag_dependency_waves_and_aggregate(captured):
     assert ("ctx_b2", "echo B") in injected
     assert any(e[0] == "orch.dispatch" and e[1].get("lane") == "b-dag"
                for e in captured["events"])
-    # kg/14 #3: DAG 聚合终稿同样只走 on_final，orch.done 无 artifact
+    # kg/14 #3: DAG 聚合终稿的 orch.done 无 artifact；body = 原始聚合正文
+    # （剥 FINAL_PREFIX），与 on_final 收到的 final 严格互补
     dones = [p for k, p in captured["events"] if k == "orch.done"]
     assert dones and all("artifact" not in p for p in dones)
+    assert dones[0]["run_id"] == "run_beef"
+    assert dones[0]["body"] == final[len(FINAL_PREFIX):]
 
 
 @pytest.mark.asyncio
@@ -594,7 +603,7 @@ async def test_liaison_receipt_full_plan_keeps_tasks(monkeypatch):
         t.cancel()
 
 
-# ---- PR1 (kg/14): orch.done 无 artifact / 终点失败面 orch.failed ----
+# ---- kg/14：orch.done 载荷面（无 artifact、PR3 加 body）+ 终点失败面 ----
 
 def make_phase2_backend(captured, check_messages_reply="", lane_error=False):
     """Backend purpose-built for direct ``_phase2`` drives: the lane only
@@ -625,9 +634,10 @@ def make_phase2_backend(captured, check_messages_reply="", lane_error=False):
 
 
 @pytest.mark.asyncio
-async def test_phase2_done_emits_orch_done_without_artifact(captured):
-    """裁决 #3：orch.done 只带 ref/run_id——正文经 on_final 全文回注
-    （PR1 缺省 fulltext 行为不变），不再随事件外发。"""
+async def test_phase2_done_carries_raw_body(captured):
+    """PR3：orch.done 加 body 键（台账桥数据源）——值是剥掉
+    FINAL_PREFIX 的原始正文；artifact 键仍不存在（裁决 #3），on_final
+    全文回注行为不变。"""
     from rt_dsh_backend import DshDispatch
 
     ref = "vh-<redacted>"
@@ -642,12 +652,107 @@ async def test_phase2_done_emits_orch_done_without_artifact(captured):
     dones = [p for k, p in captured["events"] if k == "orch.done"]
     assert len(dones) == 1
     assert "artifact" not in dones[0]
-    # 只剩 ref/run_id + 总线统一加盖的 ts
-    assert set(dones[0]) == {"ref", "run_id", "ts"}
+    # 只剩 ref/run_id/body + 总线统一加盖的 ts
+    assert set(dones[0]) == {"ref", "run_id", "body", "ts"}
     assert dones[0]["ref"] == ref and dones[0]["run_id"] == "run_<redacted>"
+    assert dones[0]["body"] == "调研完成 【凭证R-AB12CD34】 结论 23%"
     assert captured["finals"], "on_final fulltext re-injection was lost"
     assert "调研完成" in captured["finals"][0][1]
     assert not any(k == "orch.failed" for k, _ in captured["events"])
+
+
+@pytest.mark.asyncio
+async def test_phase2_done_body_strips_final_prefix(captured):
+    """邮箱回执自带 FINAL_PREFIX 时，orch.done.body 与 on_final 正文同为
+    剥前缀后的原始正文——前缀是回注协议包装，不进台账。"""
+    from rt_dsh_backend import DshDispatch
+    from rt_orchestrator import FINAL_PREFIX
+
+    ref = "vh-<redacted>"
+    row = {"seq": 5, "from": "session_orch", "to": "voice-head",
+           "type": "status",
+           "body": f'[ref:{ref}] {FINAL_PREFIX}调研完成 结论 41%'}
+    b = make_phase2_backend(captured,
+                            check_messages_reply=json.dumps(row) + "\n")
+    disp = DshDispatch(run_id="run_<redacted>", task_id=None, ref=ref,
+                       credentials=[])
+    await b._phase2(ref, disp)
+    dones = [p for k, p in captured["events"] if k == "orch.done"]
+    assert len(dones) == 1
+    assert dones[0]["body"] == "调研完成 结论 41%"
+    assert not dones[0]["body"].startswith('"Agent Final Message"')
+    # on_final 收到的仍是 FINAL_PREFIX + 正文（回注协议不变）
+    assert captured["finals"][0][1] == f"{FINAL_PREFIX}调研完成 结论 41%"
+
+
+@pytest.mark.asyncio
+async def test_phase2_dag_deadline_emits_orch_failed(captured):
+    """DAG 预算耗尽仍有任务未结算 → orch.failed（对齐 _phase2 超时形态
+    ref/run_id/reason），不再静默 return——ref 在台账落 status=failed
+    而非永久悬置。"""
+    from rt_dsh_backend import DshDispatch
+
+    async def runner(argv):
+        sub = argv[2]
+        if sub == "start-worker":
+            return ("ctx_deadbeef\n", "")
+        return ("no unread messages\n" if sub == "check-messages" else "", "")
+
+    bus = EventBus()
+
+    async def sink(kind, payload):
+        captured["events"].append((kind, payload))
+
+    bus.subscribe(sink)
+
+    async def on_final(ref, message):
+        captured["finals"].append((ref, message))
+
+    b = DshBackend(lane=DaisLane(runner=runner), bus=bus, on_final=on_final,
+                   await_timeout_s=0.3, poll_s=0.05, poll_max_s=0.1)
+    ref = "vh-dag0123"
+    disp = DshDispatch(run_id="run_dag0123", task_id=None, ref=ref,
+                       credentials=[])
+    disp.dag = [{"task_id": "task_d1", "deps": [], "command": None,
+                 "session": None, "spec": "调研甲"}]
+    disp.dag_ctx = {}
+    await b._phase2_dag(ref, disp)
+    fails = [p for k, p in captured["events"] if k == "orch.failed"]
+    assert len(fails) == 1
+    assert fails[0]["ref"] == ref
+    assert fails[0]["run_id"] == "run_dag0123"
+    assert fails[0]["reason"] == "still running"
+    assert isinstance(fails[0]["ts"], float)
+    assert not any(k == "orch.done" for k, _ in captured["events"])
+    assert not captured["finals"]
+
+
+@pytest.mark.asyncio
+async def test_phase2_lane_a_task_gone_emits_orch_failed(captured):
+    """lane-a 任务被服务端遗忘（重启/回滚）→ orch.failed（终稿不可知，
+    ref 落 failed），不再只发 progress 后静默 return。"""
+    from rt_a2a_client import A2aError
+    from rt_dsh_backend import DshDispatch
+
+    class GoneA2a:
+        async def await_done(self, task_id, timeout_s=600.0):
+            raise A2aError(-2, f"task {task_id} failed: rolled")
+
+    b = make_phase2_backend(captured)
+    b.lane_a = GoneA2a()
+    ref = "vh-la012345"
+    disp = DshDispatch(run_id="t_mock01", task_id=None, ref=ref,
+                       credentials=[])
+    await b._phase2(ref, disp)
+    fails = [p for k, p in captured["events"] if k == "orch.failed"]
+    assert len(fails) == 1
+    assert fails[0]["ref"] == ref
+    assert fails[0]["run_id"] == "t_mock01"
+    assert fails[0]["reason"].startswith("lane-a task gone")
+    assert "rolled" in fails[0]["reason"]
+    assert isinstance(fails[0]["ts"], float)
+    assert not any(k == "orch.done" for k, _ in captured["events"])
+    assert not captured["finals"]
 
 
 @pytest.mark.asyncio

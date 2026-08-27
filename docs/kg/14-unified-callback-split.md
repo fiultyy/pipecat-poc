@@ -1,6 +1,6 @@
 # 14 · 回调分流统一框架（A/B/C/D 合并裁决稿）
 
-依据实读：`rt_gateway.py`（`_on_final`/`_inject_final_when_idle`/`_live_heads`/`main._bridge`/`TOPIC_KINDS`）、`rt_dsh_backend.py`（`_liaison_roundtrip`/`_phase2`/`_runs`）、`rt_head_tools.py`（`DoctrineSource` 五件套）、maestro 信封。子设计 A-Store/B-Protocol/C-Persona/D-Display 有冲突，裁决如下。
+依据实读：`rt_gateway.py`（`_on_final`/`_inject_final_when_idle`/`_live_heads`/`_store_bridge`/`_first_line`/`TOPIC_KINDS`）、`rt_dsh_backend.py`（`_liaison_roundtrip`/`_phase2`/`_phase2_dag`/`_runs`）、`rt_session_store.py`（put/update/get/list）、`rt_head_tools.py`（`DoctrineSource` 五件套）、maestro 信封。子设计 A-Store/B-Protocol/C-Persona/D-Display 有冲突，裁决如下。落地进度：PR1–PR3 已合入（§2.6），PR4/PR5 待办。
 
 ## 1. 冲突裁决
 
@@ -13,7 +13,7 @@
 | 5 | 工具：A `read_final(ref)` vs B `read_body(ref_or_no,max_chars,from_tail)`+`list_bodies` vs C 常驻+no-store 降级 | B 签名+C 降级；`read_final` 弃 |
 | 6 | 回执可见面：B 留 credentials（只不念）vs C 剔出 | C：模型只见 `status/ref/no/summary[/tasks]`；credentials/run_id 落 orch.dispatch 事件+store（三落点对账）。口播金丝雀失效属预期（开放问题 1） |
 | 7 | 通报：B 自然语句内嵌指令 vs C `[编排通报]`+JSON、行为全在 doctrine | C+`no` 字段；注入项不带指令——doctrine 是单事实源，指令随载荷重复即漂移 |
-| 8 | 写入面：A backend 回调直写 vs B bus 订阅+另留 `on_failed` 直连钩子 | B 的 `main._bridge` 订阅为唯一写入面；`on_receipt`/`on_failed` 直连均弃——单路径，backend 不感知 store |
+| 8 | 写入面：A backend 回调直写 vs B bus 订阅+另留 `on_failed` 直连钩子 | B 的 bus 订阅为唯一写入面（落地为 `attach_store_bridge`→`_store_bridge`）；`on_receipt`/`on_failed` 直连均弃——单路径，backend 不感知 store |
 | 9 | 语音会话 kinds：B 不推正文事件 vs D `+= body.push` | D：body.push 是轻通知，喂语音页迷你行；topic 只到客户端壳、不进 head 上下文，无刷屏 |
 | 10 | 状态字段：A `kind=receipt|final` 双字段 / B `final` / C `done` | 去 kind；`status=accepted|running|done|failed|cancelled|timeout`，对齐 orch.done 命名 |
 | 11 | B、C 各占一份 `13-*.md` | 本稿 N14 收编；13-* 降为子设计附录 |
@@ -35,31 +35,36 @@
 - 保留：LRU 500 + **SQLite**（`~/.local/state/voice-gateway/store.db`，WAL；裁决 #4）；dais 信箱读即消费，不作恢复源。
 - query/cancel 的 liaison roundtrip 不入库（body 前缀 STATUS/CANCEL 过滤）。
 
-### 2.2 分流协议（写入面=`main._bridge` 单点）
+### 2.2 分流协议（写入面=`_store_bridge` 单点；✅PR1 建、PR3 body 直载）
 
-orch.dispatch→put(accepted)；orch.done→update(done, body=artifact)+emit body.push+通报注入；新增 orch.failed（`_phase2`/`_phase2_dag` 两处静默 return 处 emit）→update(failed)+通报；cancel 的 orch.done artifact="(已取消)"→status=cancelled。orch.done **不带 artifact**（裁决 #3：正文只走 body.push，无双写期）。progress 零注入 head；心跳不做（裁决 #5），状态留 store 随时查。
+orch.dispatch→put(accepted)；orch.done 载荷 `{ref, run_id, body}`（body=剥 FINAL_PREFIX 的原始终稿正文；cancel 路径无 body）→update(done)+emit body.push；orch.failed→update(failed)+emit body.push，emit 点共四处：`_phase2` 超时、`_phase2` lane 错至 deadline、`_phase2` lane-a task 消失、`_phase2_dag` deadline 到期（对齐 ref/run_id/reason 形态）。bridge 取 payload `body` 优先、旧 `artifact` 哨兵兜底；cancel 语义两形态不变（`status:"cancelled"` 或 artifact="(已取消)"）。artifact 通道停发（裁决 #3）；台账 body 自此有值，body.push 的 title/summary/inline 自然填充。backend 不感知 store、不感知 VOICE_FINAL_MODE（policy 在 gateway）。progress 零注入 head；心跳不做（裁决 #5），状态留 store 随时查。
 
 ### 2.3 head 面
 
-回执（SLIM=1；=0 回旧形 run_id/credentials/note 原样）：
+回执（✅PR2；SLIM=1 缺省，=0 回旧形 run_id/credentials/note 原样）：
 
 ```json
 {"status":"accepted","ref":"vh-<redacted>","no":2,"summary":"已受理，转对接人执行"}
 ```
 
-dispatch_plan 加 `"tasks":3`。完成通报（split 模式，走 `_inject_final_when_idle`/`_live_heads`/pending/`_flush_pending` 原机制，仅换载荷）：
+dispatch_plan 加 `"tasks":3`。终稿投递由 `VOICE_FINAL_MODE` 分支（✅PR3；helper 每次现读 env，仅精确 `split` 激活，缺省 `fulltext` 免重启回退；PR5 验证后翻缺省 split）：
+
+- **fulltext（缺省）**：现行注入串字节级不变——`[编排终稿 ref] final` + 「请把上述终稿口语播报给用户：原样转述，不添加事实。」
+- **split**：纯数据通报，单行 JSON，通报后不接任何指令句（裁决 #7：注入载荷不嵌指令，doctrine 是行为唯一真源，PR2 doctrine 已含 [编排通报] 条款）：
 
 ```json
 [编排通报] {"no":2,"ref":"vh-<redacted>","status":"done","summary":"采纳方案B…","chars":1834}
 ```
 
-注入点同步 emit `head.turn{"phase":"notify",...}`。工具七件套：+`read_body`/`list_bodies`。doctrine=C 稿四段式（回执一句话、通报一句话+详情栏指引、编号默认不念、完整 ref 只给工具）。
+  `no/status/summary/chars` 取 `store.get(ref)`（backend 先 emit orch.done 再调 on_final，时序保证台账已更新）；store 不可用或查不到时降级：ref 照旧、summary/chars 从 final 本体算（剥 FINAL_PREFIX 后 `_first_line(text,60)` 与 len）、no 缺省省略、stderr 告警。两模式共用 `_inject_final_when_idle`/`_live_heads`/pending/`_flush_pending` 原机制——注入串在 `_on_final` 时点定形，缓冲与补投不区分模式。
 
-### 2.4 显示面（rt_voice_app）
+注入点同步 emit `head.turn{"phase":"notify",...}`（PR5）。工具七件套：+`read_body`/`list_bodies`（PR4）。doctrine=C 稿四段式（✅PR2：回执一句话、通报一句话+详情栏指引、编号默认不念、完整 ref 只给工具）。
+
+### 2.4 显示面（rt_voice_app，PR5 待办）
 
 第 6 页签「详情」：左 Treeview（time/no/ref/title/chars，按 ref 去重）+右只读正文；选中→inline 直渲染，否则经观测连接 body.get。语音页加迷你通知行（订 body.push；`DEFAULT_VOICE_KINDS += body.push`）。回合页：notify 相（`TURN_PHASE_LABEL`+"📣"）；body.push 同 ref 追加灰行「└已入详情」。
 
-### 2.5 压缩衔接（零 LLM 确定性快照）
+### 2.5 压缩衔接（零 LLM 确定性快照，PR5 待办）
 
 回合超阈值后下次 turn_idle：从 `store.list()` ∪ `backend._runs−store` 机械拼状态快照，以单 user item 替换历史回执/通报 items，emit head.compact：
 
@@ -73,16 +78,16 @@ dispatch_plan 加 `"tasks":3`。完成通报（split 模式，走 `_inject_final
 
 ### 2.6 迁移（PR 粒度，每步独立验证+回退）
 
-1. **PR1** `rt_session_store.py`+bridge 写入面+body.push/body.get 帧；缺省 fulltext，store 静默积累。验证：派发后 body.get 命中；回退：零行为变化。
-2. **PR2** 回执瘦身+orch.failed emit+no 序号；doctrine 先走 `VOICE_HEAD_DOCTRINE` 外置（零代码回退）。验证：播报一句话；回退：SLIM=0。
-3. **PR3** split 投递：`_on_final` 分流，split 不接 `backend.on_final`（`if self.on_final` 护栏已在）。验证：终稿入库+一句话播报；回退：MODE=fulltext。
-4. **PR4** read_body/list_bodies+kinds 扩展。验证：「查看任务2」可取正文。
-5. **PR5** 详情页+notify 相+head.compact 快照；翻缺省 split。回退矩阵：两开关+doctrine 指回旧稿。
+1. ✅ **PR1**（c82bed4）`rt_session_store.py`（SQLite）+`_store_bridge` 唯一写入面+body.push/body.get 帧；缺省 fulltext，store 静默积累。验证：派发后 body.get 命中；回退：零行为变化。
+2. ✅ **PR2**（3a27293）回执瘦身（VOICE_RECEIPT_SLIM 缺省开）+doctrine 四段式+`_phase2` orch.failed 入观测面；no 序号。验证：播报一句话；回退：SLIM=0。
+3. ✅ **PR3** split 交付：orch.done 载 `body`（cancel 路径无）；bridge body 优先/artifact 哨兵兜底，台账 body 落库；`_on_final` 按 VOICE_FINAL_MODE 分流（split 纯数据通报+store 降级）；`_phase2` lane-a task 消失与 `_phase2_dag` deadline 到期两处静默 return 补 orch.failed；tests 同步（backend/gateway）。回退：MODE=fulltext。
+4. **PR4** read_body/list_bodies 常驻注册（七件套）+kinds 扩展（`DEFAULT_VOICE_KINDS += body.push`）。验证：「查看任务2」可取正文。
+5. **PR5** 详情页（Treeview+右栏只读正文）+notify 相+head.compact 快照；翻缺省 split。回退矩阵：两开关+doctrine 指回旧稿。
 
 ## 3. 开放问题（已全部裁决，2026-08-27 用户拍板）
 
 1. credentials 退出模型上下文——**确认**。念出来本来就多余；对账迁观测面机器比对。
 2. `no` 全局编号，口播直接叫「任务N」——**确认**。
-3. orch.done.artifact——**立即停发**，正文只走 body.push 新通道（不留双写期；`_phase2` emit 处去 artifact）。
+3. orch.done 正文通道——artifact **停发**（PR1 落地）；正文经载荷 `body` 字段直载台账（PR3，无哨兵双写），观测面走 body.push 轻通知（chars≤4096 附 inline）。
 4. 台账载体——**SQLite**（`~/.local/state/voice-gateway/store.db`，WAL；替原 JSONL 方案），LRU 500 条照做。
 5. progress 主动播报——**不做**；状态留在 store（status 字段随时可查），用户问走 query_status。

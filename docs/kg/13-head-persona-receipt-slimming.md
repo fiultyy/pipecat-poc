@@ -1,6 +1,6 @@
 # KG N13 · Head 人格配置化与回执精简化（设计稿）
 
-> 状态：**设计**（未实施）· 2026-08-27 · 配对文档：正文 store 任务（gateway 进程内 store + on_final 一分为二）
+> 状态：**子设计附录**（未单独实施；终稿分流、开关与台账形态以 N14 裁决为准——VOICE_FINAL_DELIVERY 并入 VOICE_FINAL_MODE，通报加 no 字段且取自 store，PR1–PR3 已落地）· 2026-08-27 · 配对文档：正文 store 任务（gateway 进程内 store + on_final 一分为二）
 > 目标：① tools 回执只报状态+极简摘要；② 人格配置化，默认「任务助手：精炼表述、状态优先、正文引用详情栏」；③ After Tool Calls 废除逐字转述；④ read_body 按需读正文。
 > 硬约束：无新进程；渐进迁移可回退；兼容 turn_idle 注入锁、_live_heads 单活 head、topics 观测面。
 
@@ -80,7 +80,7 @@ dispatch_plan 多一个 `tasks`：
 | 2 | `rt_head_tools.py:dsh_head_tools` / 新增 `read_body_tool` | 挂第 6 工具（常驻）；缺 body_store 返回 `{"status":"no-store"}` | 不挂即退（条件注册亦可） |
 | 3 | `rt_dsh_backend.py:_liaison_roundtrip` | 回执瘦身 status/ref/summary[/tasks]；credentials、run_id 仅留 `_runs` 与 orch.dispatch emit | `VOICE_RECEIPT_SLIM=0` |
 | 4 | `rt_dsh_backend.py:dispatch`、`dispatch_dag` | 非 liaison 回执同形瘦身（同开关） | 同上 |
-| 5 | `rt_gateway.py:build_realtime_head` 内 `_on_final` | notice 模式：`store.put(ref, body, summary)` 后仅注入 `[编排通报]{json}`；仍走 `_inject_final_when_idle`/`_final_inject_lock` | `VOICE_FINAL_DELIVERY=fulltext`；body_store 缺席强制 fulltext（双保险） |
+| 5 | `rt_gateway.py:build_realtime_head` 内 `_on_final` | notice 模式：`store.put(ref, body, summary)` 后仅注入 `[编排通报]{json}`；仍走 `_inject_final_when_idle`/`_final_inject_lock` | `VOICE_FINAL_MODE=fulltext`；store 缺席降级 fulltext 形态（双保险） |
 | 6 | `rt_gateway.py:main`（backend 构建处） | body_store 实例注入 backend / app_resources（与配对任务合流点） | — |
 
 开关读取时机：receipt 组装处与 `_on_final` 每次调用现读 env（免重启，与 DoctrineSource 哲学一致）。
@@ -89,9 +89,9 @@ dispatch_plan 多一个 `tasks`：
 
 - **turn_idle 注入锁**：notice 仍走 `_inject_final_when_idle`（`rt_gateway.py:859`），仅文本变短，锁语义不变。
 - **_live_heads 单活**：notice 文本更短，pending 缓冲 / 补投行为不变（`rt_gateway.py:_live_heads`）。
-- **topics 观测面**：不新增 kind；详情栏数据源 = `orch.done.artifact`（现成）+ store（补按 ref 历史查询）。
+- **topics 观测面**：不新增 kind；详情栏数据源 = store + body.push 回放索引（`topic_cache`，N14 §2.2）。
 - **ConversationLog**（`rt_conversation_items.py`）：注入项从全文变通报，`text_chars` 增速大幅下降，compaction 压力减小。
-- **回退成组**：`VOICE_RECEIPT_SLIM=0` + `VOICE_FINAL_DELIVERY=fulltext` + doctrine 指回旧文件 = 完整旧链路。
+- **回退成组**：`VOICE_RECEIPT_SLIM=0` + `VOICE_FINAL_MODE=fulltext` + doctrine 指回旧文件 = 完整旧链路。
 
 ## 9. 迁移顺序
 

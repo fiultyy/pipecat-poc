@@ -908,3 +908,112 @@ async def test_body_push_cancel_via_status_field(tmp_path, monkeypatch):
         assert p["status"] == "cancelled"
         assert store.get("vh-cx")["status"] == "cancelled"
         await close_ws(ws)
+
+
+# ---- J. split 终稿交付（KG 14 §2.2/§2.3，PR3）：bridge 落 body + 通报形态 ----
+
+
+@pytest.mark.asyncio
+async def test_body_push_from_done_body_field(tmp_path, monkeypatch):
+    """orch.done 载荷 body（PR3）→ 台账正文/轻通知 inline 有值；body 优先于
+    旧 artifact 键（裁决 #3 正文单通道，body.push 承载）。"""
+    body = "采纳方案B，收益约41%\n对比明细……"
+    assert len(body) <= rt_gateway.BODY_INLINE_MAX_CHARS  # inline 应有值
+    async with GatewayFixture() as fx:
+        store = await _open_store(fx, tmp_path, monkeypatch)
+        ws = await fx.ws()
+        await observe_handshake(ws)
+        await fx.gw.bus.emit("orch.dispatch", {"ref": "vh-b1", "run_id": "r1"})
+        await fx.gw.bus.emit("orch.done", {
+            "ref": "vh-b1", "run_id": "r1", "body": body})
+        p = await recv_until(ws, lambda d: d.get("t") == "body.push" and d["ref"] == "vh-b1")
+        assert p["status"] == "done" and p["inline"] == body
+        assert p["summary"] == body.splitlines()[0][:60]
+        rec = store.get("vh-b1")
+        assert rec["body"] == body and rec["chars"] == len(body)
+        assert rec["title"] == body.splitlines()[0][:16]
+        # body 优先：两键并存时旧 artifact 不生效
+        await fx.gw.bus.emit("orch.dispatch", {"ref": "vh-b2", "run_id": "r2"})
+        await fx.gw.bus.emit("orch.done", {
+            "ref": "vh-b2", "run_id": "r2", "body": "新正文", "artifact": "旧通道"})
+        p = await recv_until(ws, lambda d: d.get("t") == "body.push" and d["ref"] == "vh-b2")
+        assert p["inline"] == "新正文" and store.get("vh-b2")["body"] == "新正文"
+        await close_ws(ws)
+
+
+def test_final_mode_env_parsing(monkeypatch):
+    """VOICE_FINAL_MODE 仅精确 "split" 激活通报；其余值/未设一律 fulltext。"""
+    monkeypatch.setenv("VOICE_FINAL_MODE", "split")
+    assert rt_gateway._final_mode() == "split"
+    for value in ("fulltext", "SPLIT", "split ", "0", "spoilt"):
+        monkeypatch.setenv("VOICE_FINAL_MODE", value)
+        assert rt_gateway._final_mode() == "fulltext", value
+    monkeypatch.delenv("VOICE_FINAL_MODE", raising=False)
+    assert rt_gateway._final_mode() == "fulltext"
+
+
+@pytest.mark.asyncio
+async def test_final_fulltext_injection_byte_identical(monkeypatch):
+    """回退路径字节级回归：fulltext 注入串与旧实现一字不差（不触台账）。"""
+    monkeypatch.delenv("VOICE_FINAL_MODE", raising=False)
+    rt_gateway._store = None  # fulltext 不得依赖 store 可用性
+    ref, final = "vh-f1", '"Agent Final Message":\n\n采纳方案B\n全文……'
+    text = await rt_gateway._final_injection_text(ref, final)
+    expected = (
+        "[编排终稿 vh-f1] \"Agent Final Message\":\n\n采纳方案B\n全文……\n"
+        "请把上述终稿口语播报给用户：原样转述，不添加事实。"
+    )
+    assert text == expected
+    assert text.encode("utf-8") == expected.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_final_split_notice_from_store(tmp_path, monkeypatch):
+    """split 通报：[编排通报] + 单行 JSON，字段取台账（backend 先 emit
+    orch.done 再调 on_final 的时序前提）；串内无任何指令句（裁决 #7）。"""
+    monkeypatch.setenv("VOICE_FINAL_MODE", "split")
+    body = "采纳方案B，收益约41%\n对比明细……"
+    final = f'"Agent Final Message":\n\n{body}'
+    async with GatewayFixture() as fx:
+        store = await _open_store(fx, tmp_path, monkeypatch)
+        await fx.gw.bus.emit("orch.dispatch", {"ref": "vh-s1", "run_id": "r1"})
+        await fx.gw.bus.emit("orch.done", {"ref": "vh-s1", "run_id": "r1", "body": body})
+        text = await rt_gateway._final_injection_text("vh-s1", final)
+        assert text.startswith(rt_gateway.FINAL_NOTICE_PREFIX)
+        assert "\n" not in text  # 单行：pending 缓冲按行语义不受扰
+        rec = store.get("vh-s1")
+        payload = json.loads(text[len(rt_gateway.FINAL_NOTICE_PREFIX):])
+        assert payload == {"no": rec["no"], "ref": "vh-s1", "status": "done",
+                           "summary": rec["summary"], "chars": rec["chars"]}
+        assert payload["no"] == 1  # no 来自 store 受理分配
+        assert payload["summary"] == body.splitlines()[0][:60]
+        assert payload["chars"] == len(body)
+        for word in ("播报", "转述", "请把"):
+            assert word not in text, f"通报不得嵌指令词：{word}"
+
+
+@pytest.mark.asyncio
+async def test_final_split_notice_degrades_without_record(tmp_path, monkeypatch, capsys):
+    """降级路径：store 查不到（或不可用）→ no 省略、summary/chars 从 final
+    本体算（剥 FINAL_PREFIX），stderr 告警；形态仍是纯数据通报。"""
+    monkeypatch.setenv("VOICE_FINAL_MODE", "split")
+    body = "降级正文首行，恰好超过不了六十字的限制\n第二行"
+    final = f'"Agent Final Message":\n\n{body}'
+    async with GatewayFixture() as fx:
+        await _open_store(fx, tmp_path, monkeypatch)  # store 在、ref 无行
+        text = await rt_gateway._final_injection_text("vh-ghost", final)
+        payload = json.loads(text[len(rt_gateway.FINAL_NOTICE_PREFIX):])
+        assert "no" not in payload
+        assert payload == {"ref": "vh-ghost", "status": "done",
+                           "summary": body.splitlines()[0][:60], "chars": len(body)}
+        for word in ("播报", "转述", "请把"):
+            assert word not in text
+        assert "degraded" in capsys.readouterr().err
+
+        # store 整体不可用：同一条降级路径（_store_call 之外的 None 分支）
+        rt_gateway._store = None
+        text = await rt_gateway._final_injection_text("vh-ghost2", final)
+        payload = json.loads(text[len(rt_gateway.FINAL_NOTICE_PREFIX):])
+        assert "no" not in payload and payload["ref"] == "vh-ghost2"
+        assert payload["summary"] == body.splitlines()[0][:60]
+        assert payload["chars"] == len(body)
