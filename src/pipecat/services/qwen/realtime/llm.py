@@ -4,6 +4,7 @@
 
 """Qwen-Omni-Realtime LLM service implementation (DashScope Realtime WS API)."""
 
+import asyncio
 import json
 
 from loguru import logger
@@ -112,6 +113,19 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             **kwargs,
         )
         self._workspace_id = workspace_id
+        # Protocol-level turn state: cleared on ``response.created``, set on
+        # ``response.done``. Lets callers queue work until the turn ends
+        # instead of racing ``response.create`` into the single
+        # active-response slot — a losing race the server drops silently.
+        self.turn_idle: asyncio.Event = asyncio.Event()
+        self.turn_idle.set()
+
+    def _track_turn_state(self, evt) -> None:
+        """Mirror protocol response lifecycle onto :attr:`turn_idle`."""
+        if evt.type == "response.created":
+            self.turn_idle.clear()
+        elif evt.type == "response.done":
+            self.turn_idle.set()
 
     async def _connect(self):
         try:
@@ -300,6 +314,7 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             except Exception as e:
                 logger.warning(f"{self} skipped unparseable server event: {e}")
                 continue
+            self._track_turn_state(evt)
             try:
                 if await self._dispatch_server_event(evt) == "fatal":
                     return

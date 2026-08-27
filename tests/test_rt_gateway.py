@@ -656,3 +656,84 @@ async def test_tail_reader_stop_event_exits():
     stop.set()
     await asyncio.wait_for(task, timeout=2.0)
     assert events, "至少捕获一次增量后才 stop"
+
+
+# ---- F. 终稿温和排队注入（turn_idle；A 语义：不打断在飞回合）----
+
+
+class IdleFakeHead:
+    """带协议级 turn_idle 信号的 head 替身，记录 send_client_event。"""
+
+    def __init__(self):
+        self.turn_idle = asyncio.Event()
+        self.turn_idle.set()
+        self.sent: list[str] = []
+
+    async def send_client_event(self, event):
+        self.sent.append(type(event).__name__)
+
+
+@pytest.mark.asyncio
+async def test_final_inject_waits_for_turn_idle():
+    from rt_gateway import _inject_final_when_idle
+
+    head = IdleFakeHead()
+    head.turn_idle.clear()  # 用户正在对话（active response）
+    task = asyncio.create_task(_inject_final_when_idle(head, "终稿A"))
+    await asyncio.sleep(0.1)
+    assert not head.sent, "turn 进行中不得注入"
+    assert not task.done(), "注入必须挂起等待而非丢弃"
+
+    head.turn_idle.set()  # 回合结束
+    ok = await asyncio.wait_for(task, timeout=2.0)
+    assert ok is True
+    assert head.sent == ["ConversationItemCreateEvent", "ResponseCreateEvent"]
+
+
+@pytest.mark.asyncio
+async def test_final_inject_without_idle_signal_is_immediate():
+    from rt_gateway import _inject_final_when_idle
+
+    class PlainHead:  # echo 头/旧替身：无 turn_idle 属性
+        def __init__(self):
+            self.sent = []
+
+        async def send_client_event(self, event):
+            self.sent.append(type(event).__name__)
+
+    head = PlainHead()
+    ok = await asyncio.wait_for(_inject_final_when_idle(head, "终稿B"), timeout=2.0)
+    assert ok is True and len(head.sent) == 2, "无信号 head 保持旧行为：直接注入"
+
+
+@pytest.mark.asyncio
+async def test_final_inject_failure_returns_false():
+    from rt_gateway import _inject_final_when_idle
+
+    class DeadHead(IdleFakeHead):
+        async def send_client_event(self, event):
+            raise RuntimeError("websocket closed")
+
+    ok = await asyncio.wait_for(
+        _inject_final_when_idle(DeadHead(), "终稿C"), timeout=2.0)
+    assert ok is False, "注入失败必须返回 False 供调用方重排队"
+
+
+@pytest.mark.asyncio
+async def test_final_inject_serializes_concurrent_finals():
+    from rt_gateway import _inject_final_when_idle
+
+    head = IdleFakeHead()
+
+    async def run(tag: str):
+        return await _inject_final_when_idle(head, tag)
+
+    t1 = asyncio.create_task(run("终稿1"))
+    await asyncio.sleep(0.05)
+    head.turn_idle.clear()  # 第一条注入后自己的 response 活跃
+    t2 = asyncio.create_task(run("终稿2"))
+    await asyncio.sleep(0.1)
+    assert head.sent.count("ResponseCreateEvent") == 1, "第二条必须等第一条的回合结束"
+    head.turn_idle.set()
+    assert await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2.0)
+    assert head.sent.count("ResponseCreateEvent") == 2

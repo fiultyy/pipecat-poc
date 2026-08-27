@@ -851,6 +851,38 @@ class VoiceGateway:
 
 _live_heads: dict = {"head": None, "pending": []}  # 活 head + 无 head 期到达的终稿
 
+# 终稿注入串行锁：并发的终稿（phase-2 多路 + 会话补投）排队走同一个
+# active-response 槽，否则后到的 response.create 撞前一个被服务端静默丢弃。
+_final_inject_lock: asyncio.Lock = asyncio.Lock()
+
+
+async def _inject_final_when_idle(head: Any, text: str, *, idle_wait_s: float = 120.0) -> bool:
+    """终稿以新 user turn 注入；turn 进行中先排队等其结束（不打断用户）。
+
+    ``head.turn_idle`` 是协议级回合信号（response.created 清 / response.done
+    置）。无该信号的 head（echo 头、测试替身）直接注入，保持旧行为。等待超
+    时降级为尽力注入。注入失败返回 False，由调用方重排队不丢终稿。
+    """
+    from pipecat.services.openai.realtime import events as rt_events
+
+    idle = getattr(head, "turn_idle", None)
+    async with _final_inject_lock:
+        if idle is not None and not idle.is_set():
+            try:
+                await asyncio.wait_for(idle.wait(), timeout=idle_wait_s)
+            except asyncio.TimeoutError:
+                pass  # 长独白：降级为尽力注入（同旧行为）
+        try:
+            await head.send_client_event(rt_events.ConversationItemCreateEvent(
+                item=rt_events.ConversationItem(
+                    type="message", role="user",
+                    content=[rt_events.ItemContent(type="input_text", text=text)])))
+            await head.send_client_event(rt_events.ResponseCreateEvent())
+            return True
+        except Exception as e:  # noqa: BLE001 — 失败由调用方重排队
+            print(f"rt_gateway: final inject failed: {e}", file=sys.stderr)
+            return False
+
 
 async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any):
     """真 Qwen realtime 头接到 ws 会话（形制=poc_t6_pipeline.py）。
@@ -960,8 +992,6 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         # minutes later, after the arming session closed — inject into the
         # currently live head instead of the arming one (a dead head's send
         # silently no-ops, losing the final).
-        from pipecat.services.openai.realtime import events as rt_events
-
         async def _on_final(ref: str, final: str) -> None:
             text = (f"[编排终稿 {ref}] {final}\n"
                     "请把上述终稿口语播报给用户：原样转述，不添加事实。")
@@ -972,14 +1002,11 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
                 print(f"rt_gateway: final {ref} buffered (no live head, "
                       f"total={len(_live_heads['pending'])})", file=sys.stderr)
                 return
-            try:
-                await head.send_client_event(rt_events.ConversationItemCreateEvent(
-                    item=rt_events.ConversationItem(
-                        type="message", role="user",
-                        content=[rt_events.ItemContent(type="input_text", text=text)])))
-                await head.send_client_event(rt_events.ResponseCreateEvent())
-            except Exception as e:  # noqa: BLE001 — 注入失败不杀 phase-2
-                print(f"rt_gateway: final inject {ref} failed: {e}", file=sys.stderr)
+            if not await _inject_final_when_idle(head, text):
+                # 注入失败（head 恰在断开窗口等）：同样不丢，重排队
+                _live_heads["pending"].append(text)
+                print(f"rt_gateway: final {ref} requeued (inject failed)",
+                      file=sys.stderr)
 
         backend.on_final = _on_final
 
@@ -999,20 +1026,13 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     if _live_heads["pending"]:
 
         async def _flush_pending() -> None:
-            from pipecat.services.openai.realtime import events as _rt_ev
-
             await asyncio.sleep(2.0)  # 等 session.update 完成
-            for text in _live_heads["pending"]:
-                try:
-                    await head.send_client_event(_rt_ev.ConversationItemCreateEvent(
-                        item=_rt_ev.ConversationItem(
-                            type="message", role="user",
-                            content=[_rt_ev.ItemContent(type="input_text", text=text)])))
-                    await head.send_client_event(_rt_ev.ResponseCreateEvent())
-                    await asyncio.sleep(0.5)
-                except Exception as e:  # noqa: BLE001
-                    print(f"rt_gateway: pending flush failed: {e}", file=sys.stderr)
-            _live_heads["pending"].clear()
+            while _live_heads["pending"]:
+                text = _live_heads["pending"][0]
+                if await _inject_final_when_idle(head, text):
+                    _live_heads["pending"].pop(0)
+                else:
+                    break  # head 不可用：剩余终稿留给下一个会话补投
 
         asyncio.create_task(_flush_pending())
 

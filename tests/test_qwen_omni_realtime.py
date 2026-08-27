@@ -211,10 +211,27 @@ async def test_qwen_omni_realtime_end_to_end():
     assert LLMFullResponseEndFrame in types
     assert ProposedUserStartedSpeakingFrame in types
 
+    # --- turn-state mirror: a completed round leaves the head idle ---
+    assert service.turn_idle.is_set()
+
     # --- teardown: plain socket close (session.finish is rejected by
     # qwen3.5 endpoints; live-probe-verified 2026-08-22) ---
     client_types = {m.get("type") for m in server.received}
     assert "session.finish" not in client_types, "session.finish must not be sent"
+
+
+def test_turn_idle_lifecycle_unit():
+    """turn_idle mirrors response.created/.done without needing a socket."""
+    from types import SimpleNamespace
+
+    service = QwenOmniRealtimeLLMService(api_key="sk-test")
+    assert service.turn_idle.is_set(), "fresh head must start idle"
+    service._track_turn_state(SimpleNamespace(type="response.created"))
+    assert not service.turn_idle.is_set(), "response.created must clear"
+    service._track_turn_state(SimpleNamespace(type="response.done"))
+    assert service.turn_idle.is_set(), "response.done must set"
+    service._track_turn_state(SimpleNamespace(type="response.audio.delta"))
+    assert service.turn_idle.is_set(), "unrelated events must not touch state"
 
 
 def test_server_event_aliases_cover_documented_events():
