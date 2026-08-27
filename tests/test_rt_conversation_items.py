@@ -102,3 +102,71 @@ def test_compactor_trigger_threshold():
     assert c.should_compact() is True
     c2 = ConversationCompactor(log, trigger_chars=200)
     assert c2.should_compact() is False
+
+
+def test_compactor_zero_threshold_disables():
+    log = ConversationLog()
+    log.add("i1", _msg("i1", "user", "x" * 5000))
+    assert ConversationCompactor(log, trigger_chars=0).should_compact() is False
+
+
+# ---- ConversationCompactor：compact plan / state.snapshot（KG 14 §2.5，PR5）----
+
+
+def test_compact_plan_deletes_all_but_open_pairs():
+    log = ConversationLog()
+    log.add("i1", _msg("i1", "user", "查任务"))
+    log.add("i2", _call("i2", "query_status", "call_1", "{}"))
+    log.add("i3", _output("i3", "call_1", '{"runs": 1}'))
+    log.add("i4", _call("i4", "dispatch_intent", "call_2", '{"raw_intent":"X"}'))
+    plan = ConversationCompactor(log).compact_plan()
+    assert plan["delete_ids"] == ["i1", "i2", "i3"], "闭合并的历史项（含整对工具往返）全删"
+    assert plan["pinned"] == 1, "在飞 call_2 钉住"
+    assert plan["before_chars"] == log.text_chars()
+
+
+def test_state_snapshot_store_union_running():
+    log = ConversationLog()
+    c = ConversationCompactor(log)
+    now = 1759300123.4
+    rows = [{"no": 1, "ref": "vh-1a", "status": "done", "summary": "采纳方案B…",
+             "chars": 1834}]
+    running = [
+        {"ref": "vh-1a", "ts": now - 999},    # store 已有 → 沿台账终态，不重复
+        {"ref": "vh-9f", "ts": now - 412.9},  # store 无 → running + elapsed_s
+        {"ref": "", "ts": now},               # 空 ref 弃
+    ]
+    snap = c.state_snapshot(rows, running, now=now)
+    assert snap["t"] == "state.snapshot" and snap["ts"] == now
+    assert snap["tasks"] == [
+        {"no": 1, "ref": "vh-1a", "status": "done",
+         "summary": "采纳方案B…", "chars": 1834},
+        {"ref": "vh-9f", "status": "running", "elapsed_s": 412},
+    ]
+    assert snap["counts"] == {"done": 1, "running": 1}
+
+
+def test_state_snapshot_counts_aggregate():
+    log = ConversationLog()
+    c = ConversationCompactor(log)
+    rows = [
+        {"no": 1, "ref": "vh-a", "status": "done", "summary": "s1", "chars": 10},
+        {"no": 2, "ref": "vh-b", "status": "failed", "summary": "s2", "chars": 0},
+        {"no": 3, "ref": "vh-c", "status": "cancelled", "summary": "s3", "chars": 2},
+    ]
+    snap = c.state_snapshot(rows, [], now=1.0)
+    assert snap["counts"] == {"done": 1, "failed": 1, "cancelled": 1}
+    assert snap["tasks"] == [dict(r) for r in rows]
+
+
+def test_log_add_accepts_mirror_sink_dict_and_drop():
+    log = ConversationLog()
+    log.add("m1", {"item_id": "m1", "type": "message", "role": "user",
+                   "text": "镜像直喂", "name": None, "call_id": None})
+    log.add("m2", {"type": "message", "role": "assistant",
+                   "content": [{"type": "text", "text": "content 提取"}]})
+    assert log.items()[0].text == "镜像直喂"
+    assert log.items()[1].text == "content 提取"
+    assert log.drop("m1").item_id == "m1"
+    assert log.drop("m1") is None
+    assert [i.item_id for i in log.items()] == ["m2"]

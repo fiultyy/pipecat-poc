@@ -6,6 +6,7 @@
 
 import asyncio
 import json
+from typing import Callable
 
 from loguru import logger
 
@@ -55,6 +56,32 @@ _SERVER_EVENT_DROPS = {
     "response.function_call_arguments.delta",
     "session.finished",
 }
+
+
+def _mirror_item_text(item) -> str:
+    """Extract the displayable text of one realtime conversation item."""
+    if item.type == "function_call":
+        return item.arguments or ""
+    if item.type == "function_call_output":
+        return item.output or ""
+    parts = []
+    for c in item.content or []:
+        t = getattr(c, "transcript", None) or getattr(c, "text", None) or ""
+        if t:
+            parts.append(t)
+    return "\n".join(parts)
+
+
+def _mirror_item_dict(item) -> dict:
+    """Flatten one conversation item into the mirror tap's dict form."""
+    return {
+        "item_id": item.id,
+        "type": item.type,
+        "role": item.role,
+        "text": _mirror_item_text(item),
+        "name": item.name,
+        "call_id": item.call_id,
+    }
 
 
 class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
@@ -119,6 +146,16 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
         # active-response slot — a losing race the server drops silently.
         self.turn_idle: asyncio.Event = asyncio.Event()
         self.turn_idle.set()
+        # Optional taps for a client-side conversation mirror and compaction
+        # (kg/14 §2.5). Both default to None — unset, the service behaves
+        # exactly as before.
+        # - mirror_sink: fed one flat dict per conversation.item.added/.done
+        #   handler pass (see ``_mirror_item_dict`` for the field set).
+        # - on_turn_idle: invoked synchronously right after response.done
+        #   settles the turn, in the receive-loop context — schedule async
+        #   work from it, never block.
+        self.mirror_sink: Callable[[dict], None] | None = None
+        self.on_turn_idle: Callable[[], None] | None = None
 
     def _track_turn_state(self, evt) -> None:
         """Mirror protocol response lifecycle onto :attr:`turn_idle`."""
@@ -126,6 +163,11 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             self.turn_idle.clear()
         elif evt.type == "response.done":
             self.turn_idle.set()
+            if self.on_turn_idle is not None:
+                try:
+                    self.on_turn_idle()
+                except Exception as e:
+                    logger.debug(f"{self} on_turn_idle callback failed: {e}")
 
     async def _connect(self):
         try:
@@ -296,6 +338,41 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
         # (sent on speech_started) is the supported way to stop playback, so
         # only drop the local tracking state.
         self._current_audio_response = None
+
+    def _feed_mirror(self, item) -> None:
+        """Feed :attr:`mirror_sink` one item as a flat dict, if subscribed.
+
+        Sink exceptions are contained at debug level: the mirror is an
+        observation tap and must never break the receive path.
+        """
+        if self.mirror_sink is None:
+            return
+        try:
+            self.mirror_sink(_mirror_item_dict(item))
+        except Exception as e:
+            logger.debug(f"{self} mirror_sink failed: {e}")
+
+    async def _handle_evt_conversation_item_added(self, evt):
+        # Mirror before the parent: client-seeded items (gateway final/
+        # snapshot injections) must land in the mirror too, and the parent
+        # returns early on them.
+        self._feed_mirror(evt.item)
+        await super()._handle_evt_conversation_item_added(evt)
+
+    async def _handle_evt_conversation_item_done(self, evt):
+        self._feed_mirror(evt.item)
+        await super()._handle_evt_conversation_item_done(evt)
+
+    async def delete_conversation_item(self, item_id: str) -> None:
+        """Delete one server-side conversation item by id.
+
+        Compaction entry (kg/14 §2.5): the client-side plan deletes every
+        non-pinned item so the server-side context shrinks without a session
+        rollover. The event needs no DashScope rewriting.
+        """
+        await self.send_client_event(
+            openai_realtime.events.ConversationItemDeleteEvent(item_id=item_id)
+        )
 
     async def _receive_task_handler(self):
         # Copied from OpenAIRealtimeLLMService with three DashScope-specific

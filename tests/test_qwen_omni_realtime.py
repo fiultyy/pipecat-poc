@@ -122,6 +122,19 @@ class FakeDashScopeServer:
 
     async def _respond(self, ws):
         rid = {"response_id": "resp_1", "item_id": "item_1", "output_index": 0, "content_index": 0}
+        # A client-seeded conversation item acknowledged in DashScope's
+        # dialect (conversation.item.created), then completed — drives the
+        # parent's added/done handlers and the mirror tap.
+        item = {
+            "id": "item_seed",
+            "object": "realtime.item",
+            "type": "message",
+            "status": "completed",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "帮我查任务2"}],
+        }
+        await ws.send(json.dumps(_evt(type="conversation.item.created", item=item)))
+        await ws.send(json.dumps(_evt(type="conversation.item.done", item=item)))
         await ws.send(
             json.dumps(
                 _evt(type="input_audio_buffer.speech_started", audio_start_ms=0, item_id="item_0")
@@ -164,6 +177,8 @@ async def test_qwen_omni_realtime_end_to_end():
                 )
             ),
         )
+        mirrored: list[dict] = []
+        service.mirror_sink = mirrored.append
         pipeline = Pipeline([service, collector])
         worker = PipelineWorker(pipeline, cancel_on_idle_timeout=False)
         runner = WorkerRunner(handle_sigint=False)
@@ -182,6 +197,7 @@ async def test_qwen_omni_realtime_end_to_end():
                 await asyncio.sleep(0.1)
             # Give the service time to process server events into frames.
             await asyncio.sleep(1.0)
+            await service.delete_conversation_item("item_seed")
             await worker.queue_frame(EndFrame())
 
         await asyncio.wait_for(
@@ -214,6 +230,22 @@ async def test_qwen_omni_realtime_end_to_end():
     # --- turn-state mirror: a completed round leaves the head idle ---
     assert service.turn_idle.is_set()
 
+    # --- mirror tap: conversation.item.added/.done each feed one flat dict ---
+    assert len(mirrored) == 2
+    assert mirrored[0] == {
+        "item_id": "item_seed",
+        "type": "message",
+        "role": "user",
+        "text": "帮我查任务2",
+        "name": None,
+        "call_id": None,
+    }
+    assert mirrored[1]["item_id"] == "item_seed" and mirrored[1]["text"] == "帮我查任务2"
+
+    # --- item deletion (compaction client event) serializes to the wire ---
+    deletes = [m for m in server.received if m.get("type") == "conversation.item.delete"]
+    assert deletes and deletes[-1]["item_id"] == "item_seed"
+
     # --- teardown: plain socket close (session.finish is rejected by
     # qwen3.5 endpoints; live-probe-verified 2026-08-22) ---
     client_types = {m.get("type") for m in server.received}
@@ -226,12 +258,58 @@ def test_turn_idle_lifecycle_unit():
 
     service = QwenOmniRealtimeLLMService(api_key="sk-test")
     assert service.turn_idle.is_set(), "fresh head must start idle"
+    fired: list[int] = []
+    service.on_turn_idle = lambda: fired.append(1)
     service._track_turn_state(SimpleNamespace(type="response.created"))
     assert not service.turn_idle.is_set(), "response.created must clear"
+    assert fired == [], "on_turn_idle fires only on response.done"
     service._track_turn_state(SimpleNamespace(type="response.done"))
     assert service.turn_idle.is_set(), "response.done must set"
+    assert fired == [1]
     service._track_turn_state(SimpleNamespace(type="response.audio.delta"))
     assert service.turn_idle.is_set(), "unrelated events must not touch state"
+    assert fired == [1], "unrelated events must not refire the tap"
+
+
+def test_on_turn_idle_exception_contained():
+    """A broken on_turn_idle sink must not break turn-state tracking."""
+    from types import SimpleNamespace
+
+    service = QwenOmniRealtimeLLMService(api_key="sk-test")
+
+    def boom():
+        raise RuntimeError("sink down")
+
+    service.on_turn_idle = boom
+    service._track_turn_state(SimpleNamespace(type="response.done"))
+    assert service.turn_idle.is_set()
+
+
+def test_mirror_item_dict_flattens_function_call():
+    from pipecat.services.openai.realtime import events as rt_events
+    from pipecat.services.qwen.realtime.llm import _mirror_item_dict
+
+    item = rt_events.ConversationItem(
+        type="function_call", call_id="call_1", name="query_status",
+        arguments='{"ref":"vh-1"}')
+    assert _mirror_item_dict(item) == {
+        "item_id": item.id,
+        "type": "function_call",
+        "role": None,
+        "text": '{"ref":"vh-1"}',
+        "name": "query_status",
+        "call_id": "call_1",
+    }
+
+
+def test_conversation_item_delete_event_serialization():
+    from pipecat.services.openai.realtime import events as rt_events
+
+    evt = rt_events.ConversationItemDeleteEvent(item_id="item_9")
+    dumped = evt.model_dump(exclude_none=True)
+    assert dumped["type"] == "conversation.item.delete"
+    assert dumped["item_id"] == "item_9"
+    assert set(dumped) == {"event_id", "type", "item_id"}
 
 
 def test_server_event_aliases_cover_documented_events():

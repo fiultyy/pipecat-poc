@@ -12,7 +12,10 @@ stdlib tkinter（Notebook 页签）+ sounddevice 原生采集 + numpy FFT + aioh
   静音语义只控采集上行，WS 会话保持；断线 2s 重连续接
 - 观测连接（KG 11 §3 observe:true）：独立 WS，缺省订阅全部 topic——
   编排页（orch.* 任务树+时间线）、回合页（head.turn）、席位页
-  （fleet.snapshot 表）、消息/票板页（bridge.msg + tickets.snapshot）
+  （fleet.snapshot 表）、消息/票板页（bridge.msg + tickets.snapshot）、
+  详情页（body.push 台账：左表右正文，body.get{ref} 拉全文，KG 14 §2.4）
+- 语音页迷你通知行：body.push 到达一行（no/status/summary/chars 量级）；
+  回合页 notify 相（📣）+ 同 ref body.push 追加灰行「└已入详情」
 
 两连接同 token 计入网关并发上限 ≤2（即本客户端独占单 token 配额）。
 帧协议与 rt_gateway.py §1 逐字对齐。
@@ -52,7 +55,7 @@ DB_FLOOR = -60.0
 LOG_SHORT = {
     "orch.dispatch": "派发", "orch.progress": "进展", "orch.done": "终稿",
     "auth.ok": "鉴权", "session.started": "会话", "session.ended": "结束",
-    "gate.resolved": "闸解", "error": "错误",
+    "gate.resolved": "闸解", "error": "错误", "body.push": "台账",
 }
 
 
@@ -161,6 +164,15 @@ class VoiceLink:
                                         self._mute = False
                                     self.rx.put("[回合] "
                                                 + json.dumps(data, ensure_ascii=False)[:200])
+                                elif t == "body.push":
+                                    # KG 14 §2.4 语音页迷你通知行：单条→一行轻通知，
+                                    # 回放批（items）→一行摘要（全文去详情页签）
+                                    if isinstance(data.get("items"), list):
+                                        line = replay_notice_line(data)
+                                    else:
+                                        line = notice_line_from_push(data)
+                                    if line:
+                                        self.rx.put(f"[台账] {line}")
                                 elif t == "error":
                                     self.rx.put(f"[错误] {data.get('code')}: "
                                                 f"{str(data.get('msg'))[:120]}")
@@ -261,6 +273,11 @@ class ObserveLink:
 
     与语音连接生命周期解耦（观测可先于语音开；语音断不影响观测）。
     与 tkinter 只经 obs 队列交换（dict 帧，渲染在 UI 线程）。
+
+    出站请求面（KG 14 §2.4）：``send_request`` 投递客户端帧（body.get 等）
+    ——req 线程队列 → worker 内泵任务在会话开后发送；会话内的 ``error``
+    回包（body_miss 等）是请求级错误，进 obs 队列按帧处理，不断链；
+    握手期 error 仍视为致命（鉴权/协议失败）。
     """
 
     def __init__(self, url: str, token: str, obs: "queue.Queue[dict]", on_state):
@@ -268,8 +285,13 @@ class ObserveLink:
         self.obs, self.on_state = obs, on_state
         self.session_id: str | None = None
         self.topics: list[str] | None = None
+        self.req: "queue.Queue[dict]" = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def send_request(self, req: dict):
+        """线程安全投递客户端帧（UI 线程调用；worker 侧在会话开后发送）。"""
+        self.req.put(req)
 
     def start(self):
         self._stop.clear()
@@ -284,6 +306,21 @@ class ObserveLink:
     def _run(self):
         asyncio.run(self._worker())
 
+    async def _req_pump(self, ws, ready):
+        """req 队列 → 文本帧；握手先行（session.started 前不发——auth 会被
+        网关拒），50ms 轮询线程队列（tk 线程只 put 不碰 ws）。"""
+        await ready.wait()
+        while True:
+            try:
+                req = self.req.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.05)
+                continue
+            try:
+                await ws.send_json(req)
+            except Exception:  # noqa: BLE001 — 连接已断：外层 async for 随即退出重连
+                return
+
     async def _worker(self):
         import aiohttp
 
@@ -294,27 +331,38 @@ class ObserveLink:
                     async with http.ws_connect(self.url, max_msg_size=1 << 21) as ws:
                         await ws.send_json({"t": "auth", "token": self.token})
                         self.on_state("authing")
-                        async for msg in ws:
-                            if self._stop.is_set():
-                                break
-                            if msg.type != aiohttp.WSMsgType.TEXT:
-                                continue
-                            data = json.loads(msg.data)
-                            t = data.get("t", "")
-                            if t == "auth.ok":
-                                self.session_id = data.get("session_id")
-                                await ws.send_json({"t": "session.start",
-                                                    "observe": True,
-                                                    "session_id": self.session_id})
-                            elif t == "session.started":
-                                self.topics = data.get("topics")
-                                self.on_state("open")
-                            elif t == "error":
-                                self.obs.put({"_error": data})
-                                self.on_state(f"error {data.get('code')}")
-                                return
-                            else:
-                                self.obs.put(data)
+                        ready = asyncio.Event()
+                        pump = asyncio.create_task(self._req_pump(ws, ready))
+                        try:
+                            async for msg in ws:
+                                if self._stop.is_set():
+                                    break
+                                if msg.type != aiohttp.WSMsgType.TEXT:
+                                    continue
+                                data = json.loads(msg.data)
+                                t = data.get("t", "")
+                                if t == "auth.ok":
+                                    self.session_id = data.get("session_id")
+                                    await ws.send_json({"t": "session.start",
+                                                        "observe": True,
+                                                        "session_id": self.session_id})
+                                elif t == "session.started":
+                                    self.topics = data.get("topics")
+                                    self.on_state("open")
+                                    ready.set()
+                                elif t == "error":
+                                    if self.topics is not None:
+                                        # 会话内请求级错误（body.get miss 等）：
+                                        # 按普通帧下发，由请求方回填，不断链
+                                        self.obs.put(data)
+                                    else:
+                                        self.obs.put({"_error": data})
+                                        self.on_state(f"error {data.get('code')}")
+                                        return
+                                else:
+                                    self.obs.put(data)
+                        finally:
+                            pump.cancel()
             except Exception as e:  # noqa: BLE001 — 断线重连面
                 self.obs.put({"_link": f"{type(e).__name__}: {str(e)[:100]}"})
             # asyncio-native wait (this coroutine owns the loop thread; a
@@ -374,10 +422,14 @@ def orch_tree_lines(frames: list[dict]) -> list[str]:
     return lines
 
 
-def st_write(widget, line: str):
-    """ScrolledText 追加一行并滚尾（state 恢复 disabled）。"""
+def st_write(widget, line: str, tags: "tuple[str, ...] | list[str]" = ()):
+    """ScrolledText 追加一行并滚尾（state 恢复 disabled）；tags 上文本样式。"""
+    text = line.rstrip("\n") + "\n"
     widget.config(state="normal")
-    widget.insert("end", line.rstrip("\n") + "\n")
+    if tags:
+        widget.insert("end", text, tuple(tags))
+    else:
+        widget.insert("end", text)
     widget.see("end")
     widget.config(state="disabled")
 
@@ -389,12 +441,110 @@ TURN_PHASE_LABEL = {
 }
 
 
+def turn_label_with_notify(phase: str) -> str:
+    """head.turn phase → 显示图标；notify 相=📣（KG 14 §2.4 回合页）。"""
+    if phase == "notify":
+        return "📣"
+    return TURN_PHASE_LABEL.get(phase, "·")
+
+
 def turn_line(frame: dict) -> str:
-    """head.turn 帧 → 单行呈现（phase 图标 + detail 截断）。"""
+    """head.turn 帧 → 单行呈现（phase 图标 + detail 截断；notify 无 detail
+    时回退显示 ref——通报帧只带 conv_id/phase/ref，ref 即检索线索）。"""
     phase = frame.get("phase", "?")
-    icon = TURN_PHASE_LABEL.get(phase, "·")
+    icon = turn_label_with_notify(phase)
     detail = str(frame.get("detail", "") or "")[:80]
+    if not detail and phase == "notify" and frame.get("ref"):
+        detail = f"→ {frame.get('ref')}"
     return f"{icon} {phase}{(' ' + detail) if detail else ''}"
+
+
+def chars_mag(n) -> str:
+    """字数 → 量级短写（512 / 1.2k / 38k）。"""
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n < 1000:
+        return str(n)
+    if n < 10000:
+        return f"{n / 1000:.1f}k"
+    return f"{n // 1000}k"
+
+
+def notice_line_from_push(frame: dict) -> str:
+    """body.push 单条帧 → 语音页迷你通知行（no/status/summary/chars 量级）；
+    无 ref 的畸形帧返回 ""。"""
+    if not isinstance(frame, dict) or not frame.get("ref"):
+        return ""
+    no = frame.get("no")
+    who = f"#{no}" if no not in (None, "") else str(frame.get("ref"))
+    summary = str(frame.get("summary") or frame.get("title") or "")[:40]
+    return f"📣 {who} {frame.get('status', '?')} {summary}（{chars_mag(frame.get('chars'))}字）"
+
+
+def replay_notice_line(frame: dict) -> str:
+    """body.push 回放帧（items 批）→ 语音页单行摘要；非回放/空批返回 ""。"""
+    items = frame.get("items") if isinstance(frame, dict) else None
+    if not isinstance(items, list) or not items:
+        return ""
+    return f"📣 台账回放 {len(items)} 条（详情页签查看）"
+
+
+DETAIL_COLS = ("time", "no", "ref", "title", "chars")
+DETAIL_REF_I = DETAIL_COLS.index("ref")
+
+
+def detail_rows_from_push(frame: dict) -> list[tuple]:
+    """body.push 帧 → 详情表行 (time/no/ref/title/chars)。
+
+    单条帧（ref/inline 形）出一行；回放帧（items 批、无 inline）按批
+    出多行；无 ref 条目与非 dict 条目跳过。行序=帧内序（合并时去重）。
+    """
+    if not isinstance(frame, dict):
+        return []
+    items = frame.get("items")
+    src = [e for e in items if isinstance(e, dict)] if isinstance(items, list) \
+        else ([frame] if frame.get("ref") else [])
+    rows = []
+    for e in src:
+        if not e.get("ref"):
+            continue
+        ts = e.get("ts")
+        when = time.strftime("%H:%M:%S", time.localtime(ts)) \
+            if isinstance(ts, (int, float)) else ""
+        rows.append((when, str(e.get("no", "") if e.get("no") is not None else ""),
+                     str(e.get("ref")), str(e.get("title", "") or "")[:28],
+                     str(e.get("chars", 0))))
+    return rows
+
+
+def merge_detail_rows(prev: list[tuple], new: list[tuple]) -> list[tuple]:
+    """详情表行按 ref 去重合并：已见 ref 原位更新值（行不跳动），
+    新 ref 追加尾部。"""
+    out = {r[DETAIL_REF_I]: r for r in prev}
+    for r in new:
+        out[r[DETAIL_REF_I]] = r
+    return list(out.values())
+
+
+def detail_ack_line(frame: dict, notify_refs) -> str | None:
+    """body.push 帧 → 回合页灰行「└已入详情」；ref 未在回合页出现过
+    （无 notify 相）则 None——灰行只标已通报过的任务。"""
+    if not isinstance(frame, dict):
+        return None
+    ref = frame.get("ref")
+    if not ref or ref not in set(notify_refs or ()):
+        return None
+    return f"└ 已入详情 {ref}"
+
+
+def detail_error_line(frame: dict) -> str:
+    """error 帧（body.get 失败回包）→ 详情右栏提示行。"""
+    if not isinstance(frame, dict):
+        return "⚠ 未知错误"
+    parts = [str(frame.get("code") or "?"), str(frame.get("msg", "") or "")[:120]]
+    return "⚠ " + " ".join(p for p in parts if p)
 
 
 class PushToTalk:
@@ -441,6 +591,12 @@ class App:
         self.obs_q: "queue.Queue[dict]" = queue.Queue()
         self.obs_link: ObserveLink | None = None
         self.orch_frames: list[dict] = []      # orch.* 帧序（树渲染源）
+        # 详情页签状态（KG 14 §2.4）：表行（按 ref 去重）+ inline/拉取两级正文缓存
+        self.detail_rows: list[tuple] = []
+        self.detail_inline: dict[str, str] = {}    # ref → inline 轻通知全文
+        self.detail_bodies: dict[str, str] = {}    # ref → body.get 拉取全文
+        self._detail_pending: str | None = None    # 在途 body.get 的 ref
+        self._notify_refs: set[str] = set()        # 回合页已见 notify 相的 ref
         self.stream: sd.InputStream | None = None
 
         root.title("rt-voice · ONE 桌面客户端（语音+观测）")
@@ -517,6 +673,7 @@ class App:
         self.turn_log = scrolledtext.ScrolledText(turn_tab, font=("monospace 9"),
                                                   state="disabled", wrap="word")
         self.turn_log.pack(fill="both", expand=True)
+        self.turn_log.tag_configure("dim", foreground="#8a8a8a")  # 「└已入详情」灰行
 
         fleet_tab = ttk.Frame(self.nb, padding=6)
         self.nb.add(fleet_tab, text=" 席位 ")
@@ -536,6 +693,27 @@ class App:
                                                      state="disabled", wrap="none", height=10)
         self.tickets_log.pack(fill="both", expand=True)
 
+        # ---- 详情页签（KG 14 §2.4）：左台账表（按 ref 去重）+ 右只读正文 ----
+        detail_tab = ttk.Frame(self.nb, padding=6)
+        self.nb.add(detail_tab, text=" 详情 ")
+        detail_pane = self.ttk.PanedWindow(detail_tab, orient="horizontal")
+        detail_pane.pack(fill="both", expand=True)
+        detail_left = ttk.Frame(detail_pane)
+        detail_right = ttk.Frame(detail_pane)
+        detail_pane.add(detail_left, weight=3)
+        detail_pane.add(detail_right, weight=4)
+        self.detail_tree = ttk.Treeview(detail_left, columns=DETAIL_COLS,
+                                        show="headings", height=18, selectmode="browse")
+        for c, w in zip(DETAIL_COLS, (76, 44, 130, 280, 52)):
+            self.detail_tree.heading(c, text=c)
+            self.detail_tree.column(c, width=w, anchor="w")
+        self.detail_tree.pack(fill="both", expand=True)
+        self.detail_tree.bind("<<TreeviewSelect>>", self._on_detail_select)
+        self.detail_body = scrolledtext.ScrolledText(detail_right,
+                                                     font=("monospace 9"),
+                                                     state="disabled", wrap="word")
+        self.detail_body.pack(fill="both", expand=True)
+
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._draw_spectrum(np.zeros(BARS))
         self._tick()
@@ -543,6 +721,7 @@ class App:
         if not self.token:
             self.log_write("[提示] 未配置令牌——gateway 开启鉴权时会收到 auth 错误")
         if selftest:
+            root.after(200, self._selftest_probe)
             root.after(700, root.destroy)
 
     # ---- 连接 ----
@@ -589,7 +768,20 @@ class App:
                 self._render_orch()
                 st_write(self.orch_log, f"{t} {json.dumps(f, ensure_ascii=False)[:160]}")
             elif t == "head.turn":
+                if f.get("phase") == "notify" and f.get("ref"):
+                    self._notify_refs.add(str(f["ref"]))
                 st_write(self.turn_log, turn_line(f))
+            elif t == "body.push":
+                self._on_body_push(f)
+            elif t == "body.item":
+                self._on_body_item(f)
+            elif t == "error":
+                # 会话内请求级错误（body.get miss 等）：在途详情回填右栏
+                if self._detail_pending:
+                    self._render_detail_body(detail_error_line(f))
+                    self._detail_pending = None
+                else:
+                    st_write(self.orch_log, f"[观测错误] {detail_error_line(f)}")
             elif t == "fleet.snapshot":
                 self._render_fleet(f)
             elif t == "bridge.msg":
@@ -613,6 +805,91 @@ class App:
         self.fleet_tree.delete(*self.fleet_tree.get_children())
         for row in rows:
             self.fleet_tree.insert("", "end", values=row)
+
+    # ---- 详情页签（KG 14 §2.4：表按 ref 去重，正文两级缓存+观测拉取） ----
+
+    def _on_body_push(self, frame: dict):
+        """body.push（单条/回放批）→ 入表去重 + inline 缓存 + 回合页灰行。"""
+        rows = detail_rows_from_push(frame)
+        if not rows:
+            return
+        self.detail_rows = merge_detail_rows(self.detail_rows, rows)
+        self._render_detail()
+        inline = frame.get("inline")
+        if isinstance(inline, str) and inline and frame.get("ref"):
+            self.detail_inline[str(frame["ref"])] = inline
+        ack = detail_ack_line(frame, self._notify_refs)
+        if ack:
+            st_write(self.turn_log, ack, tags=("dim",))
+
+    def _on_body_item(self, frame: dict):
+        """body.item（body.get 回包）→ 全文缓存；正选中该 ref 则回填右栏。"""
+        ref = str(frame.get("ref", "") or "")
+        text = str(frame.get("text", "") or "")
+        if not ref:
+            return
+        self.detail_bodies[ref] = text
+        if self._detail_pending == ref:
+            self._detail_pending = None
+        if ref == self._selected_detail_ref():
+            self._render_detail_body(text)
+
+    def _render_detail(self):
+        sel = self._selected_detail_ref()   # 增量重绘保住选中行
+        self.detail_tree.delete(*self.detail_tree.get_children())
+        for row in self.detail_rows:
+            # iid=ref：去重已由 merge 保证，选中路径直接拿 ref
+            self.detail_tree.insert("", "end", iid=row[DETAIL_REF_I], values=row)
+        if sel and self.detail_tree.exists(sel):
+            self.detail_tree.selection_set(sel)
+
+    def _render_detail_body(self, text: str):
+        self.detail_body.config(state="normal")
+        self.detail_body.delete("1.0", "end")
+        self.detail_body.insert("1.0", text)
+        self.detail_body.config(state="disabled")
+
+    def _selected_detail_ref(self) -> str:
+        sel = self.detail_tree.selection()
+        if not sel:
+            return ""
+        values = self.detail_tree.item(sel[0], "values")
+        return str(values[2]) if values and len(values) > DETAIL_REF_I else ""
+
+    def _on_detail_select(self, _e=None):
+        """行选中 → inline/已拉取缓存直渲染，否则经观测连接 body.get{ref}。"""
+        ref = self._selected_detail_ref()
+        if not ref:
+            return
+        body = self.detail_bodies.get(ref) or self.detail_inline.get(ref)
+        if body is not None:
+            self._detail_pending = None
+            self._render_detail_body(body)
+            return
+        if not (self.obs_link and self.obs_link._thread
+                and self.obs_link._thread.is_alive()):
+            self._render_detail_body("（观测连接未开——开启「观测」后选择行可拉取正文）")
+            return
+        self._detail_pending = ref
+        self._render_detail_body(f"（拉取中 {ref} …）")
+        self.obs_link.send_request({"t": "body.get", "ref": ref})
+
+    def _selftest_probe(self):
+        """selftest 冒烟（无显示环境 CI）：假帧走真实渲染路径——回放批入表、
+        notify 相记 ref、单条 push 入表+灰行、body.item 回填缓存。不触网。"""
+        now = time.time()
+        self.obs_q.put({"t": "body.push", "items": [
+            {"ref": "vh-self1", "no": 1, "status": "done", "title": "回放标题",
+             "summary": "回放摘要", "chars": 12, "ts": now - 60},
+            {"ref": "", "no": 9, "status": "done", "title": "无 ref 跳过", "chars": 1},
+        ], "ts": now})
+        self.obs_q.put({"t": "head.turn", "phase": "notify", "ref": "vh-self2",
+                        "conv_id": "s-self"})
+        self.obs_q.put({"t": "body.push", "ref": "vh-self2", "no": 2, "status": "done",
+                        "title": "直播标题", "summary": "直播摘要", "chars": 4096,
+                        "inline": "inline 正文", "ts": now})
+        self.obs_q.put({"t": "body.item", "ref": "vh-self1", "title": "回放标题",
+                        "text": "全文正文", "chars": 4, "ts": now})
 
     def end_session(self):
         """优雅收尾需要一帧 session.end——经由 tx 旁路不便，此处仅断链。

@@ -118,6 +118,10 @@ class DshDispatch:
     ref: str
     credentials: list[str] = field(default_factory=list)
     intent_seq: int = -1
+    # Construction time ≈ dispatch time; the gateway's compaction snapshot
+    # reads it for the ``elapsed_s`` of runs the store has no terminal row
+    # for yet (kg/14 §2.5).
+    ts: float = field(default_factory=time.time)
 
 
 @dataclass

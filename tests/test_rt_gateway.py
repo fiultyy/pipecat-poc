@@ -945,20 +945,21 @@ async def test_body_push_from_done_body_field(tmp_path, monkeypatch):
 
 
 def test_final_mode_env_parsing(monkeypatch):
-    """VOICE_FINAL_MODE 仅精确 "split" 激活通报；其余值/未设一律 fulltext。"""
-    monkeypatch.setenv("VOICE_FINAL_MODE", "split")
-    assert rt_gateway._final_mode() == "split"
-    for value in ("fulltext", "SPLIT", "split ", "0", "spoilt"):
-        monkeypatch.setenv("VOICE_FINAL_MODE", value)
-        assert rt_gateway._final_mode() == "fulltext", value
+    """PR5 翻缺省：未设/杂值一律 split；仅精确 "fulltext" 回旧全文。"""
     monkeypatch.delenv("VOICE_FINAL_MODE", raising=False)
+    assert rt_gateway._final_mode() == "split"
+    monkeypatch.setenv("VOICE_FINAL_MODE", "fulltext")
     assert rt_gateway._final_mode() == "fulltext"
+    for value in ("split", "SPLIT", "FULLTEXT", "fulltext ", "0", "spoilt", ""):
+        monkeypatch.setenv("VOICE_FINAL_MODE", value)
+        assert rt_gateway._final_mode() == "split", value
 
 
 @pytest.mark.asyncio
 async def test_final_fulltext_injection_byte_identical(monkeypatch):
-    """回退路径字节级回归：fulltext 注入串与旧实现一字不差（不触台账）。"""
-    monkeypatch.delenv("VOICE_FINAL_MODE", raising=False)
+    """回退路径字节级回归：VOICE_FINAL_MODE=fulltext 注入串与旧实现一字不差
+    （不触台账）。"""
+    monkeypatch.setenv("VOICE_FINAL_MODE", "fulltext")
     rt_gateway._store = None  # fulltext 不得依赖 store 可用性
     ref, final = "vh-f1", '"Agent Final Message":\n\n采纳方案B\n全文……'
     text = await rt_gateway._final_injection_text(ref, final)
@@ -1088,3 +1089,339 @@ async def test_realtime_head_wires_voice_store_into_app_resources(monkeypatch):
     res = wired["app_resources"]
     assert res["dsh_backend"] is backend
     assert res["voice_store"] is rt_gateway._get_store()
+
+
+# ---- L. head.compact + notify 相 + 翻缺省缺省形态（KG 14 §2.5/§2.3，PR5）----
+
+
+@pytest.mark.asyncio
+async def test_final_split_is_default_without_env(tmp_path, monkeypatch):
+    """翻缺省：未设 env 即 split 通报，字段取台账（store 有行时）。"""
+    monkeypatch.delenv("VOICE_FINAL_MODE", raising=False)
+    body = "缺省即分流\n第二行"
+    final = f'"Agent Final Message":\n\n{body}'
+    async with GatewayFixture() as fx:
+        store = await _open_store(fx, tmp_path, monkeypatch)
+        await fx.gw.bus.emit("orch.dispatch", {"ref": "vh-d0", "run_id": "r0"})
+        await fx.gw.bus.emit("orch.done", {"ref": "vh-d0", "run_id": "r0", "body": body})
+        text = await rt_gateway._final_injection_text("vh-d0", final)
+        assert text.startswith(rt_gateway.FINAL_NOTICE_PREFIX)
+        rec = store.get("vh-d0")
+        payload = json.loads(text[len(rt_gateway.FINAL_NOTICE_PREFIX):])
+        assert payload == {"no": rec["no"], "ref": "vh-d0", "status": "done",
+                           "summary": rec["summary"], "chars": rec["chars"]}
+        for word in ("播报", "转述", "请把"):
+            assert word not in text
+
+
+@pytest.mark.asyncio
+async def test_final_default_split_degrades_without_store(monkeypatch):
+    """翻缺省后的降级面：store 不可用 → 字段从终稿本体算，仍是纯数据通报。"""
+    monkeypatch.delenv("VOICE_FINAL_MODE", raising=False)
+    rt_gateway._store = None
+    body = "降级本体"
+    final = f'"Agent Final Message":\n\n{body}'
+    text = await rt_gateway._final_injection_text("vh-d9", final)
+    payload = json.loads(text[len(rt_gateway.FINAL_NOTICE_PREFIX):])
+    assert payload == {"ref": "vh-d9", "status": "done",
+                       "summary": "降级本体", "chars": len(body)}
+
+
+def test_compact_threshold_env_parsing(monkeypatch):
+    """VOICE_COMPACT_CHARS：缺省 20000、0 关、非法值回落缺省。"""
+    monkeypatch.delenv("VOICE_COMPACT_CHARS", raising=False)
+    assert rt_gateway._compact_threshold() == 20000
+    monkeypatch.setenv("VOICE_COMPACT_CHARS", "5000")
+    assert rt_gateway._compact_threshold() == 5000
+    monkeypatch.setenv("VOICE_COMPACT_CHARS", "0")
+    assert rt_gateway._compact_threshold() == 0
+    monkeypatch.setenv("VOICE_COMPACT_CHARS", "abc")
+    assert rt_gateway._compact_threshold() == 20000
+
+
+class CompactFakeHead:
+    """压缩路径 head 替身：turn_idle 置位 + 记录发出的客户端事件。"""
+
+    def __init__(self):
+        self.turn_idle = asyncio.Event()
+        self.turn_idle.set()
+        self.events: list = []
+
+    async def send_client_event(self, event):
+        self.events.append(event)
+
+
+def _mirror_items(log):
+    """喂一段过阈值的镜像（含一个在飞工具调用）。"""
+    log.add("i1", {"type": "message", "role": "user", "text": "查一下任务2的正文"})
+    log.add("i2", {"type": "function_call", "name": "read_body",
+                   "call_id": "call_1", "arguments": '{"ref":"vh-1"}'})
+    log.add("i3", {"type": "message", "role": "assistant", "text": "好的" * 500})
+
+
+@pytest.mark.asyncio
+async def test_compact_runs_deletes_snapshot_and_emits(tmp_path, monkeypatch):
+    """过线压缩全链：非 pinned 逐项 delete → 单条 state.snapshot user item
+    （tasks=store ∪ 运行登记−store，running 带 elapsed_s）→ head.compact。"""
+    import time
+    import types
+
+    from rt_conversation_items import ConversationCompactor, ConversationLog
+
+    async with GatewayFixture() as fx:
+        await _open_store(fx, tmp_path, monkeypatch)
+        rt_gateway._store.put({
+            "ref": "vh-d1", "no": 1, "status": "done",
+            "title": "完成稿", "summary": "完成稿摘要", "body": "完成稿全文",
+        })
+        log = ConversationLog()
+        _mirror_items(log)
+        compactor = ConversationCompactor(log, trigger_chars=100)
+        assert compactor.should_compact()
+        head = CompactFakeHead()
+        backend = types.SimpleNamespace(_runs={
+            "vh-r1": types.SimpleNamespace(ts=time.time() - 412.2)})
+        emitted: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        assert await rt_gateway._run_compaction(
+            head, log, compactor, conv_id="s-c1", backend=backend,
+            emit=emit) is True
+
+        deletes = [e for e in head.events
+                   if type(e).__name__ == "ConversationItemDeleteEvent"]
+        assert [e.item_id for e in deletes] == ["i1", "i3"], "在飞 call_1 钉住不删"
+        creates = [e for e in head.events
+                   if type(e).__name__ == "ConversationItemCreateEvent"]
+        assert len(creates) == 1
+        snap_text = creates[0].item.content[0].text
+        assert "\n" not in snap_text, "快照串必须单行"
+        snap = json.loads(snap_text)
+        assert snap["t"] == "state.snapshot"
+        assert [t["ref"] for t in snap["tasks"]] == ["vh-d1", "vh-r1"]
+        assert snap["tasks"][0] == {"no": 1, "ref": "vh-d1", "status": "done",
+                                    "summary": "完成稿摘要", "chars": 5}
+        assert snap["tasks"][1]["status"] == "running"
+        assert 412 <= snap["tasks"][1]["elapsed_s"] <= 413
+        assert snap["counts"] == {"done": 1, "running": 1}
+        # 镜像 = 钉住项 + 快照项（与服务端同 id，echo 到来时原位更新）
+        assert [i.item_id for i in log.items()] == ["i2", creates[0].item.id]
+        assert log.items()[1].role == "user" and log.items()[1].text == snap_text
+        # head.compact 事件形态（§2.5）
+        assert len(emitted) == 1
+        kind, payload = emitted[0]
+        assert kind == "head.compact"
+        assert payload["conv_id"] == "s-c1" and payload["reason"] == "threshold"
+        assert payload["pinned"] == 1
+        assert payload["before_chars"] > payload["after_chars"] > 0
+        assert isinstance(payload["ts"], float)
+
+
+@pytest.mark.asyncio
+async def test_compact_prefers_typed_delete_helper(tmp_path, monkeypatch):
+    """qwen 头的 typed 删除助手优先（_send_item_delete 分派）。"""
+    from rt_conversation_items import ConversationCompactor, ConversationLog
+
+    class TypedDeleteHead(CompactFakeHead):
+        def __init__(self):
+            super().__init__()
+            self.deleted: list[str] = []
+
+        async def delete_conversation_item(self, item_id):
+            self.deleted.append(item_id)
+
+    async with GatewayFixture() as fx:
+        await _open_store(fx, tmp_path, monkeypatch)
+        log = ConversationLog()
+        _mirror_items(log)
+        compactor = ConversationCompactor(log, trigger_chars=100)
+        head = TypedDeleteHead()
+
+        async def emit(kind, payload):
+            pass
+
+        assert await rt_gateway._run_compaction(
+            head, log, compactor, conv_id="s-t1", emit=emit) is True
+        assert head.deleted == ["i1", "i3"]
+        assert not [e for e in head.events
+                    if type(e).__name__ == "ConversationItemDeleteEvent"]
+
+
+@pytest.mark.asyncio
+async def test_compact_skips_below_threshold_or_disabled(tmp_path, monkeypatch):
+    """锁内复检阈值：未过线 / 0 关闭 → 零发送零 emit。"""
+    from rt_conversation_items import ConversationCompactor, ConversationLog
+
+    async with GatewayFixture() as fx:
+        await _open_store(fx, tmp_path, monkeypatch)
+        log = ConversationLog()
+        log.add("i1", {"type": "message", "role": "user", "text": "短会话"})
+        head = CompactFakeHead()
+        emitted: list = []
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        below = ConversationCompactor(log, trigger_chars=10_000)
+        assert await rt_gateway._run_compaction(
+            head, log, below, conv_id="s-c0", emit=emit) is False
+        off = ConversationCompactor(log, trigger_chars=0)
+        assert await rt_gateway._run_compaction(
+            head, log, off, conv_id="s-c0", emit=emit) is False
+        assert head.events == [] and emitted == []
+
+
+@pytest.mark.asyncio
+async def test_compact_aborts_when_turn_never_idle(tmp_path, monkeypatch):
+    """turn 不空闲（等不到 idle）→ 放弃本轮不降级：零删除零 emit。"""
+    from rt_conversation_items import ConversationCompactor, ConversationLog
+
+    async with GatewayFixture() as fx:
+        await _open_store(fx, tmp_path, monkeypatch)
+        log = ConversationLog()
+        _mirror_items(log)
+        compactor = ConversationCompactor(log, trigger_chars=100)
+        head = CompactFakeHead()
+        head.turn_idle.clear()
+        emitted: list = []
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        assert await rt_gateway._run_compaction(
+            head, log, compactor, conv_id="s-b1", emit=emit,
+            idle_wait_s=0.05) is False
+        assert head.events == [] and emitted == []
+
+
+@pytest.mark.asyncio
+async def test_compact_waits_for_final_inject_lock(tmp_path, monkeypatch):
+    """锁序：终稿注入锁被持有时压缩挂起，释放后才执行（不竞态）。"""
+    from rt_conversation_items import ConversationCompactor, ConversationLog
+
+    async with GatewayFixture() as fx:
+        await _open_store(fx, tmp_path, monkeypatch)
+        # 独立锁：模块级锁跨测试事件循环复用会绑定首个 loop
+        monkeypatch.setattr(rt_gateway, "_final_inject_lock", asyncio.Lock())
+        log = ConversationLog()
+        _mirror_items(log)
+        compactor = ConversationCompactor(log, trigger_chars=100)
+        head = CompactFakeHead()
+        emitted: list = []
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        async with rt_gateway._final_inject_lock:
+            task = asyncio.create_task(rt_gateway._run_compaction(
+                head, log, compactor, conv_id="s-l1", emit=emit))
+            await asyncio.sleep(0.15)
+            assert not task.done() and head.events == [], "压缩必须等终稿注入锁"
+        assert await asyncio.wait_for(task, timeout=3.0) is True
+        assert emitted and emitted[0][0] == "head.compact"
+
+
+@pytest.mark.asyncio
+async def test_arm_compaction_taps_mirror_and_turn_idle(tmp_path, monkeypatch):
+    """build 侧挂的 tap：mirror_sink 喂镜像；on_turn_idle 过线才排压缩任务。"""
+    import types
+
+    from rt_conversation_items import ConversationCompactor, ConversationLog
+
+    async with GatewayFixture() as fx:
+        await _open_store(fx, tmp_path, monkeypatch)
+        head = CompactFakeHead()
+        log = ConversationLog()
+        compactor = ConversationCompactor(log, trigger_chars=100)
+        session = types.SimpleNamespace(conv_id="s-arm")
+        emitted: list = []
+
+        async def emit(kind, payload):
+            emitted.append((kind, payload))
+
+        rt_gateway._arm_compaction(head, log, compactor, session=session,
+                                   backend=None, emit=emit)
+        head.mirror_sink({"item_id": "i1", "type": "message", "role": "user",
+                          "text": "问好", "name": None, "call_id": None})
+        assert [i.item_id for i in log.items()] == ["i1"]
+        head.on_turn_idle()  # 未过线：不排任务
+        await asyncio.sleep(0.1)
+        assert head.events == [] and emitted == []
+        head.mirror_sink({"item_id": "i2", "type": "message", "role": "assistant",
+                          "text": "长" * 200, "name": None, "call_id": None})
+        assert compactor.should_compact()
+        head.on_turn_idle()
+        for _ in range(40):
+            if emitted:
+                break
+            await asyncio.sleep(0.05)
+        assert len(emitted) == 1 and emitted[0][0] == "head.compact"
+        assert emitted[0][1]["conv_id"] == "s-arm"
+        # 压缩后镜像落快照项，二次 on_turn_idle 不再触发
+        head.on_turn_idle()
+        await asyncio.sleep(0.1)
+        assert len(emitted) == 1
+
+
+@pytest.mark.asyncio
+async def test_head_compact_topic_subscribable():
+    """head.compact 入 SUBSCRIBABLE 面：observe 缺省订阅回显 + 帧下发。"""
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        started = await observe_handshake(ws)
+        assert "head.compact" in started["topics"]
+        await fx.gw.bus.emit("head.compact", {
+            "conv_id": "s-x", "before_chars": 21340, "after_chars": 512,
+            "pinned": 3, "reason": "threshold"})
+        got = await recv_until(ws, lambda d: d.get("t") == "head.compact")
+        assert got["conv_id"] == "s-x" and got["reason"] == "threshold"
+        assert got["before_chars"] == 21340 and got["after_chars"] == 512
+        assert got["pinned"] == 3 and isinstance(got["ts"], float)
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_final_inject_calls_on_injected_after_sends():
+    """notify 钩子时序：create+response.create 发出后才调用（注入成功点）。"""
+    head = IdleFakeHead()
+
+    async def on_injected():
+        head.sent.append("notify")
+
+    ok = await rt_gateway._inject_final_when_idle(
+        head, "终稿N", on_injected=on_injected)
+    assert ok is True
+    assert head.sent == ["ConversationItemCreateEvent", "ResponseCreateEvent", "notify"]
+
+
+@pytest.mark.asyncio
+async def test_final_inject_failure_skips_on_injected():
+    class DeadHead(IdleFakeHead):
+        async def send_client_event(self, event):
+            raise RuntimeError("websocket closed")
+
+    calls: list = []
+
+    async def on_injected():
+        calls.append(1)
+
+    ok = await rt_gateway._inject_final_when_idle(
+        DeadHead(), "终稿X", on_injected=on_injected)
+    assert ok is False and calls == []
+
+
+@pytest.mark.asyncio
+async def test_notify_phase_head_turn_shape_reaches_observers():
+    """notify 相 payload 经观测面可达：head.turn{phase:notify,ref} 全字段。"""
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await observe_handshake(ws)
+        await fx.gw.bus.emit("head.turn", {
+            "conv_id": "s-n1", "phase": "notify", "ref": "vh-n1"})
+        got = await recv_until(
+            ws, lambda d: d.get("t") == "head.turn" and d.get("phase") == "notify")
+        assert got["conv_id"] == "s-n1" and got["ref"] == "vh-n1"
+        assert isinstance(got["ts"], float)
+        await close_ws(ws)

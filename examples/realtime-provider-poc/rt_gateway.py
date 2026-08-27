@@ -17,9 +17,15 @@
   ``attach_store_bridge`` 唯一写入面（orch.dispatch→put、orch.done/orch.failed
   →update+emit ``body.push`` 轻通知）；``body.get``→``body.item``/``error
   body_miss``；轻通知索引入 ``topic_cache`` 回放（最近 50 条、无 body）
-- 终稿投递形态（KG 14 §2.3 PR3）— ``VOICE_FINAL_MODE=split|fulltext``（缺省
-  fulltext）：split 注入 ``[编排通报]`` 单行 JSON（字段取台账，缺席降级从终稿
-  本体算，不接指令句）；fulltext 保持旧全文串
+- 终稿投递形态（KG 14 §2.3；PR5 翻缺省）— ``VOICE_FINAL_MODE=split|fulltext``
+  （缺省 ``split``）：split 注入 ``[编排通报]`` 单行 JSON（字段取台账，缺席降级从终稿
+  本体算，不接指令句）；仅精确 ``fulltext`` 回旧全文串（免重启回退）
+- 会话压缩（KG 14 §2.5，PR5）— ``ConversationLog`` 镜像服务端 items +
+  ``ConversationCompactor`` 零 LLM 快照：每次 turn_idle 检查阈值
+  （``VOICE_COMPACT_CHARS`` 缺省 20000、0 关），过线则在终稿注入锁内逐项
+  ``conversation.item.delete``（open 工具对钉住）+ 单条 ``state.snapshot``
+  user item 注入（tasks=store.list ∪ backend 运行登记−store），emit
+  ``head.compact``；不换会话、doctrine 不动
 
 帧协议（§1）：JSON 文本帧（control/event）+ 二进制帧（raw PCM16LE/16k/mono，
 推荐 20ms=640B）。握手序：``auth`` → ``auth.ok{session_id}`` →
@@ -92,6 +98,7 @@ FINAL_NOTICE_PREFIX = "[编排通报] "
 # topic.* 观测事件全集（KG 11 §1；console P1 数据平面）
 TOPIC_KINDS = (
     "head.turn",         # head 回合生命周期（TurnTrace，KG 11 §1 phase 表）
+    "head.compact",      # 会话压缩通报（KG 14 §2.5：{conv_id,before/after_chars,pinned,reason}）
     "fleet.snapshot",    # ~/.dsh/maestro/fleet.json 字节变更 → 全量 JSON 快照
     "bridge.msg",        # ~/.dsh/maestro/bridge/inbox.log 增量行
     "tickets.snapshot",  # ~/.dsh/maestro/tickets.md 变更 → 全文快照（render 覆写非追加）
@@ -1050,7 +1057,7 @@ async def attach_store_bridge(gateway: "VoiceGateway") -> Callable[[], None] | N
 # ---- live 阶段（W4.1 e2e）：真 pipecat 头，惰性导入，单测不触达 ----
 
 
-_live_heads: dict = {"head": None, "pending": []}  # 活 head + 无 head 期到达的终稿
+_live_heads: dict = {"head": None, "pending": []}  # 活 head + 无 head 期到达的终稿 (ref, 注入串)
 
 # 终稿注入串行锁：并发的终稿（phase-2 多路 + 会话补投）排队走同一个
 # active-response 槽，否则后到的 response.create 撞前一个被服务端静默丢弃。
@@ -1058,10 +1065,11 @@ _final_inject_lock: asyncio.Lock = asyncio.Lock()
 
 
 def _final_mode() -> str:
-    """终稿投递形态（KG 14 裁决 #2）：仅 ``VOICE_FINAL_MODE`` 精确等于
-    ``"split"`` 时走台账通报，其余值（含未设）回落全文注入——policy 只在
-    gateway，backend 不感知；改 env 即切形态，无需重启即回退。"""
-    return "split" if os.environ.get("VOICE_FINAL_MODE") == "split" else "fulltext"
+    """终稿投递形态（KG 14 裁决 #2；PR5 翻缺省 split）：仅 ``VOICE_FINAL_MODE``
+    精确等于 ``"fulltext"`` 时走旧全文注入（回退路径），其余值（含未设）走
+    台账通报——policy 只在 gateway，backend 不感知；改 env 即切形态，无需
+    重启即回退。"""
+    return "fulltext" if os.environ.get("VOICE_FINAL_MODE") == "fulltext" else "split"
 
 
 async def _final_injection_text(ref: str, final: str) -> str:
@@ -1096,12 +1104,20 @@ async def _final_injection_text(ref: str, final: str) -> str:
     return f"{FINAL_NOTICE_PREFIX}{line}"
 
 
-async def _inject_final_when_idle(head: Any, text: str, *, idle_wait_s: float = 120.0) -> bool:
+async def _inject_final_when_idle(
+    head: Any,
+    text: str,
+    *,
+    idle_wait_s: float = 120.0,
+    on_injected: Callable[[], Awaitable[None]] | None = None,
+) -> bool:
     """终稿以新 user turn 注入；turn 进行中先排队等其结束（不打断用户）。
 
     ``head.turn_idle`` 是协议级回合信号（response.created 清 / response.done
     置）。无该信号的 head（echo 头、测试替身）直接注入，保持旧行为。等待超
-    时降级为尽力注入。注入失败返回 False，由调用方重排队不丢终稿。
+    时降级为尽力注入。注入成功（response.create 已发）后调用 ``on_injected``
+    （notify 相上报）再返回 True；失败路径不调用。注入失败返回 False，由
+    调用方重排队不丢终稿。
     """
     from pipecat.services.openai.realtime import events as rt_events
 
@@ -1118,10 +1134,139 @@ async def _inject_final_when_idle(head: Any, text: str, *, idle_wait_s: float = 
                     type="message", role="user",
                     content=[rt_events.ItemContent(type="input_text", text=text)])))
             await head.send_client_event(rt_events.ResponseCreateEvent())
+            if on_injected is not None:
+                await on_injected()
             return True
         except Exception as e:  # noqa: BLE001 — 失败由调用方重排队
             print(f"rt_gateway: final inject failed: {e}", file=sys.stderr)
             return False
+
+
+# ---- 会话压缩（KG 14 §2.5，PR5）：零 LLM 确定性快照 ----
+
+COMPACT_KIND = "head.compact"
+COMPACT_IDLE_WAIT_S = 30.0
+
+
+def _compact_threshold() -> int:
+    """压缩触发阈值：``VOICE_COMPACT_CHARS`` 覆写（缺省 20000 字），``0``
+    关闭压缩；非法值回落缺省。"""
+    try:
+        return int(os.environ.get("VOICE_COMPACT_CHARS", ""))
+    except ValueError:
+        return 20_000
+
+
+async def _send_item_delete(head: Any, item_id: str) -> None:
+    """发一条 ``conversation.item.delete``：realtime 头有 typed 助手方法
+    （qwen）优先，鸭子头（测试替身）回落裸事件。"""
+    deleter = getattr(head, "delete_conversation_item", None)
+    if deleter is not None:
+        await deleter(item_id)
+        return
+    from pipecat.services.openai.realtime import events as rt_events
+
+    await head.send_client_event(rt_events.ConversationItemDeleteEvent(item_id=item_id))
+
+
+async def _run_compaction(
+    head: Any,
+    log: Any,
+    compactor: Any,
+    *,
+    conv_id: str | None,
+    backend: Any = None,
+    emit: Callable[[str, dict], Awaitable[None]],
+    idle_wait_s: float = COMPACT_IDLE_WAIT_S,
+) -> bool:
+    """执行一次压缩（kg/14 §2.5）。全程持终稿注入锁——不与终稿注入竞态。
+
+    锁内先复检阈值（并发的 turn_idle 信号可能已压缩过）、再等 turn_idle，
+    然后逐项 ``conversation.item.delete`` 非 pinned 项（open 工具对钉住；
+    每删一项同步镜像，部分失败即中止，服务端/镜像不漂移）→ 注入单条
+    ``state.snapshot`` user item（快照串单行 JSON；tasks=store.list() ∪
+    backend 运行登记−store，running 带 elapsed_s；零 LLM）→ emit
+    ``head.compact``。不建新会话、session.instructions/doctrine 不动。
+    返回是否完成了一次压缩。
+    """
+    from pipecat.services.openai.realtime import events as rt_events
+
+    async with _final_inject_lock:
+        if not compactor.should_compact():
+            return False
+        idle = getattr(head, "turn_idle", None)
+        if idle is not None and not idle.is_set():
+            try:
+                await asyncio.wait_for(idle.wait(), timeout=idle_wait_s)
+            except asyncio.TimeoutError:
+                print("rt_gateway: compact skipped (turn never went idle)",
+                      file=sys.stderr)
+                return False  # 不降级：下一轮 turn_idle 复检再试
+        plan = compactor.compact_plan()
+        store = _get_store()
+        rows = await _store_call(store.list) if store is not None else []
+        running = [{"ref": ref, "ts": getattr(d, "ts", 0)}
+                   for ref, d in (getattr(backend, "_runs", None) or {}).items()]
+        snapshot = compactor.state_snapshot(rows or [], running, now=time.time())
+        text = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        for item_id in plan["delete_ids"]:
+            try:
+                await _send_item_delete(head, item_id)
+            except Exception as e:  # noqa: BLE001 — 部分失败中止，下轮重试
+                print(f"rt_gateway: compact delete {item_id} failed: {e}",
+                      file=sys.stderr)
+                return False
+            log.drop(item_id)
+        snap_id = "snap-" + uuid.uuid4().hex[:8]
+        try:
+            await head.send_client_event(rt_events.ConversationItemCreateEvent(
+                item=rt_events.ConversationItem(
+                    id=snap_id, type="message", role="user",
+                    content=[rt_events.ItemContent(type="input_text", text=text)])))
+        except Exception as e:  # noqa: BLE001
+            print(f"rt_gateway: compact snapshot inject failed: {e}", file=sys.stderr)
+            return False
+        log.add(snap_id, {"type": "message", "role": "user", "text": text})
+        await emit(COMPACT_KIND, {
+            "conv_id": conv_id,
+            "before_chars": plan["before_chars"],
+            "after_chars": log.text_chars(),
+            "pinned": plan["pinned"],
+            "reason": "threshold",
+            "ts": time.time(),
+        })
+        return True
+
+
+def _arm_compaction(
+    head: Any,
+    log: Any,
+    compactor: Any,
+    *,
+    session: Any,
+    backend: Any,
+    emit: Callable[[str, dict], Awaitable[None]],
+) -> None:
+    """挂镜像/阈值两个 tap 到 realtime 头（kg/14 §2.5）。
+
+    ``mirror_sink`` 喂 :class:`ConversationLog`（服务端 item 镜像，added/
+    done 都进，item_id 去重更新）；``on_turn_idle`` 在 response.done 置位后
+    检查阈值，过线才排压缩任务（锁序由 ``_run_compaction`` 保证）。conv_id
+    取触发时点的 ``session.conv_id``（构建时会话尚未领 id）。头无这两个
+    回调面（非 qwen provider）时属性照设、无人调用，零影响。
+    """
+    def _mirror(item: dict) -> None:
+        log.add(item["item_id"], item)
+
+    def _on_idle() -> None:
+        if not compactor.should_compact():
+            return
+        asyncio.create_task(_run_compaction(
+            head, log, compactor, conv_id=session.conv_id,
+            backend=backend, emit=emit))
+
+    head.mirror_sink = _mirror
+    head.on_turn_idle = _on_idle
 
 
 async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any):
@@ -1153,6 +1298,7 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     from pipecat.workers.runner import WorkerRunner
 
     from providers import RealtimeHeadConfig, RealtimeProtocol, RealtimeProvider, create_realtime_head
+    from rt_conversation_items import ConversationCompactor, ConversationLog
     from rt_head_tools import DoctrineSource, dsh_head_tools
 
     transcript = TranscriptState()
@@ -1211,6 +1357,10 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
 
     observer = _HeadObserver()
 
+    # 会话压缩（kg/14 §2.5）：镜像 + 阈值 tap；阈值读一次（env 覆写）。
+    conv_log = ConversationLog()
+    compactor = ConversationCompactor(conv_log, trigger_chars=_compact_threshold())
+
     head = create_realtime_head(
         RealtimeHeadConfig(
             provider=RealtimeProvider.QWEN,
@@ -1225,6 +1375,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
             tools=tools,
         )
     )
+    _arm_compaction(head, conv_log, compactor,
+                    session=session, backend=backend, emit=bus.emit)
 
     if getattr(backend, "liaison_session", ""):
         # Liaison finals come back on the voice-head dais mailbox; re-inject
@@ -1235,18 +1387,25 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         # silently no-ops, losing the final). Payload form per VOICE_FINAL_MODE
         # (fulltext legacy string / split store notice), shaped in
         # _final_injection_text — pending buffering below is mode-agnostic.
+        # Injection success also emits head.turn phase="notify" (kg/14 §2.3).
+        def _notify(ref: str) -> Callable[[], Awaitable[None]]:
+            async def _emit_notify() -> None:
+                await bus.emit("head.turn", {"conv_id": session.conv_id,
+                                             "phase": "notify", "ref": ref})
+            return _emit_notify
+
         async def _on_final(ref: str, final: str) -> None:
             text = await _final_injection_text(ref, final)
             head = _live_heads["head"]
             if head is None:
                 # 无活会话（用户已断开）：终稿不丢，等下一个会话接入补投
-                _live_heads["pending"].append(text)
+                _live_heads["pending"].append((ref, text))
                 print(f"rt_gateway: final {ref} buffered (no live head, "
                       f"total={len(_live_heads['pending'])})", file=sys.stderr)
                 return
-            if not await _inject_final_when_idle(head, text):
+            if not await _inject_final_when_idle(head, text, on_injected=_notify(ref)):
                 # 注入失败（head 恰在断开窗口等）：同样不丢，重排队
-                _live_heads["pending"].append(text)
+                _live_heads["pending"].append((ref, text))
                 print(f"rt_gateway: final {ref} requeued (inject failed)",
                       file=sys.stderr)
 
@@ -1270,8 +1429,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         async def _flush_pending() -> None:
             await asyncio.sleep(2.0)  # 等 session.update 完成
             while _live_heads["pending"]:
-                text = _live_heads["pending"][0]
-                if await _inject_final_when_idle(head, text):
+                ref, text = _live_heads["pending"][0]
+                if await _inject_final_when_idle(head, text, on_injected=_notify(ref)):
                     _live_heads["pending"].pop(0)
                 else:
                     break  # head 不可用：剩余终稿留给下一个会话补投
