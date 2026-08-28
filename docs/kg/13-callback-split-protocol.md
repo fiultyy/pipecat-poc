@@ -40,13 +40,26 @@ progress 零注入的理由：realtime 每回合全量计费，TailReader 2s/条
 每步 2+ 条，注入即 user item + response.create，一分钟可塞几十条，刷屏
 且每条都触发播报。用户主动问进度走既有 `query_status`。
 
-## 3. head 工具面（五件套 → 七件套）
+## 3. head 工具面（五件套 → 七件套 → 十二件套）
 
 `read_body(ref_or_no, max_chars=4000, from_tail=False)` /
 `list_bodies()`。用户说「看看那个报告」→ head 先 `list_bodies` 定位
 （`latest_final_no`）→ `read_body` 取正文；正文只在用户主动要时进上下文，
 且默认截断。handler 从 `params.app_resources["body_store"]` 解析
 （与 `dsh_backend` 同一 wiring 模式）。
+
+PR7 追加工作区文件五件套：`find_files(pattern, limit)` /
+`grep_files(pattern, path, include, limit)` /
+`read_file(path, offset, limit)` /
+`edit_file(path, old_string, new_string, replace_all)` /
+`write_file(path, content)`。根取
+`params.app_resources["workspace_root"]`（rt_gateway：`VOICE_WORKSPACE`
+覆写，缺省仓库根）；路径 resolve 后必须落在根内（越界 error 不钳制）；
+量限封顶（find≤200 条/扫 2 万文件、grep≤100 条/扫 5000 文件/单文件≤2MB、
+read≤1000 行且单行≤1000 字符、write≤65536 字符）；垃圾目录
+（.git/node_modules/__pycache__/.venv 等）与二进制一律剪掉。doctrine：
+读取类中间步骤不出声，edit/write 完成只回一个状态，不念文件内容、
+不倒 diff。
 
 ## 4. 人格与回退
 
@@ -179,7 +192,7 @@ rt_gateway.py
 rt_head_tools.py
 
 - 新增 `read_body_tool` / `list_bodies_tool`（§7）。
-- `dsh_head_tools()` — 返回七件套。
+- `dsh_head_tools()` — 返回十二件套（七件套 + PR7 工作区文件五件套）。
 - `DSH_TOOLS_DOCTRINE` — "After Tool Calls" 段重写：只念 `speak`；
   终稿/失败通报照念；详情按需 `read_body`；progress 不播；人格默认
   「任务助手精炼表述」。

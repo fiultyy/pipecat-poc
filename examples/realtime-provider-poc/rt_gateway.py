@@ -1008,6 +1008,14 @@ def _get_store() -> Any:
     return _store
 
 
+def _workspace_root() -> str:
+    """文件工具的工作区根：``VOICE_WORKSPACE`` 覆写，缺省取仓库根。"""
+    env = (os.environ.get("VOICE_WORKSPACE") or "").strip()
+    if env:
+        return env
+    return str(Path(__file__).resolve().parents[2])
+
+
 async def _store_call(fn: Callable, *a, **kw) -> Any:
     """store 调用统一包装：``asyncio.to_thread`` 包裹（store 为同步 API，
     见其模块头约定）；任何失败只 stderr 告警、返回 None，绝不抛——
@@ -1443,7 +1451,7 @@ def _arm_compaction(
 async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any):
     """真 Qwen realtime 头接到 ws 会话（形制=poc_t6_pipeline.py）。
 
-    providers 工厂 + dsh_head_tools() 四件套 + observer（transcript 镜像、
+    providers 工厂 + dsh_head_tools() 工具面 + observer（transcript 镜像、
     TTS 下发、head.turn）；上行 InputAudioRawFrame 入管线，下行
     TTSAudioRawFrame → session.send_audio。
     """
@@ -1591,7 +1599,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         Pipeline([aggregators.user(), head, aggregators.assistant()]),
         cancel_on_idle_timeout=False,
         observers=[observer],
-        app_resources={"dsh_backend": backend, "voice_store": _get_store()},
+        app_resources={"dsh_backend": backend, "voice_store": _get_store(),
+                       "workspace_root": _workspace_root()},
     )
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)

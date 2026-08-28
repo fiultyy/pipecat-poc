@@ -25,10 +25,15 @@ from rt_head_tools import (  # noqa: E402
     cancel_run_tool,
     dispatch_intent_tool,
     dispatch_plan_tool,
+    edit_file_tool,
+    find_files_tool,
+    grep_files_tool,
     list_bodies_tool,
     query_status_tool,
     read_body_tool,
+    read_file_tool,
     remain_silent_tool,
+    write_file_tool,
 )
 
 
@@ -375,14 +380,17 @@ def test_dsh_head_tools_registry():
     assert names == {
         "dispatch_intent_tool", "dispatch_plan_tool", "query_status_tool",
         "read_body_tool", "list_bodies_tool", "cancel_run_tool",
-        "remain_silent_tool",
+        "remain_silent_tool", "find_files_tool", "grep_files_tool",
+        "read_file_tool", "edit_file_tool", "write_file_tool",
     }
-    assert len(dsh_head_tools()) == 7
+    assert len(dsh_head_tools()) == 12
 
 
 def test_doctrine_covers_all_tools_and_two_phase_rule():
     for name in ("dispatch_intent", "dispatch_plan", "query_status",
-                 "read_body", "list_bodies", "cancel_run", "remain_silent"):
+                 "read_body", "list_bodies", "cancel_run", "remain_silent",
+                 "find_files", "grep_files", "read_file", "edit_file",
+                 "write_file"):
         assert name in DSH_TOOLS_DOCTRINE
 
 
@@ -449,3 +457,159 @@ def test_doctrine_after_calls_covers_read_tools():
     # C 降级话术：miss/error 各有口径，不编造
     assert "miss" in clause and "error" in clause
     assert "暂不可用" in clause and "不编造" in clause
+
+
+def test_doctrine_file_tools_clause():
+    """文件工具条款：读取类不出声；edit/write 一句话状态；不倒 diff。"""
+    after = DSH_TOOLS_DOCTRINE.split("# After Tool Calls")[1]
+    clause = next(ln for ln in after.splitlines() if "find_files/grep_files" in ln)
+    assert "中间步骤不出声" in clause and "改好了" in clause
+    assert "不念文件内容" in clause and "diff" in clause
+    assert "不编造" in clause
+    tools = DSH_TOOLS_DOCTRINE.split("# Tools")[1].split("# After Tool Calls")[0]
+    edit_clause = next(ln for ln in tools.splitlines() if ln.startswith("- edit_file"))
+    assert "完全一致" in edit_clause and "replace_all" in edit_clause
+
+
+# ---- 工作区文件五件套 ----
+
+
+def ws_params(root) -> FakeParams:
+    return FakeParams(app_resources={"workspace_root": str(root)})
+
+
+@pytest.fixture
+def ws(tmp_path):
+    """最小工作区：源码 + 子包 + 垃圾目录 + 二进制文件。"""
+    (tmp_path / "app.py").write_text(
+        "def run():\n    return 1\n\n\ndef stop():\n    return run()\n",
+        encoding="utf-8")
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "util.py").write_text("VALUE = 7\n", encoding="utf-8")
+    (tmp_path / "notes.md").write_text("# 笔记\n正文\n", encoding="utf-8")
+    junk = tmp_path / "node_modules"
+    junk.mkdir()
+    (junk / "j.js").write_text("junk junk junk\n", encoding="utf-8")
+    gitdir = tmp_path / ".git"
+    gitdir.mkdir()
+    (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (tmp_path / "data.bin").write_bytes(b"\x00\x01\x02binary")
+    return tmp_path
+
+
+@pytest.mark.asyncio
+async def test_file_tools_without_workspace_root(ws):
+    params = FakeParams(app_resources={})
+    for fn, args in ((find_files_tool, ("*.py",)), (grep_files_tool, ("run",)),
+                     (read_file_tool, ("app.py",)),
+                     (edit_file_tool, ("app.py", "a", "b")),
+                     (write_file_tool, ("x.txt", "hi"))):
+        await fn(params, *args)
+    assert all(r == {"status": "error", "reason": "工作区不可用"}
+               for r in params.results)
+
+
+@pytest.mark.asyncio
+async def test_read_file_window_numbering_and_clip(ws):
+    params = ws_params(ws)
+    long_line = "x" * 1500
+    (ws / "long.py").write_text("one\n" + long_line + "\nthree\n", encoding="utf-8")
+    await read_file_tool(params, "long.py", offset=2, limit=2)
+    out = params.results[0]
+    assert out["status"] == "ok" and out["total_lines"] == 3
+    assert out["offset"] == 2 and out["returned"] == 2
+    assert out["lines"][0].startswith("2: ") and out["lines"][0].endswith("…")
+    assert len(out["lines"][0]) <= 1005
+    assert out["lines"][1] == "3: three"
+    # 缺省窗口：整文件（小文件）；limit 上限收敛
+    await read_file_tool(params, "pkg/util.py")
+    assert params.results[-1]["lines"] == ["1: VALUE = 7"]
+    await read_file_tool(params, "app.py", limit="9999")  # 字串数字也要收敛
+    assert params.results[-1]["returned"] == 6  # app.py 共 6 行（上限 1000 未起作用）
+
+
+@pytest.mark.asyncio
+async def test_read_file_miss_and_escape(ws):
+    params = ws_params(ws)
+    await read_file_tool(params, "nope.py")
+    assert params.results[0] == {"status": "miss", "path": "nope.py"}
+    for escape in ("../../etc/passwd", "/etc/passwd"):
+        await read_file_tool(params, escape)
+        assert params.results[-1]["status"] == "error" and "越界" in params.results[-1]["reason"]
+    await read_file_tool(params, "")
+    assert params.results[-1]["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_find_files_glob_skips_junk(ws):
+    params = ws_params(ws)
+    await find_files_tool(params, "*.py")
+    out = params.results[0]
+    assert out["status"] == "ok" and out["files"] == ["app.py", "pkg/util.py"]
+    await find_files_tool(params, "pkg/*.py")  # 含 "/"：按相对路径整体匹配
+    assert params.results[-1]["files"] == ["pkg/util.py"]
+    await find_files_tool(params, "*.zzz")
+    assert params.results[-1]["count"] == 0
+    await find_files_tool(params, "*", limit=1)
+    assert len(params.results[-1]["files"]) == 1  # limit 生效
+
+
+@pytest.mark.asyncio
+async def test_grep_files_match_include_limit_scope(ws):
+    params = ws_params(ws)
+    await grep_files_tool(params, "return")  # app.py 两处 + 垃圾目录已被剪掉
+    out = params.results[0]
+    assert out["status"] == "ok" and out["count"] == 2
+    assert all(m["path"] == "app.py" for m in out["matches"])
+    assert out["matches"][0] == {"path": "app.py", "line": 2, "text": "return 1"}
+    await grep_files_tool(params, "return", path="pkg")  # 子目录无命中
+    assert params.results[-1]["count"] == 0
+    await grep_files_tool(params, "junk")  # node_modules 被剪，搜不到
+    assert params.results[-1]["count"] == 0
+    await grep_files_tool(params, "run", limit=1)
+    out = params.results[-1]
+    assert out["count"] == 1 and out["truncated"] is True
+    await grep_files_tool(params, "(unclosed")  # 非法正则
+    assert params.results[-1]["status"] == "error" and "正则" in params.results[-1]["reason"]
+    await grep_files_tool(params, "run", path="nope/")  # 子目录不存在
+    assert params.results[-1] == {"status": "miss", "path": "nope/"}
+    await grep_files_tool(params, "binary")  # 二进制（含 \x00）跳过
+    assert params.results[-1]["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_edit_file_unique_ambiguous_replace_all(ws):
+    params = ws_params(ws)
+    await edit_file_tool(params, "app.py", "return 1", "return 42")
+    out = params.results[0]
+    assert out["status"] == "ok" and out["replacements"] == 1
+    assert "return 42" in (ws / "app.py").read_text(encoding="utf-8")
+    dup = ws / "dup.txt"
+    dup.write_text("foo A\nfoo B\n", encoding="utf-8")
+    await edit_file_tool(params, "dup.txt", "foo ", "bar ")  # 两处：拒绝
+    out = params.results[-1]
+    assert out["status"] == "error" and "2 处匹配" in out["reason"]
+    assert dup.read_text(encoding="utf-8") == "foo A\nfoo B\n"  # 未写入
+    await edit_file_tool(params, "dup.txt", "foo ", "bar ", replace_all=True)
+    assert params.results[-1]["replacements"] == 2
+    assert dup.read_text(encoding="utf-8") == "bar A\nbar B\n"
+    await edit_file_tool(params, "app.py", "不存在原文", "x")  # miss
+    assert params.results[-1]["status"] == "miss"
+    await edit_file_tool(params, "../../etc/passwd", "a", "b")  # 越界
+    assert params.results[-1]["status"] == "error" and "越界" in params.results[-1]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_write_file_create_overwrite_cap(ws):
+    params = ws_params(ws)
+    await write_file_tool(params, "docs/new/plan.md", "# 计划\n")  # 含父目录创建
+    out = params.results[0]
+    assert out["status"] == "ok" and out["created"] is True
+    assert (ws / "docs" / "new" / "plan.md").read_text(encoding="utf-8") == "# 计划\n"
+    await write_file_tool(params, "docs/new/plan.md", "# 改\n")
+    assert params.results[-1]["created"] is False
+    assert (ws / "docs" / "new" / "plan.md").read_text(encoding="utf-8") == "# 改\n"
+    await write_file_tool(params, "big.txt", "x" * 65537)  # 超上限拒绝
+    assert params.results[-1]["status"] == "error" and "上限" in params.results[-1]["reason"]
+    assert not (ws / "big.txt").exists()

@@ -101,8 +101,9 @@ tasks 来自 `store.list()` ∪ `backend._runs−store`（running 带 elapsed_s�
 3. ✅ **PR3** split 交付：orch.done 载 `body`（cancel 路径无）；bridge body 优先/artifact 哨兵兜底，台账 body 落库；`_on_final` 按 VOICE_FINAL_MODE 分流（split 纯数据通报+store 降级）；`_phase2` lane-a task 消失与 `_phase2_dag` deadline 到期两处静默 return 补 orch.failed；tests 同步（backend/gateway）。回退：MODE=fulltext。
 4. ✅ **PR4**（d262e21）工具面七件套（read_body/list_bodies 裁决签名实录见 §2.3）+cancel_run ref-only+接线（app_resources `voice_store`、`DEFAULT_VOICE_KINDS += body.push`）+live 探针断言刷新（瘦回执一句话、通报一句话）。验证：「查看任务2」可取正文；list_bodies 列索引。回退：纯代码回退——七件套缩回五件套（去两 handler+doctrine 两条款）、`voice_store` 出 app_resources、kinds 去 body.push、探针断言回旧稿；工具只读台账，无数据迁移。
 5. ✅ **PR5**（443bfd9）数据分流框架收口：详情页第 6 页签+语音页迷你通知行+回合页 notify 相/灰行（§2.4）；head.compact 零 LLM 压缩——events.py delete 事件、llm.py mirror_sink、删非 pinned+快照单 item、`VOICE_COMPACT_CHARS`（§2.5）；notify 相 emit（§2.3）；翻缺省 split。验证：gateway compact 计划/镜像喂入/head.compact 事件形态/notify emit/翻缺省两形态/fulltext 回退不变；voice_app 纯函数+详情装配 selftest；qwen mirror_sink 回调/delete 序列化。回退：`VOICE_FINAL_MODE=fulltext` 回旧注入串（回退路径保留）、`VOICE_COMPACT_CHARS=0` 关压缩；详情页/通知行纯增量显示面，无数据迁移。
+6. ✅ **PR7** 工具面扩至十二件套：+工作区文件五件套 find_files/grep_files/read_file/edit_file/write_file（app_resources `workspace_root`=VOICE_WORKSPACE 覆写/缺省仓库根；越界拒绝不钳制，find/grep/read/write 量限封顶，垃圾目录与二进制剪除；edit 精确唯一匹配、多处须 replace_all）。doctrine：读取类不出声、edit/write 一句话状态、不倒 diff。回退：纯代码回退——五 handler+doctrine 条款+registry 项+`workspace_root` 出 app_resources。
 
-五 PR 全落，框架收口：写入单点（`_store_bridge`）、投递两形（split 缺省+fulltext 回退）、回执瘦身、工具七件套、显示面六页签、压缩零 LLM——store/观测/工具/显示/压缩五面齐备，backend 全程不感知 store。
+框架收口（PR1–PR5 + PR7 工具面扩展）：写入单点（`_store_bridge`）、投递两形（split 缺省+fulltext 回退）、回执瘦身、工具十二件套、显示面六页签、压缩零 LLM——store/观测/工具/显示/压缩五面齐备，backend 全程不感知 store。
 
 ## 3. 开放问题（已全部裁决，2026-08-27 用户拍板）
 
