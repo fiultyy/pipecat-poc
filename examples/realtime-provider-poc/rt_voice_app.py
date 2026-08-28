@@ -40,6 +40,9 @@ stdlib tkinter（Notebook 页签）+ sounddevice 原生采集 + numpy FFT + aioh
   probing/verified/stale·preset·lastSeen 时长 + 租约到期倒计时 + 换代中
   瞬态）；数据面=op=fleet 全量 + fleet.kind 失效通知防抖重拉 + 尾随
   fleet.snapshot 全文双源共一卡模；stale 高亮阈值页签内可配
+- 轨迹页签（TK-004）：turn 分组时间线（类型相着色）+ 事件类型/工具名
+  过滤 + 文本搜索 + seq 跳转 + 折叠摘要展开；数据面=op=trace 拉取
+  （过滤/折叠全在服务端，参数组合即幂等键，客户端纯渲染）
 
 两连接同 token 计入网关并发上限 ≤2（即本客户端独占单 token 配额）。
 帧协议与 rt_gateway.py §1 逐字对齐。
@@ -56,6 +59,7 @@ import asyncio
 import json
 import math
 import queue
+import re
 import sys
 import threading
 import time
@@ -94,6 +98,12 @@ TICKETS_REFETCH_DEBOUNCE_MS = 400      # tickets 事件→全量重拉的合并�
 FLEET_REFETCH_DEBOUNCE_MS = 400        # fleet 事件→全量重拉的合并窗（同票板语义）
 FLEET_VERIFY_STALE_S = 120             # 席位舰 stale 判定缺省阈值（页签内可调）
 FLEET_VERIFY_STATES = ("probing", "verified", "mismatch")  # 准入探测态原样透出
+TRACE_BUDGET_CHARS = 20000             # 服务端 head.compact 阈值（展示参照）
+# 轨迹行着色相：类型前缀 → 相（turn 琥珀/tool 蓝/step 灰/流紫/元深灰）
+TRACE_TYPE_PHASES = (("turn/", "turn"), ("tool/", "tool"), ("step/", "step"),
+                     ("agent/", "stream"), ("session", "meta"),
+                     ("approval/", "meta"), ("permission/", "meta"),
+                     ("sandbox/", "meta"))
 
 LOG_SHORT = {
     "orch.dispatch": "派发", "orch.progress": "进展", "orch.done": "终稿",
@@ -116,6 +126,8 @@ PENDING_KINDS = {
     "pm.req": "PM 请求",
     "pm.tickets": "票板拉取",
     "pm.fleet": "席位舰拉取",
+    "pm.trace": "轨迹拉取",
+    "pm.trace.expand": "轨迹展开",
 }
 
 
@@ -1286,6 +1298,133 @@ def fleet_ship_view(cards: dict[str, dict], now: float,
     return block
 
 
+def trace_query_params(session_id, type_csv="", tool="", text="",
+                       seq_from=None, seq_to=None) -> dict:
+    """UI 输入 → op=trace 查询参数（空值剔除、seq 收敛 int）。
+
+    参数组合即请求幂等键（spec §TK-004）：同组合必同参数，同参数服务端
+    必同投影——本函数是组合到参数的唯一确定映射。"""
+    p: dict = {}
+    if session_id:
+        p["sessionId"] = str(session_id)
+    if type_csv:
+        p["type"] = ",".join(x.strip() for x in str(type_csv).split(",")
+                             if x.strip())
+    if tool:
+        p["tool"] = str(tool)
+    if text:
+        p["text"] = str(text)
+    for k, v in (("seqFrom", seq_from), ("seqTo", seq_to)):
+        if v not in (None, ""):
+            try:
+                p[k] = int(v)
+            except (TypeError, ValueError):
+                pass
+    return p
+
+
+def trace_params_key(params: dict) -> str:
+    """参数组合 → 幂等键（sorted json 串）。"""
+    return json.dumps(params, ensure_ascii=False, sort_keys=True)
+
+
+def trace_expand_params(data) -> dict | None:
+    """折叠快照 → 展开被折叠头部的续查参数（seqTo=保留区首条 seq-1，其余
+    过滤条件原样）；无折叠/推不出边界 → None。被折叠头部自身超预算时
+    服务端会再折叠——展开是逐层剥洋葱，客户端不做预算业务。"""
+    if not isinstance(data, dict) or not data.get("folded"):
+        return None
+    entries = data.get("entries")
+    if not isinstance(entries, list) or len(entries) < 2:
+        return None
+    seq = entries[1].get("seq") if isinstance(entries[1], dict) else None
+    if not isinstance(seq, int):
+        return None
+    f = data.get("filter") if isinstance(data.get("filter"), dict) else {}
+    sr = (data.get("matched") or {}).get("seq_range") or [None, None]
+    base = trace_query_params(data.get("sessionId") or "", f.get("type") or "",
+                              f.get("tool") or "", f.get("text") or "",
+                              sr[0], seq - 1)
+    return base if base.get("seqFrom") is not None else None
+
+
+def trace_phase_of(entry: dict) -> str:
+    """记录类型前缀 → 着色相（确定性；未知归 misc）。"""
+    t = str(entry.get("type") or "?")
+    for prefix, phase in TRACE_TYPE_PHASES:
+        if t.startswith(prefix):
+            return phase
+    return "misc"
+
+
+def trace_line_of(entry: dict) -> str:
+    """单记录 → 时间线行：#seq · 类型[turnN] · 工具名 · 摘要（≤80 字符）。"""
+    e = entry if isinstance(entry, dict) else {}
+    d = e.get("data") if isinstance(e.get("data"), dict) else {}
+    seq = e.get("seq")
+    turn = d.get("turn")
+    parts = [f"#{seq if isinstance(seq, int) else '?'}",
+             str(e.get("type") or "?")
+             + (f"[turn{turn}]" if isinstance(turn, int) else "")]
+    name = d.get("name") or d.get("toolName") or ""
+    if name:
+        parts.append(str(name))
+    brief = (d.get("title") or d.get("summary") or d.get("command")
+             or d.get("arguments") or "")
+    if not brief:
+        brief = " ".join(str(v) for v in d.values()
+                         if isinstance(v, (str, int, float)))
+    brief = re.sub(r"\s+", " ", str(brief))[:80]
+    if brief:
+        parts.append(brief)
+    return " · ".join(parts)
+
+
+def trace_fold_line(s: dict) -> str:
+    """trace.compact 折叠摘要 → 单行（可展开提示）。"""
+    d = s.get("dropped") if isinstance(s.get("dropped"), dict) else {}
+    k = s.get("kept") if isinstance(s.get("kept"), dict) else {}
+    sr = s.get("seq_range")
+    return (f"⊘ trace.compact 折叠：丢弃 {d.get('entries', '?')} 条/"
+            f"{d.get('chars', '?')} 字符 · 保留 {k.get('entries', '?')} 条/"
+            f"{k.get('chars', '?')} 字符 · seq范围 {sr} （可展开）")
+
+
+def trace_groups(entries: list) -> list[tuple[str, list[dict]]]:
+    """seq 序 entries → turn 分组（data.turn 编组；无 turn 归「· 前导」；
+    trace.compact 摘要行归前导组）。"""
+    groups: list[tuple[str, list[dict]]] = []
+    cur_key: str | None = None
+    cur_list: list[dict] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        d = e.get("data") if isinstance(e.get("data"), dict) else {}
+        turn = d.get("turn")
+        key = (f"turn {turn}" if isinstance(turn, int)
+               and str(e.get("type")) != "trace.compact" else "· 前导")
+        if key != cur_key:
+            cur_key = key
+            cur_list = []
+            groups.append((key, cur_list))
+        cur_list.append(e)
+    return groups
+
+
+def trace_view(entries: list) -> list[tuple[str, str]]:
+    """entries → [(相标签, 行)] 确定视图：同 entries 必同视图（过滤器重放
+    同视图门的客户端幂等键）。"""
+    view: list[tuple[str, str]] = []
+    for key, es in trace_groups(entries):
+        view.append(("group", f"── {key}（{len(es)} 条）"))
+        for e in es:
+            if str(e.get("type")) == "trace.compact":
+                view.append(("fold", trace_fold_line(e)))
+            else:
+                view.append((trace_phase_of(e), trace_line_of(e)))
+    return view
+
+
 def vad_tail_plan(total_ms: int = VAD_TAIL_MS,
                   step_ms: int = VAD_TAIL_STEP_MS) -> list[tuple[int, int]]:
     """尾静音投递表：``[(距松键毫秒, 块字节数), …]``。
@@ -1368,6 +1507,8 @@ class App:
         self._fleet_ship_fetch_job: str | None = None  # 防抖全量重拉定时器
         self._fleet_ship_seq = 0                   # 席位舰拉取 id 序号
         self._fleet_ship_snap_ts: float | None = None  # 舰页收帧时刻（断流陈旧判定）
+        self._trace_seq = 0                        # 轨迹拉取 id 序号
+        self._trace_last: dict | None = None       # 最近 op=trace 快照（展开参照）
         self._pending: dict[str, dict] = {}        # req_id → {kind, ts, rid[, ref, seq]} 在途
         self._fleet_codes: set[str] | None = None  # 上次 fleet.snapshot 席位码（移出 diff 源）
         self._fleet_rows_cache: list[tuple] = []   # 上次快照表行（brief 回填 last_seen 后重绘源）
@@ -1679,6 +1820,59 @@ class App:
         self.fleet_ship_text = scrolledtext.ScrolledText(
             ship_tab, font=("monospace 9"), state="disabled", wrap="none")
         self.fleet_ship_text.pack(fill="both", expand=True, pady=(4, 0))
+
+        # ---- 轨迹页签（TK-004：turn 分组时间线——类型/工具过滤、文本搜索、
+        #      seq 跳转、折叠展开；过滤折叠全在服务端，客户端纯渲染）----
+        trace_tab = ttk.Frame(self.nb, padding=6)
+        self.nb.add(trace_tab, text=" 轨迹 ")
+        self.trace_sid_var = tk.StringVar(value="")
+        self.trace_type_var = tk.StringVar(value="")
+        self.trace_tool_var = tk.StringVar(value="")
+        self.trace_text_var = tk.StringVar(value="")
+        self.trace_from_var = tk.StringVar(value="")
+        self.trace_to_var = tk.StringVar(value="")
+        self.trace_seq_var = tk.StringVar(value="")
+        trow = ttk.Frame(trace_tab)
+        trow.pack(fill="x")
+        for label, var, w in (("sessionId", self.trace_sid_var, 30),
+                              ("type", self.trace_type_var, 12),
+                              ("tool", self.trace_tool_var, 10),
+                              ("text", self.trace_text_var, 14),
+                              ("seqFrom", self.trace_from_var, 7),
+                              ("seqTo", self.trace_to_var, 7)):
+            ttk.Label(trow, text=label, foreground="#8a8a8a").pack(side="left")
+            ttk.Entry(trow, textvariable=var, width=w).pack(
+                side="left", padx=(2, 6))
+        trow2 = ttk.Frame(trace_tab)
+        trow2.pack(fill="x", pady=(4, 0))
+        ttk.Button(trow2, text="拉取",
+                   command=self._trace_fetch).pack(side="left")
+        ttk.Button(trow2, text="展开折叠",
+                   command=self._trace_expand).pack(side="left", padx=(6, 0))
+        ttk.Label(trow2, text="seq跳转",
+                  foreground="#8a8a8a").pack(side="left", padx=(12, 0))
+        ttk.Entry(trow2, textvariable=self.trace_seq_var,
+                  width=8).pack(side="left", padx=(2, 2))
+        ttk.Button(trow2, text="跳", command=self._trace_jump).pack(side="left")
+        self.trace_note_var = tk.StringVar(
+            value="（填 sessionId 后拉取；参数组合即幂等键）")
+        ttk.Label(trace_tab, textvariable=self.trace_note_var,
+                  foreground="#555").pack(anchor="w", pady=(4, 0))
+        self.trace_text = scrolledtext.ScrolledText(
+            trace_tab, font=("monospace 8"), state="disabled", wrap="none")
+        self.trace_text.pack(fill="both", expand=True)
+        ttk.Label(trace_tab, text="折叠展开区",
+                  foreground="#8a8a8a").pack(anchor="w", pady=(4, 0))
+        self.trace_expand_text = scrolledtext.ScrolledText(
+            trace_tab, font=("monospace 8"), state="disabled", wrap="none",
+            height=8)
+        self.trace_expand_text.pack(fill="both")
+        for tag, fg in (("group", "#555555"), ("fold", "#8a3f3f"),
+                        ("turn", "#b26a00"), ("tool", "#0a5bd3"),
+                        ("step", "#666666"), ("stream", "#6a4fb2"),
+                        ("meta", "#777777"), ("misc", "#222222")):
+            self.trace_text.tag_configure(tag, foreground=fg)
+            self.trace_expand_text.tag_configure(tag, foreground=fg)
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._draw_spectrum(np.zeros(BARS))
@@ -2399,6 +2593,10 @@ class App:
                     # 席位舰页签内的降级透出（死服/断流时 tab 不静默）
                     self.fleet_ship_note_var.set(
                         f"⚠ 降级 {code} {str(msg)[:60]}")
+                elif entry.get("kind") == "pm.trace.expand":
+                    # 轨迹展开失败也不静默：展开区直接给失败行
+                    st_set(self.trace_expand_text,
+                           f"⚠ 展开失败：{code} {str(msg)[:60]}")
         else:
             data = frame.get("data")
             if isinstance(data, dict) and isinstance(data.get("tickets"), list):
@@ -2418,6 +2616,18 @@ class App:
                 st_write(self.pm_log,
                          f"✓ pm.res[{frame.get('id')}] "
                          f"席位舰全量 {data.get('count', '?')} 席")
+                return
+            if isinstance(data, dict) and data.get("op") == "trace" \
+                    and isinstance(data.get("entries"), list):
+                # op=trace 回包：轨迹数据面（过滤/折叠已在服务端，客户端纯渲染）
+                expand = (entry is not None
+                          and entry.get("kind") == "pm.trace.expand")
+                self._on_trace_snapshot(data, expand=expand)
+                if entry is not None:
+                    self._pending_fill(entry, "轨迹已更新")
+                st_write(self.pm_log,
+                         f"✓ pm.res[{frame.get('id')}] 轨迹 "
+                         f"{(data.get('matched') or {}).get('entries', '?')} 条")
                 return
             if isinstance(data, dict) and "subscribed" in data \
                     and "was_subscribed" not in data:
@@ -2558,6 +2768,77 @@ class App:
             return f"舰快照 {when}（断流陈旧）"
         return f"舰快照 {when}"
 
+    # ---- 轨迹视图（TK-004：op=trace 拉取 → turn 分组时间线纯渲染） ----
+
+    def _trace_fetch(self, params: dict | None = None, target: str = "main"):
+        """op=trace 拉取（params 缺省由 UI 过滤行组装；直给用于展开）。
+        观测链路不在时只提示不拉（离线期请求丢弃）。"""
+        if not (self.obs_link and self.obs_link._thread
+                and self.obs_link._thread.is_alive()):
+            self.trace_note_var.set("（观测链路未开）")
+            return
+        if params is None:
+            params = trace_query_params(
+                self.trace_sid_var.get().strip(), self.trace_type_var.get(),
+                self.trace_tool_var.get(), self.trace_text_var.get(),
+                self.trace_from_var.get(), self.trace_to_var.get())
+        if not params.get("sessionId"):
+            self.trace_note_var.set("（先填 sessionId）")
+            return
+        self._trace_seq += 1
+        kind = "pm.trace" if target == "main" else "pm.trace.expand"
+        self._pending_send(
+            {"t": "pm.req", "op": "trace", "params": params,
+             "id": f"pmt-{int(time.time() * 1000)}-{self._trace_seq}"}, kind)
+
+    def _trace_jump(self):
+        """seq 跳转：seqFrom=seqTo=输入 seq 的窄窗拉取（历史不可变窗）。"""
+        seq = self.trace_seq_var.get().strip()
+        if not seq:
+            self.trace_note_var.set("（先填要跳的 seq）")
+            return
+        self.trace_from_var.set(seq)
+        self.trace_to_var.set(seq)
+        self._trace_fetch()
+
+    def _trace_expand(self):
+        """展开折叠：最近快照 → 续查参数（被折叠头部窗口）拉到展开区。
+
+        快照无保留区边界（整段被折叠、只剩摘要行）时不静默：展开区直接
+        给出可见的「无法展开」行（边界缺失也是结论）。"""
+        params = trace_expand_params(self._trace_last)
+        if params is None:
+            st_set(self.trace_expand_text,
+                   "⊘ 无法展开：折叠快照无保留区边界（全部被折叠）")
+            self.trace_note_var.set("（无已折叠快照可展开——见展开区说明）")
+            return
+        self._trace_fetch(params, target="expand")
+
+    def _on_trace_snapshot(self, data: dict, expand: bool = False):
+        """快照 → 主区留档（展开参照）+ 纯渲染 + 状态行（幂等键回显）。"""
+        if not expand:
+            self._trace_last = data
+            self._render_trace(data)
+        else:
+            self._render_trace(data, widget=self.trace_expand_text)
+        m = data.get("matched") or {}
+        self.trace_note_var.set(
+            f"轨迹 {m.get('entries', '?')} 条 · payload "
+            f"{m.get('payload_chars', '?')}/{TRACE_BUDGET_CHARS} 字符 · "
+            f"key {trace_params_key(data.get('filter') or {})[:40]}…"
+            + (" · 已折叠（可展开）" if data.get("folded") else ""))
+
+    def _render_trace(self, data: dict, widget=None):
+        """轨迹渲染：trace_view 纯函数输出逐行插 tag（类型相着色）；
+        空投影不静默，给可见「（空）」行。"""
+        widget = widget or self.trace_text
+        view = trace_view(data.get("entries")) or [("group", "（空）")]
+        widget.config(state="normal")
+        widget.delete("1.0", "end")
+        for tag, line in view:
+            widget.insert("end", line + "\n", tag)
+        widget.config(state="disabled")
+
     def _selftest_probe(self):
         """selftest 冒烟（无显示环境 CI）：假帧走真实渲染路径——回放批入表、
         notify 相记 ref、单条 push 入表+灰行、body.item 回填缓存；席位快照
@@ -2565,7 +2846,8 @@ class App:
         逐行；对接解绑/历史翻页 eof/取消回包各走一条；PM 订阅受理→横幅
         恢复、事件流水两行、pm_down→降级横幅；票板全量入 kanban（含
         未知态兜底列）、tickets 事件进侧栏；席位舰全文卡（租约/准入/换代
-        瞬态）、投影 seats 卡、fleet 事件防抖。不触网。"""
+        瞬态）、投影 seats 卡、fleet 事件防抖；轨迹折叠快照入 turn 分组
+        时间线。不触网。"""
         now = time.time()
         self.obs_q.put({"t": "body.push", "items": [
             {"ref": "vh-self1", "no": 1, "status": "done", "title": "回放标题",
@@ -2665,6 +2947,27 @@ class App:
         self.obs_q.put({"t": "pm.event", "seq": 4, "msgid": "fleet:touch:self",
                         "source": "fleet", "kind": "fleet",
                         "path": "maestro/fleet.json", "replay": False})
+        # 轨迹（TK-004）：折叠快照入时间线（折叠摘要行 + turn 分组相着色）
+        self.obs_q.put({"t": "pm.res", "id": "self-pmtt-1", "data": {
+            "op": "trace", "sessionId": "s-self", "signature": "self-ts-1",
+            "totalLines": 5, "parseFailures": 0, "logTruncated": False,
+            "filter": {"type": None, "tool": None, "text": None,
+                       "seqFrom": None, "seqTo": None},
+            "matched": {"entries": 3, "chars": 900, "payload_chars": 900,
+                        "seq_range": [1, 6], "type_histogram": {}},
+            "folded": True, "budget": TRACE_BUDGET_CHARS,
+            "dropped": {"entries": 1, "chars": 600},
+            "entries": [
+                {"type": "trace.compact", "reason": "threshold",
+                 "threshold": TRACE_BUDGET_CHARS,
+                 "dropped": {"entries": 1, "chars": 600},
+                 "kept": {"entries": 2, "chars": 300},
+                 "seq_range": [1, 6]},
+                {"type": "turn/start", "seq": 5, "time": 0,
+                 "data": {"turn": 1}},
+                {"type": "tool/call", "seq": 6, "time": 0,
+                 "data": {"turn": 1, "name": "bash", "command": "echo hi"}},
+            ]}})
 
     def end_session(self):
         """优雅收尾需要一帧 session.end——经由 tx 旁路不便，此处仅断链。

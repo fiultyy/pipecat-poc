@@ -76,6 +76,26 @@ class FakePMSSE:
                  "status": "active", "session": None},
             ],
         }
+        self.trace_payload: dict = {
+            "op": "trace", "sessionId": "s-fake", "signature": "fake-ts-1",
+            "totalLines": 4, "parseFailures": 0, "logTruncated": False,
+            "filter": {"type": None, "tool": None, "text": None,
+                       "seqFrom": None, "seqTo": None},
+            "matched": {"entries": 3, "chars": 800, "payload_chars": 800,
+                        "seq_range": [1, 9], "type_histogram": {}},
+            "folded": True, "budget": 20000,
+            "dropped": {"entries": 1, "chars": 500},
+            "entries": [
+                {"type": "trace.compact", "reason": "threshold",
+                 "threshold": 20000,
+                 "dropped": {"entries": 1, "chars": 500},
+                 "kept": {"entries": 2, "chars": 300}, "seq_range": [1, 9]},
+                {"type": "turn/start", "seq": 5, "time": 0,
+                 "data": {"turn": 2}},
+                {"type": "tool/call", "seq": 9, "time": 0,
+                 "data": {"turn": 2, "name": "bash", "command": "ls"}},
+            ],
+        }
 
     def app(self) -> web.Application:
         app = web.Application()
@@ -88,7 +108,12 @@ class FakePMSSE:
         app.router.add_get("/op/tickets", self.handle_tickets)
         app.router.add_get("/fleet", self.handle_fleet)
         app.router.add_get("/op/fleet", self.handle_fleet)
+        app.router.add_get("/trace", self.handle_trace)
+        app.router.add_get("/op/trace", self.handle_trace)
         return app
+
+    async def handle_trace(self, _request: web.Request) -> web.Response:
+        return web.json_response(self.trace_payload)
 
     async def handle_tickets(self, _request: web.Request) -> web.Response:
         return web.json_response(self.tickets_payload)
