@@ -26,6 +26,12 @@ stdlib tkinter（Notebook 页签）+ sounddevice 原生采集 + numpy FFT + aioh
 - 白板页（协作交互输入面）：文本区即白板本体，改动防抖（600ms）自动
   经 whiteboard.set 推进网关全局白板，无手动同步步；语音侧让 head 调
   read_whiteboard 工具直接读当前内容（长文输入走眼不走嘴）
+- PM 页签（TK-001，<internal-repo> spec-tk-client）：观测连接上 pm.sub 自动订阅
+  （会话就绪即订、上游断流自动重订、帧 id 自增不重放已发帧）；降级横幅
+  （pm_* 失败码/订阅断流点亮，订阅受理即熄灭）+ pm.req 透传控制台
+  （op/params 原样交网关机械路由，ADR-004 客户端零业务）+ pm.res/
+  pm.event 流水面板；断线重连指数退避 2s→30s；会话配置 JSON 只记
+  网关地址（可丢）
 
 两连接同 token 计入网关并发上限 ≤2（即本客户端独占单 token 配额）。
 帧协议与 rt_gateway.py §1 逐字对齐。
@@ -67,6 +73,13 @@ VAD_TAIL_STEP_MS = 50                  # 步进投递：50ms/块=32KB/s，低于
 PENDING_TIMEOUT_S = 5.0                # 控制请求在途上限：超时清登记并回填提示
 FLEET_STALE_S = 120                    # 席位快照陈旧阈值：距收帧超时标「可能陈旧」
 FLEET_EVENT_KEEP = 8                   # 席位事件历史保留条数（事件区最新条标 ▸）
+DEFAULT_GATEWAY_URL = "ws://127.0.0.1:8765/ws"
+SESSION_CONFIG_PATH = Path.home() / ".rt_voice_app_session.json"  # 会话配置（可丢）
+RECONNECT_BASE_S = 2.0                 # 断线重连退避基值（第 1 次）
+RECONNECT_MAX_S = 30.0                 # 退避封顶：2,4,8,16,30,30…
+PM_SUB_KINDS = ("fleet", "tickets")    # 就绪自动订阅的 PM 事件 kind（冒烟实证词汇）
+PM_RESUB_DELAY_S = 10.0                # 上游事件流断（pm_sub_failed/ended）后的重订间隔
+PM_BANNER_OFF = "PM 未接入（开启「观测」后自动订阅）"
 
 LOG_SHORT = {
     "orch.dispatch": "派发", "orch.progress": "进展", "orch.done": "终稿",
@@ -86,6 +99,7 @@ PENDING_KINDS = {
     "liaison.unbind": "对接解绑",
     "liaison.bind": "对接绑定",
     "run.cancel": "任务取消",
+    "pm.req": "PM 请求",
 }
 
 
@@ -107,6 +121,7 @@ class VoiceLink:
         self._thread: threading.Thread | None = None
         self._play_q: "queue.Queue" = queue.Queue()
         self._play_thread: threading.Thread | None = None
+        self._attempts = 0  # 连续失败次数（session.started 复位；退避指数源）
         self._mute = False  # 打断后丢弃下行音频，直到新应答开始（worker 线程内读写）
 
     # ---- lifecycle (called from tkinter thread) ----
@@ -184,6 +199,7 @@ class VoiceLink:
                                 elif t == "session.started":
                                     started = True
                                     self.session_id = data.get("session_id") or self.session_id
+                                    self._attempts = 0
                                     self.on_state("open")
                                 elif t == "head.turn":
                                     ph = data.get("phase")
@@ -216,9 +232,10 @@ class VoiceLink:
                             reader.cancel()
             except Exception as e:  # noqa: BLE001 — 断线重连面：任何异常都进退避
                 self.rx.put(f"[链路] {type(e).__name__}: {str(e)[:100]}")
-            if self._stop.wait(2.0):
+            self._attempts += 1
+            if self._stop.wait(reconnect_delay_s(self._attempts)):
                 break
-            self.rx.put("[链路] 2s 后重连…")
+            self.rx.put(f"[链路] {reconnect_delay_s(self._attempts):.0f}s 后重连…")
         self.on_state("closed")
 
     async def _pump_up(self, ws, started):
@@ -308,14 +325,26 @@ class ObserveLink:
     ——req 线程队列 → worker 内泵任务在会话开后发送；会话内的 ``error``
     回包（body_miss 等）是请求级错误，进 obs 队列按帧处理，不断链；
     握手期 error 仍视为致命（鉴权/协议失败）。
+
+    PM 面（TK-001，<internal-repo> spec-tk-client）：``pm_kinds`` 给定即会话就绪
+    自动发一帧 ``pm.sub``（id 自增，重连只发新 id、不重放已发帧）；
+    上游事件流断（``pm_sub_failed``/``pm_sub_ended`` error 帧）延迟自动
+    重订——GW-002 恢复语义=客户端重订，快照回放兜底。
     """
 
-    def __init__(self, url: str, token: str, obs: "queue.Queue[dict]", on_state):
+    def __init__(self, url: str, token: str, obs: "queue.Queue[dict]", on_state,
+                 pm_kinds: "tuple[str, ...] | None" = None):
         self.url, self.token = url, token
         self.obs, self.on_state = obs, on_state
         self.session_id: str | None = None
         self.topics: list[str] | None = None
+        self.pm_kinds = pm_kinds
         self.req: "queue.Queue[dict]" = queue.Queue()
+        self._pm_seq = 0                              # pm 帧 id 自增序号
+        self._attempts = 0                            # 连续失败次数（就绪复位）
+        self._pm_resub_task: "asyncio.Task | None" = None
+        self._ws = None                               # 活连接引用（close 时真关）
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -331,6 +360,14 @@ class ObserveLink:
     def close(self):
         self._stop.set()
         if self._thread:
+            # 读循环 park 在 async for 上等帧，_stop 不会自己唤醒它——
+            # 从这里跨线程真关 ws（对端/网关随即看到断链、handler 退出）
+            if self._ws is not None and self._loop is not None \
+                    and self._thread.is_alive():
+                try:
+                    asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+                except RuntimeError:
+                    pass  # loop 已停（线程自然退出中）
             self._thread.join(timeout=3)
 
     def _run(self):
@@ -349,7 +386,11 @@ class ObserveLink:
             try:
                 await ws.send_json(req)
             except Exception:  # noqa: BLE001 — 连接已断：外层 async for 随即退出重连
-                rid = req.get("req_id") if isinstance(req, dict) else None
+                rid = None
+                if isinstance(req, dict):
+                    rid = req.get("req_id")
+                    if not isinstance(rid, str) or not rid:
+                        rid = req.get("id")  # pm.* 帧的幂等键叫 id
                 if isinstance(rid, str) and rid:
                     self.obs.put({"_send_failed": rid})  # UI 侧回填「发送失败」
                 return
@@ -362,6 +403,7 @@ class ObserveLink:
                 self.on_state("connecting")
                 async with aiohttp.ClientSession() as http:
                     async with http.ws_connect(self.url, max_msg_size=1 << 21) as ws:
+                        self._loop, self._ws = asyncio.get_running_loop(), ws
                         await ws.send_json({"t": "auth", "token": self.token})
                         self.on_state("authing")
                         ready = asyncio.Event()
@@ -383,11 +425,23 @@ class ObserveLink:
                                     self.topics = data.get("topics")
                                     self.on_state("open")
                                     ready.set()
+                                    self._attempts = 0
+                                    if self.pm_kinds:
+                                        await self._pm_subscribe(ws)
                                 elif t == "error":
                                     if self.topics is not None:
                                         # 会话内请求级错误（body.get miss 等）：
                                         # 按普通帧下发，由请求方回填，不断链
                                         self.obs.put(data)
+                                        if (self.pm_kinds and data.get("code")
+                                                in ("pm_sub_failed", "pm_sub_ended")):
+                                            # GW-002：上游事件流断/起流败——
+                                            # 恢复=客户端延迟重订（快照回放兜底）
+                                            if (self._pm_resub_task is not None
+                                                    and not self._pm_resub_task.done()):
+                                                self._pm_resub_task.cancel()
+                                            self._pm_resub_task = asyncio.create_task(
+                                                self._pm_resub_later(ws))
                                     else:
                                         self.obs.put({"_error": data})
                                         self.on_state(
@@ -402,15 +456,40 @@ class ObserveLink:
             # asyncio-native wait (this coroutine owns the loop thread; a
             # threading.Event.wait here would block the loop — unlike
             # VoiceLink, which parks in its own thread)
-            for _ in range(20):
-                if self._stop.is_set():
-                    break
+            self._attempts += 1
+            delay = reconnect_delay_s(self._attempts)
+            deadline = time.monotonic() + delay
+            while not self._stop.is_set() and time.monotonic() < deadline:
                 await asyncio.sleep(0.1)
-            else:
-                self.obs.put({"_link": "2s 后重连…"})
-                continue
-            break
+            if self._stop.is_set():
+                break
+            self.obs.put({"_link": f"{delay:.0f}s 后重连…"})
         self.on_state("closed")
+
+    async def _pm_subscribe(self, ws) -> None:
+        """PM 事件自动订阅（TK-001，GW-002 帧集）：帧 id 自增——每次
+        （重）连只发全新 id 的订阅帧，不重放任何已发过的帧（客户端侧
+        幂等键；网关 (client,id) 去重窗只是兜底）。"""
+        self._pm_seq += 1
+        await ws.send_json({"t": "pm.sub",
+                            "id": f"pm-{int(time.time() * 1000)}-{self._pm_seq}",
+                            "kinds": list(self.pm_kinds or ())})
+
+    async def _pm_resub_later(self, ws) -> None:
+        """上游事件流断（pm_sub_failed/pm_sub_ended）→ 延迟自动重订；
+        先 ``pm.unsub`` 再 ``pm.sub``——网关同 kinds 重订是 no-op（泵不动），
+        死泵场景须先清在册订阅才能起新泵；连接已断则发送即败、静默退出
+        ——由断线重连面接管（重连后会话就绪路径本就重发 pm.sub）。"""
+        try:
+            await asyncio.sleep(PM_RESUB_DELAY_S)
+            self._pm_seq += 1
+            await ws.send_json({"t": "pm.unsub",
+                                "id": f"pm-{int(time.time() * 1000)}-{self._pm_seq}"})
+            await self._pm_subscribe(ws)
+        except asyncio.CancelledError:
+            pass  # 新一轮失败接管了重订调度
+        except Exception:  # noqa: BLE001 — 连接已断：外层重连面接管
+            pass
 
 
 def fleet_rows(fleet: dict) -> list[tuple]:
@@ -860,6 +939,101 @@ def whiteboard_set_line(result) -> str:
     return f"⚠ 白板同步失败：{result.get('reason', '未知原因')}"
 
 
+# ---- TK-001 PM 协议面（<internal-repo> spec-tk-client：纯函数，便于单测） ----
+
+def reconnect_delay_s(attempt: int, base: float = RECONNECT_BASE_S,
+                      cap: float = RECONNECT_MAX_S) -> float:
+    """断线重连指数退避：第 attempt 次（1 起）等待 min(cap, base·2^(attempt-1))
+    ——2,4,8,16,30,30…；连接成功即从 1 重数（调用方复位计数）。"""
+    return min(cap, base * (2 ** (max(1, attempt) - 1)))
+
+
+def pm_error_of(frame: dict) -> tuple[str, str]:
+    """pm.res error → (code, message)：``error`` 为 ``{code, message}`` 形；
+    无 error → ("", "")。message 截 120 字。"""
+    err = frame.get("error") if isinstance(frame, dict) else None
+    if isinstance(err, dict):
+        return str(err.get("code", "")), str(err.get("message", ""))[:120]
+    if isinstance(err, str):
+        return err, ""
+    return "", ""
+
+
+def pm_is_degraded(code: str) -> bool:
+    """pm_* 失败码族（pm_down/pm_unreachable/pm_timeout/pm_unavailable/
+    pm_status/pm_bad_payload/pm_internal）= PM 底座故障 → 降级横幅；
+    bad_request 等网关侧校验错不算降级。"""
+    return str(code).startswith("pm_")
+
+
+def pm_res_line(frame: dict) -> str:
+    """pm.res → PM 流水行：订阅受理形出订阅清单，退订回包（带
+    was_subscribed）出退订行，一般 data 出 JSON 截断，error 出
+    「⚠ code message」。"""
+    if not isinstance(frame, dict):
+        return "⚠ PM 回包不可读"
+    code, msg = pm_error_of(frame)
+    if code:
+        return f"⚠ pm.res[{frame.get('id')}] {code} {msg}".rstrip()
+    data = frame.get("data")
+    if isinstance(data, dict) and "subscribed" in data:
+        if "was_subscribed" in data:                    # pm.unsub 回包
+            return (f"✓ pm.res[{frame.get('id')}] 已退订"
+                    if data["was_subscribed"]
+                    else f"✓ pm.res[{frame.get('id')}] 本就无订阅")
+        note = f"（{data['note']}）" if data.get("note") else ""
+        kinds = "，".join(str(k) for k in data["subscribed"]) or "—"
+        return f"✓ pm.res[{frame.get('id')}] 已订阅 {kinds}{note}"
+    return f"✓ pm.res[{frame.get('id')}] {json.dumps(data, ensure_ascii=False)[:160]}"
+
+
+def pm_event_line(frame: dict, now: float | None = None) -> str:
+    """pm.event → 单行流水：时刻 #seq source/kind path（快照回放标 ·回放）。"""
+    if not isinstance(frame, dict):
+        return "⚠ PM 事件不可读"
+    when = time.strftime("%H:%M:%S",
+                         time.localtime(now if now is not None else time.time()))
+    path = str(frame.get("path", "") or "")[:60]
+    replay = " · 回放" if frame.get("replay") else ""
+    return (f"{when} #{frame.get('seq', '?')} {frame.get('source', '?')}/"
+            f"{frame.get('kind', '?')} {path}{replay}")
+
+
+def pm_banner_degraded_line(code: str, msg: str) -> str:
+    """降级横幅文案：pm_* 失败码 / 订阅断流（pm_sub_failed/ended）点亮。"""
+    return f"⚠ PM 降级（{code or '未知'}）：{(msg or '').strip()[:80] or 'PM 服务不可用'}"
+
+
+def pm_banner_ok_line(subscribed) -> str:
+    """恢复横幅文案：pm.res{subscribed} 到达（订阅受理）即熄灭降级。"""
+    kinds = ("，".join(str(k) for k in subscribed)
+             if isinstance(subscribed, list) else "")
+    return f"PM 正常 · 已订阅 {kinds or '—'}"
+
+
+def load_session_config(path: Path | None = None) -> dict:
+    """会话配置读取（可丢，TK-001 存储）：``{"url": <网关地址>}``；缺文件/
+    损坏/字段不合法一律回 {}——配置丢失可接受，回落默认地址。"""
+    try:
+        data = json.loads(
+            (path or SESSION_CONFIG_PATH).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if (isinstance(data, dict) and isinstance(data.get("url"), str)
+            and data["url"].strip()):
+        return {"url": data["url"].strip()}
+    return {}
+
+
+def save_session_config(url: str, path: Path | None = None) -> None:
+    """会话配置落盘（best-effort）：关窗时记当前网关地址；失败静默（可丢）。"""
+    try:
+        (path or SESSION_CONFIG_PATH).write_text(
+            json.dumps({"url": str(url)}, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def vad_tail_plan(total_ms: int = VAD_TAIL_MS,
                   step_ms: int = VAD_TAIL_STEP_MS) -> list[tuple[int, int]]:
     """尾静音投递表：``[(距松键毫秒, 块字节数), …]``。
@@ -932,6 +1106,7 @@ class App:
         self._list_more_seq = 0                    # body.list_more req_id 序号
         self._cancel_seq = 0                       # run.cancel req_id 序号
         self._liaison_seq = 0                      # liaison.* req_id 序号
+        self._pm_seq = 0                           # pm.req 控制台 id 序号（TK-001）
         self._pending: dict[str, dict] = {}        # req_id → {kind, ts, rid[, ref, seq]} 在途
         self._fleet_codes: set[str] | None = None  # 上次 fleet.snapshot 席位码（移出 diff 源）
         self._fleet_rows_cache: list[tuple] = []   # 上次快照表行（brief 回填 last_seen 后重绘源）
@@ -1160,6 +1335,34 @@ class App:
                                                      state="disabled", wrap="none")
         self.tickets_log.pack(fill="both", expand=True)
 
+        # ---- PM 页签（TK-001：WS PM 协议接入——横幅 + 透传控制台 + 事件流水）----
+        # 订阅面在 ObserveLink（会话就绪即自动 pm.sub）；此处只做渲染与
+        # 透传输入，零业务（ADR-004）
+        pm_tab = ttk.Frame(self.nb, padding=6)
+        self.nb.add(pm_tab, text=" PM ")
+        self.pm_banner_var = tk.StringVar(value=PM_BANNER_OFF)
+        self.pm_banner = tk.Label(pm_tab, textvariable=self.pm_banner_var,
+                                  anchor="w", padx=8, pady=4,
+                                  bg="#e8e8e8", fg="#555")
+        self.pm_banner.pack(fill="x")
+        pm_bar = ttk.Frame(pm_tab)
+        pm_bar.pack(fill="x", pady=(6, 0))
+        ttk.Label(pm_bar, text="op").pack(side="left")
+        self.pm_op_var = tk.StringVar()
+        ttk.Entry(pm_bar, textvariable=self.pm_op_var, width=16).pack(side="left", padx=(4, 8))
+        ttk.Label(pm_bar, text="params").pack(side="left")
+        self.pm_params_var = tk.StringVar()
+        ttk.Entry(pm_bar, textvariable=self.pm_params_var, width=38).pack(side="left", padx=(4, 8))
+        ttk.Button(pm_bar, text="发送 pm.req", command=self._pm_send).pack(side="left")
+        self.pm_note_var = tk.StringVar(value="")
+        ttk.Label(pm_tab, textvariable=self.pm_note_var,
+                  foreground="#555").pack(anchor="w", pady=(4, 0))
+        ttk.Label(pm_tab, text="pm.res / pm.event 流水",
+                  foreground="#8a8a8a").pack(anchor="w", pady=(6, 0))
+        self.pm_log = scrolledtext.ScrolledText(pm_tab, font=("monospace 8"),
+                                                state="disabled", wrap="word")
+        self.pm_log.pack(fill="both", expand=True)
+
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._draw_spectrum(np.zeros(BARS))
         self._tick()
@@ -1194,7 +1397,8 @@ class App:
             return
         link = ObserveLink(self.url_var.get().strip(), self.token_var.get().strip(),
                            self.obs_q,
-                           lambda s: self.root.after(0, lambda: self.obs_state_var.set(f"观测:{s}")))
+                           lambda s: self.root.after(0, lambda: self.obs_state_var.set(f"观测:{s}")),
+                           pm_kinds=PM_SUB_KINDS)
         self.obs_link = link
         link.start()
         self.obs_btn.config(text="停观测")
@@ -1228,6 +1432,11 @@ class App:
                 # 请求级错误按 req_id 关联回填（命中 pending 才动 UI）；
                 # 无 req_id / 未命中只记编排页日志行——不碰 body.get 在途
                 # 态、不写详情右栏（历史误投修复：任意 error 曾被投右栏）
+                if f.get("code") in ("pm_sub_failed", "pm_sub_ended"):
+                    # GW-002 上游事件流断/起流败（细分码仅旧字段携带）：
+                    # 点亮降级横幅——ObserveLink 已在延迟自动重订
+                    self._pm_degrade(str(f.get("code")),
+                                     str(f.get("message") or f.get("msg") or ""))
                 entry = self._pending_pop(f.get("req_id"))
                 if entry is not None:
                     self._pending_fill(entry, pending_error_line(entry.get("kind", ""), f))
@@ -1269,6 +1478,10 @@ class App:
                 st_write(self.bridge_log, str(f.get("line", ""))[:300])
             elif t == "tickets.snapshot":
                 st_set(self.tickets_log, tickets_text(f))
+            elif t == "pm.res":
+                self._on_pm_res(f)
+            elif t == "pm.event":
+                st_write(self.pm_log, pm_event_line(f))
             elif "_send_failed" in f:
                 # req 泵发送失败（连接已断）：受影响 req_id 回填提示，不静默丢
                 entry = self._pending_pop(f.get("_send_failed"))
@@ -1348,8 +1561,11 @@ class App:
     def _pending_send(self, req: dict, kind: str, seq: int | None = None):
         """登记在途控制请求（req_id → kind+时刻+rid，body.get 另记 ref 与
         发起序号 seq）并经观测连接发出：回包/error/超时/发送失败都以
-        req_id 关联回填；seq 供 body.item 按 ref 清在途时校验发起新旧。"""
+        req_id 关联回填；seq 供 body.item 按 ref 清在途时校验发起新旧。
+        pm.* 帧无 req_id、幂等键叫 id——取 id 兜底。"""
         rid = req.get("req_id")
+        if not isinstance(rid, str) or not rid:
+            rid = req.get("id")
         if isinstance(rid, str) and rid:
             entry = {"kind": kind, "ts": time.monotonic(), "rid": rid}
             if kind == "body.get":
@@ -1402,7 +1618,8 @@ class App:
                "head.list": self.head_note_var,
                "whiteboard.set": self.whiteboard_note_var,
                "body.list_more": self.task_note_var,
-               "run.cancel": self.task_note_var}.get(kind)
+               "run.cancel": self.task_note_var,
+               "pm.req": self.pm_note_var}.get(kind)
         if var is not None:
             var.set(line)
         if kind in ("fleet.cleanup", "fleet.brief", "liaison.unbind", "liaison.bind"):
@@ -1815,11 +2032,73 @@ class App:
             elif isinstance(frame.get("liaison"), dict):
                 self.liaison_var.set(liaison_line(frame.get("liaison")))
 
+    # ---- PM 页（TK-001：透传控制台 + 降级横幅 + 回包渲染；ADR-004 零业务） ----
+
+    def _pm_send(self):
+        """控制台透传 ``pm.req{op, params}``：op/params 原样交网关机械路由
+        （ADR-002 只读 GET 由网关侧保证），客户端零业务；id 自增、在途
+        登记——回包 pm.res / error / 超时 / 发送失败均按 id 回填本页。"""
+        op = self.pm_op_var.get().strip()
+        if not op:
+            self.pm_note_var.set("op 不能为空")
+            return
+        raw = self.pm_params_var.get().strip() or "{}"
+        try:
+            params = json.loads(raw)
+        except ValueError:
+            self.pm_note_var.set("params 不是合法 JSON")
+            return
+        if not isinstance(params, dict):
+            self.pm_note_var.set("params 必须是 JSON 对象")
+            return
+        if not (self.obs_link and self.obs_link._thread
+                and self.obs_link._thread.is_alive()):
+            self.pm_note_var.set("观测连接未开——开启「观测」后可发 PM 请求")
+            return
+        self._pm_seq += 1
+        rid = f"pmq-{int(time.time() * 1000)}-{self._pm_seq}"
+        self.pm_note_var.set(f"已发 pm.req {op} …")
+        self._pending_send({"t": "pm.req", "id": rid, "op": op,
+                            "params": params}, "pm.req")
+
+    def _on_pm_res(self, frame: dict):
+        """pm.res 分发：error 带 pm_* 码 → 降级横幅；pm.sub 受理形（带
+        subscribed 且非退订回包）→ 横幅恢复；每帧出流水行；控制台请求
+        按 id 清在途回填。"""
+        entry = self._pending_pop(frame.get("id"))
+        code, msg = pm_error_of(frame)
+        if code:
+            if pm_is_degraded(code):
+                self._pm_degrade(code, msg)
+            if entry is not None:
+                self._pending_fill(entry, f"PM 请求失败：{code} {msg}".rstrip())
+        else:
+            data = frame.get("data")
+            if isinstance(data, dict) and "subscribed" in data \
+                    and "was_subscribed" not in data:
+                self._pm_restore(data["subscribed"])    # pm.sub 受理
+            if entry is not None:
+                self._pending_fill(entry, "PM 请求完成")
+        st_write(self.pm_log, pm_res_line(frame))
+
+    def _pm_degrade(self, code: str, msg: str):
+        """降级横幅：PM 底座故障可见化（不崩 UI、不断链）——熄灭只等
+        pm.res{subscribed}（自动重订/恢复后的订阅受理）。"""
+        self.pm_banner_var.set(pm_banner_degraded_line(code, msg))
+        self.pm_banner.config(bg="#8a3f3f", fg="white")
+        st_write(self.pm_log, f"[降级] {code} {msg}".rstrip())
+
+    def _pm_restore(self, subscribed):
+        """订阅受理 → 横幅恢复常态。"""
+        self.pm_banner_var.set(pm_banner_ok_line(subscribed))
+        self.pm_banner.config(bg="#1f6f43", fg="white")
+
     def _selftest_probe(self):
         """selftest 冒烟（无显示环境 CI）：假帧走真实渲染路径——回放批入表、
         notify 相记 ref、单条 push 入表+灰行、body.item 回填缓存；席位快照
         入表、bridge 行入编排页、tickets 覆写、清理回包摘要行、简报摘要+
-        逐行；对接解绑/历史翻页 eof/取消回包各走一条。不触网。"""
+        逐行；对接解绑/历史翻页 eof/取消回包各走一条；PM 订阅受理→横幅
+        恢复、事件流水两行、pm_down→降级横幅。不触网。"""
         now = time.time()
         self.obs_q.put({"t": "body.push", "items": [
             {"ref": "vh-self1", "no": 1, "status": "done", "title": "回放标题",
@@ -1859,6 +2138,18 @@ class App:
                         "items": [], "eof": True})
         self.obs_q.put({"t": "run.cancel.result", "req_id": "self-cancel-1",
                         "ref": "vh-self2", "ok": True, "state": "cancelled"})
+        # PM 面（TK-001）：订阅受理→横幅恢复、快照/增量事件两行、
+        # pm_down 回包→降级横幅（回包不可读形也走一条）
+        self.obs_q.put({"t": "pm.res", "id": "self-pm-sub-1",
+                        "data": {"subscribed": ["fleet", "tickets"]}})
+        self.obs_q.put({"t": "pm.event", "seq": 1, "msgid": "self-m1",
+                        "source": "fleet", "kind": "fleet",
+                        "path": "/dsh/maestro/fleet.json", "replay": True})
+        self.obs_q.put({"t": "pm.event", "seq": 2, "msgid": "self-m2",
+                        "source": "tickets", "kind": "tickets",
+                        "path": "", "replay": False})
+        self.obs_q.put({"t": "pm.res", "id": "self-pmq-1",
+                        "error": {"code": "pm_down", "message": "health probe failed"}})
 
     def end_session(self):
         """优雅收尾需要一帧 session.end——经由 tx 旁路不便，此处仅断链。
@@ -2063,6 +2354,7 @@ class App:
         self.state_var.set(s)
 
     def on_close(self):
+        save_session_config(self.url_var.get().strip())  # 会话配置（可丢，尽力写）
         self._cancel_vad_tail()
         if self._wb_push_job is not None:
             try:
@@ -2083,13 +2375,18 @@ class App:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--url", default="ws://127.0.0.1:8765/ws")
+    ap.add_argument("--url", default=None,
+                    help="网关地址（缺省读会话配置 JSON，再回落 "
+                         f"{DEFAULT_GATEWAY_URL}）")
     ap.add_argument("--token", default="")
     ap.add_argument("--selftest", action="store_true",
                     help="无设备冒烟：UI 起即退（CI/无显示环境验证布局）")
     ap.add_argument("--ptt-key", default="f9",
                     help="按住说话热键（pynput 键名，默认 f9；全局生效）")
     args = ap.parse_args()
+
+    # 网关地址三级回落：CLI > 会话配置 JSON（可丢）> 默认
+    url = args.url or load_session_config().get("url") or DEFAULT_GATEWAY_URL
 
     import tkinter as tk
 
@@ -2099,7 +2396,7 @@ def main() -> int:
         ttk.Style(root).theme_use("clam")
     except Exception:
         pass
-    App(root, args.url, args.token, args.selftest, ptt_key=args.ptt_key)
+    App(root, url, args.token, args.selftest, ptt_key=args.ptt_key)
     root.mainloop()
     return 0
 
