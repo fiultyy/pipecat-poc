@@ -84,6 +84,39 @@ def _mirror_item_dict(item) -> dict:
     }
 
 
+class _ToolPairFreeContextView:
+    """Context view that hides tool-call/tool-result messages from adapters.
+
+    Realtime services deliver tool results natively (a
+    ``function_call_output`` conversation item per completed call). Packing
+    the same pairs into the adapter's seeded user message positions the
+    payload as user text, and the model treats it as material to relay
+    verbatim instead of a governed tool result. This view exposes everything
+    else (``tools``, user/assistant messages) unchanged.
+
+    Only valid for seeding into a live server-side conversation that already
+    holds the pairs' items — i.e. not across :meth:`reset_conversation`,
+    where the server conversation is rebuilt from scratch.
+    """
+
+    def __init__(self, context) -> None:
+        self._context = context
+
+    @property
+    def tools(self):
+        return self._context.tools
+
+    def get_messages(self, *args, **kwargs):
+        return [
+            m for m in self._context.get_messages(*args, **kwargs)
+            if not (isinstance(m, dict) and (
+                m.get("role") == "tool"
+                or (m.get("role") == "assistant" and m.get("tool_calls"))
+                or m.get("tool_call_id")  # async-tool envelopes
+            ))
+        ]
+
+
 class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
     """Realtime voice service for Alibaba DashScope's Qwen-Omni-Realtime models.
 
@@ -288,6 +321,30 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             return flat
         return tool
 
+    async def _handle_context(self, context) -> None:
+        """First context frame: deliver tool results natively before seeding.
+
+        In realtime mode the first local context frame is typically the
+        first tool round (user speech stays server-side, so the context
+        carries exactly the [assistant tool_call, tool result] pair). The
+        parent's initial-context branch passes ``send_new_results=False``
+        and relies on the seeding to carry the pair — which lands it in a
+        seeded user message instead of the native ``function_call_output``
+        position. Send natively here instead; when a result was sent,
+        ``_process_completed_function_calls`` triggers the response itself.
+        """
+        if not self._context:
+            self._context = context
+            has_tool_results = any(
+                isinstance(m, dict) and m.get("tool_call_id")
+                for m in context.get_messages()
+            )
+            await self._process_completed_function_calls(send_new_results=True)
+            if not has_tool_results:
+                await self._create_response()
+            return
+        await super()._handle_context(context)
+
     async def _create_response(self):
         # Same as the parent, except the session update (carrying tools) is
         # sent BEFORE seeding conversation items: DashScope only honors
@@ -310,8 +367,12 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             # Send new settings (incl. tools) first — see method docstring.
             await self._send_session_update()
 
-            # Then seed the initial messages.
-            llm_invocation_params = adapter.get_llm_invocation_params(self._context)
+            # Then seed the initial messages — through the tool-pair-free
+            # view: those pairs were already delivered natively above / by
+            # updated-context handling, and re-packing them as user text
+            # makes the model relay tool payloads aloud.
+            llm_invocation_params = adapter.get_llm_invocation_params(
+                _ToolPairFreeContextView(self._context))
             messages = llm_invocation_params["messages"]
             for item in messages:
                 evt = openai_realtime.events.ConversationItemCreateEvent(item=item)
@@ -440,7 +501,11 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             elif evt.type == "error":
                 if not await self._maybe_handle_evt_retrieve_conversation_item_error(evt):
                     if self._is_recoverable_response_error(evt):
-                        logger.debug(f"{self} {evt.error.message}")
+                        # WARNING, not DEBUG: a swallowed turn-state race looks
+                        # externally like a dead head (silent turn) — operators
+                        # must see it in the journal.
+                        logger.warning(
+                            f"{self} recoverable response error swallowed: {evt.error.message}")
                     else:
                         await self._handle_evt_error(evt)
                         return "fatal"
