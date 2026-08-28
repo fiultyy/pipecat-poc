@@ -1072,6 +1072,30 @@ def _final_mode() -> str:
     return "fulltext" if os.environ.get("VOICE_FINAL_MODE") == "fulltext" else "split"
 
 
+def _turn_detection_from_env() -> dict | None:
+    """服务端 VAD 旋钮（KG 14 之外的语音面调参）：任一 env 设了才组装
+    ``server_vad`` 配置，否则 None→服务端默认（不猴急调节前保持原样）。
+
+    - ``VOICE_TURN_SILENCE_MS``：静音多久判定说完（调大→head 不抢话）
+    - ``VOICE_TURN_PREFIX_MS``：判定前的音频回带
+    - ``VOICE_TURN_THRESHOLD``：0..1 触发灵敏度（调大→不易被噪音触发）
+    """
+    td: dict = {}
+    for key, field, cast in (
+        ("VOICE_TURN_SILENCE_MS", "silence_duration_ms", int),
+        ("VOICE_TURN_PREFIX_MS", "prefix_padding_ms", int),
+        ("VOICE_TURN_THRESHOLD", "threshold", float),
+    ):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            td[field] = cast(raw)
+        except ValueError:
+            print(f"rt_gateway: {key}={raw} unparseable; ignored", file=sys.stderr)
+    return {"type": "server_vad", **td} if td else None
+
+
 async def _final_injection_text(ref: str, final: str) -> str:
     """组终稿注入串（fulltext/split 两形态；KG 14 §2.3，PR3）。
 
@@ -1372,6 +1396,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
             voice=os.environ.get("VOICE_HEAD_VOICE") or None,
             # VOICE_HEAD_DOCTRINE 指外置 doctrine 文件；缺省回落内置常量
             system_instruction=DoctrineSource().load(),
+            # 服务端 VAD 旋钮（VOICE_TURN_*）：全未设→None→服务端默认
+            turn_detection=_turn_detection_from_env(),
             tools=tools,
         )
     )

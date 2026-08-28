@@ -955,6 +955,23 @@ def test_final_mode_env_parsing(monkeypatch):
         assert rt_gateway._final_mode() == "split", value
 
 
+def test_turn_detection_env_parsing(monkeypatch):
+    """VAD 旋钮：全未设→None（服务端默认）；设了才组装 server_vad；
+    非法值忽略不炸。"""
+    for key in ("VOICE_TURN_SILENCE_MS", "VOICE_TURN_PREFIX_MS",
+                "VOICE_TURN_THRESHOLD"):
+        monkeypatch.delenv(key, raising=False)
+    assert rt_gateway._turn_detection_from_env() is None
+    monkeypatch.setenv("VOICE_TURN_SILENCE_MS", "800")
+    assert rt_gateway._turn_detection_from_env() == {
+        "type": "server_vad", "silence_duration_ms": 800}
+    monkeypatch.setenv("VOICE_TURN_THRESHOLD", "0.7")
+    monkeypatch.setenv("VOICE_TURN_PREFIX_MS", "junk")
+    td = rt_gateway._turn_detection_from_env()
+    assert td == {"type": "server_vad", "silence_duration_ms": 800,
+                  "threshold": 0.7}
+
+
 @pytest.mark.asyncio
 async def test_final_fulltext_injection_byte_identical(monkeypatch):
     """回退路径字节级回归：VOICE_FINAL_MODE=fulltext 注入串与旧实现一字不差

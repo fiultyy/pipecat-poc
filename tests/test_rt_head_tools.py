@@ -379,8 +379,8 @@ def test_doctrine_persona_section_keywords():
 
 
 def test_doctrine_numbering_protocol():
-    assert "默认不念编号" in DSH_TOOLS_DOCTRINE
-    assert "前三位" in DSH_TOOLS_DOCTRINE
+    assert "不念编号" in DSH_TOOLS_DOCTRINE
+    assert "任务N" in DSH_TOOLS_DOCTRINE
     assert "完整 ref" in DSH_TOOLS_DOCTRINE
     # cancel_run 条款：head 从上下文回执解析 ref，不让用户念编号
     assert "由你从上下文" in DSH_TOOLS_DOCTRINE
@@ -389,15 +389,19 @@ def test_doctrine_numbering_protocol():
 
 def test_doctrine_receipt_rule_no_verbatim_relay():
     after = DSH_TOOLS_DOCTRINE.split("# After Tool Calls")[1]
-    # 受理回执一句话；不念凭证语义（防 SLIM=0 全形回退时照念）
+    # 受理回执只回一个状态；不念凭证语义（防 SLIM=0 全形回退时照念）
+    assert "只回一个状态" in after
     assert "不念凭证" in after
     assert "不念 ref" in after
     assert "不念 run_id" in after
     assert "不复述" in after and "JSON" in after
+    # 明令封掉的啰嗦尾巴
+    assert "详情栏可看进度" not in after
     # 终稿/通报通用条款：罩住全文注入与 [编排通报] JSON 两种载荷
     assert "Agent Final Message" in after
     assert "[编排通报]" in after
-    assert "一句话" in after
+    # 连续工具调用中间步不出声
+    assert "中间步骤不出声" in after
     # 旧逐字转述条款已废除
     assert "逐字" not in DSH_TOOLS_DOCTRINE
     assert "一个字符" not in DSH_TOOLS_DOCTRINE
