@@ -384,13 +384,15 @@ class ObserveLink:
 
 
 def fleet_rows(fleet: dict) -> list[tuple]:
-    """fleet.snapshot payload → 表格行（code/alias/node/role/status）。
+    """fleet.snapshot 帧 → 表格行（code/alias/node/role/status）。
 
-    payload 形如 {"fleet": {"<code>": {sessionId, alias, node, role,
-    project, status, …}}}（FileTailer 全量快照，KG 11 §1）。
+    实线形（FileTailer snapshot）：帧载荷 = {"fleet": <fleet.json 全文>}，
+    席位表再嵌一层 doc["fleet"]；兼容扁平合成形 {"fleet": {<code>: …}}。
     """
     out = []
     entries = fleet.get("fleet") if isinstance(fleet, dict) else None
+    if isinstance(entries, dict) and isinstance(entries.get("fleet"), dict):
+        entries = entries["fleet"]  # tailer 实形：载荷是整个 fleet.json 文档
     if not isinstance(entries, dict):
         return out
     for code, e in sorted(entries.items()):

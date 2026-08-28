@@ -633,3 +633,28 @@ def test_connection_bar_stays_visible_above_tabs():
                 app.root.destroy()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def test_fleet_rows_real_tailer_payload_shape():
+    """回归（席位删除坏因）：实线形帧载荷是 {"fleet": <fleet.json 全文>}，
+    席位表嵌在 doc["fleet"]——旧解析只读一层，表里只有一条垃圾行，UI
+    无法选中真实席位。两级解析 + 扁平合成形兼容都要罩住。"""
+    real = {"t": "fleet.snapshot", "fleet": {
+        "port": 3080, "defaultWorkspaceId": "60312e7a-ae74",
+        "fleet": {
+            "<seat>": {"sessionId": "session-3103", "node": "node-<redacted>",
+                     "role": "worker", "status": "active"},
+            "db05": {"sessionId": "session-db05", "node": "vh-head-liaison",
+                     "role": "worker", "preset": "maestro", "status": "active"},
+        }}}
+    rows = fleet_rows(real)
+    assert rows == [
+        ("3103", "", "node-<redacted>", "worker", "active"),
+        ("db05", "", "vh-head-liaison", "worker", "active"),
+    ]
+    # 扁平合成形（旧单测/文档形）继续可用
+    flat = {"fleet": {"<seat>": {"node": "x", "role": "worker", "status": "active"}}}
+    assert fleet_rows(flat) == [("3103", "", "x", "worker", "active")]
+    # 畸形不抛
+    assert fleet_rows({}) == [] and fleet_rows({"fleet": "corrupt"}) == []
+    assert fleet_rows({"fleet": {"fleet": "corrupt"}}) == []
