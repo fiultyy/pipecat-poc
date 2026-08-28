@@ -154,11 +154,35 @@ async def test_dispatch_intent_tool_phase2_final_flows_to_on_final():
 
 @pytest.mark.asyncio
 async def test_query_status_tool():
+    """本地状态汇总：台账终态 ∪ 运行态；counts 齐口径；无台账降级带 note。"""
+    import time as _time
+
     backend, _, _ = make_backend()
-    params = FakeParams(app_resources={"dsh_backend": backend})
+    backend._runs["vh-run1"] = type(
+        "D", (), {"ts": _time.time() - 120, "credentials": []})()
+    backend._runs["vh-done1"] = type("D", (), {"ts": 0})()
+    store = FakeStore([
+        make_rec(ref="vh-done1", no=1, status="done", body="结论甲" * 3),
+        make_rec(ref="vh-old2", no=2, status="failed", body="失败正文"),
+    ])
+    params = FakeParams(app_resources={"dsh_backend": backend,
+                                       "voice_store": store})
     await query_status_tool(params)
-    out = json.loads(params.results[0])
-    assert out["runs"] and "2 个任务" in out["runs"][0]
+    out = params.results[0]
+    assert out["status"] == "ok"
+    assert out["counts"] == {"done": 1, "failed": 1, "running": 1}
+    by_ref = {t["ref"]: t for t in out["tasks"]}
+    assert by_ref["vh-done1"]["status"] == "done" and by_ref["vh-done1"]["no"] == 1
+    assert by_ref["vh-run1"]["status"] == "running"
+    assert 100 <= by_ref["vh-run1"]["elapsed_s"] <= 200
+    assert "body" not in by_ref["vh-done1"]  # 正文不进状态面
+    assert "note" not in out
+    # 无台账：仅运行态 + note
+    params2 = FakeParams(app_resources={"dsh_backend": backend})
+    await query_status_tool(params2)
+    out2 = params2.results[0]
+    assert out2["tasks"] and all(t["status"] == "running" for t in out2["tasks"])
+    assert "台账不可用" in out2["note"]
 
 
 @pytest.mark.asyncio

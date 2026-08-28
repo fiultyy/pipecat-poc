@@ -170,34 +170,43 @@ class ConversationCompactor:
 
     def state_snapshot(self, store_rows: list[dict], running: list[dict],
                        *, now: float) -> dict:
-        """Assemble the kg/14 §2.5 ``state.snapshot`` payload.
+        """Assemble the kg/14 §2.5 ``state.snapshot`` payload
+        (delegates to :func:`state_snapshot`)."""
+        return state_snapshot(store_rows, running, now=now)
 
-        Args:
-            store_rows: ``store.list()`` index rows; the light fields
-                (``no/ref/status/summary/chars``) survive, body never enters
-                the head context.
-            running: backend run-registry entries as ``{"ref", "ts"}`` dicts;
-                refs already in the store join as their stored (terminal)
-                status, the rest appear as ``running`` with ``elapsed_s``.
-            now: reference epoch seconds for ``elapsed_s``/``ts``.
 
-        Returns:
-            The snapshot dict (``t``/``ts``/``tasks``/``counts``).
-        """
-        tasks = [
-            {"no": r.get("no"), "ref": r.get("ref"), "status": r.get("status"),
-             "summary": r.get("summary"), "chars": r.get("chars")}
-            for r in store_rows
-        ]
-        known = {t["ref"] for t in tasks}
-        for r in running:
-            ref = r.get("ref")
-            if not ref or ref in known:
-                continue
-            started = float(r.get("ts") or 0)
-            tasks.append({"ref": ref, "status": "running",
-                          "elapsed_s": max(0, int(now - started)) if started else 0})
-        counts: dict[str, int] = {}
-        for t in tasks:
-            counts[t["status"]] = counts.get(t["status"], 0) + 1
-        return {"t": "state.snapshot", "ts": now, "tasks": tasks, "counts": counts}
+def state_snapshot(store_rows: list[dict], running: list[dict],
+                   *, now: float) -> dict:
+    """Merge ledger rows with the in-flight run registry into one status
+    payload — the single state-truth source shared by head.compact and the
+    head's query_status tool.
+
+    Args:
+        store_rows: ``store.list()`` index rows; the light fields
+            (``no/ref/status/summary/chars``) survive, body never enters
+            the head context.
+        running: backend run-registry entries as ``{"ref", "ts"}`` dicts;
+            refs already in the store join as their stored (terminal)
+            status, the rest appear as ``running`` with ``elapsed_s``.
+        now: reference epoch seconds for ``elapsed_s``/``ts``.
+
+    Returns:
+        The snapshot dict (``t``/``ts``/``tasks``/``counts``).
+    """
+    tasks = [
+        {"no": r.get("no"), "ref": r.get("ref"), "status": r.get("status"),
+         "summary": r.get("summary"), "chars": r.get("chars")}
+        for r in store_rows
+    ]
+    known = {t["ref"] for t in tasks}
+    for r in running:
+        ref = r.get("ref")
+        if not ref or ref in known:
+            continue
+        started = float(r.get("ts") or 0)
+        tasks.append({"ref": ref, "status": "running",
+                      "elapsed_s": max(0, int(now - started)) if started else 0})
+    counts: dict[str, int] = {}
+    for t in tasks:
+        counts[t["status"]] = counts.get(t["status"], 0) + 1
+    return {"t": "state.snapshot", "ts": now, "tasks": tasks, "counts": counts}

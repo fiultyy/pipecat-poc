@@ -12,7 +12,8 @@ Seven tools, docstring-as-schema (same convention as rt_orchestrator):
 - ``dispatch_plan(objective, subtasks_json)`` — dependency-split DAG
   dispatch (lane b-dag); one intent becomes ≥2 dependent subtasks and
   ONE aggregated final arrives later the same way.
-- ``query_status()`` — spoken-friendly aggregation of dais runs.
+- ``query_status()`` — local status summary: ledger rows ∪ in-flight runs
+  (same state source as head.compact); never dispatches work.
 - ``read_body(ref_or_no, max_chars=None, from_tail=False)`` — one final
   body from the read-only session store (full ref or spoken task no).
 - ``list_bodies(limit=None)`` — recent store index (no bodies).
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 
+from rt_conversation_items import state_snapshot
 from rt_dsh_backend import DshBackend
 
 DSH_TOOLS_DOCTRINE = """# Persona and Role
@@ -38,7 +40,7 @@ DSH_TOOLS_DOCTRINE = """# Persona and Role
 # Tools
 - dispatch_intent：把用户意图（自包含，指代全部展开）交给编排层分派。凡用户没有明确要求分步执行的意图，一律用这个。
 - dispatch_plan：仅当用户明确要求分步、且步骤之间有先后依赖（如"先…再…"、"第一步…第二步基于第一步…"）时调用。后一步用到前一步结果的，必须在前一步条目的 deps 里写上前一步的下标。subtasks_json 是 JSON 数组，每项含 spec（自包含子任务描述）、deps（前置子任务的下标数组，从 0 起，无依赖可省略）、command（真实完成该子任务工作的 shell 结算块，在仓库根目录执行）。
-- query_status：查询当前编排任务的状态摘要。
+- query_status：用户问"现在什么状态/进行到哪了/有几个任务"时调用，返回任务状态汇总（编号、状态、摘要，运行中带时长）。本地查询，不打扰对接人、不产生新任务。
 - read_body：用户要看某条任务的终稿正文、或追问任务输出细节时调用。ref_or_no 用你上下文里的完整 ref（vh-…）；用户念"任务N"编号时用编号 N。正文可能很长：用 max_chars 限定返回长度、from_tail 取尾部（终稿结论常在尾），按需分段读取。
 - list_bodies：用户问"都有什么任务/什么状态"时调用，列出最近任务的台账索引（编号、状态、标题、字数，无正文）；要看哪条正文再用 read_body 取。
 - cancel_run：取消一个编排任务，参数用回执里的 ref（vh-…）。用户说"取消刚才那个/第一个调研"时，由你从上下文里的回执解析出 ref，不让用户念编号。
@@ -49,7 +51,7 @@ DSH_TOOLS_DOCTRINE = """# Persona and Role
 - 受理回执（status=accepted）：只回一个状态，如"已受理"或"任务2已受理"，说完即止。不加解释、不追加任何尾巴（去向、进度提示都不加）。不念 ref、不念凭证、不念 run_id、不复述回执里的 JSON 字段。
 - 终稿与完成通报：无论以 "Agent Final Message" 开头的全文注入、还是以 [编排通报] 开头的 JSON 消息到达，都只回一个状态，如"任务2完成了"、"完成了"或"任务2失败了"。不播报正文、不讲要点；用户追问时再讲。
 - 连续工具调用（如 list_bodies 后再 read_body）：中间步骤不出声；全部取到所需信息后一次性作答。
-- read_body/list_bodies：结果按用户所问讲，不整段倒正文；长文先讲结构与要点，用户要哪段再用 max_chars/from_tail 分段取、逐段展开。查无（miss）就说目前没有这条任务，台账不可用（error）就说详情暂不可用，不编造内容。
+- query_status/read_body/list_bodies：状态问句先一句 counts（如"2个完成，1个在跑"）；read_body/list_bodies 结果按用户所问讲，不整段倒正文，长文先讲结构与要点，用户要哪段再用 max_chars/from_tail 分段取、逐段展开。查无（miss）就说目前没有这条任务，台账不可用（error/note）就说详情暂不可用，不编造内容。
 - 编号协议：单任务时不念编号；多任务并存或用户要核对时，用「任务N」（N 是回执/通报/台账里的编号）区分。工具调用一律使用你上下文里的完整 ref，与念法无关。
 - 不添加执行层没有的事实；转述终稿正文要忠实，长文先讲结构与要点，用户要求再逐段展开。
 
@@ -128,9 +130,34 @@ async def dispatch_plan_tool(params, objective: str, subtasks_json: str):
 
 
 async def query_status_tool(params):
-    """查询当前编排任务的状态摘要。"""
+    """查询编排任务的状态汇总（本地台账+运行态；不产生新任务）。
+
+    返回 {"status":"ok","tasks":[…],"counts":{…}}：task 形如
+    {"no","ref","status","summary","chars"}（终态，来自台账）或
+    {"ref","status":"running","elapsed_s"}（在飞，来自运行登记）；
+    台账不可用时仅返回运行态并附 note。
+    """
+    import asyncio
+    import time
+
     backend: DshBackend = params.app_resources["dsh_backend"]
-    await params.result_callback(await backend.query_status())
+    store = params.app_resources.get("voice_store")
+    note = None
+    rows: list[dict] = []
+    if store is not None:
+        try:
+            rows = await asyncio.to_thread(store.list, 20)
+        except Exception:  # noqa: BLE001 — degrade to running-only
+            note = "台账不可用，仅显示运行中任务"
+    else:
+        note = "台账不可用，仅显示运行中任务"
+    running = [{"ref": ref, "ts": getattr(d, "ts", 0) or 0}
+               for ref, d in getattr(backend, "_runs", {}).items()]
+    snap = state_snapshot(rows, running, now=time.time())
+    out = {"status": "ok", "tasks": snap["tasks"], "counts": snap["counts"]}
+    if note:
+        out["note"] = note
+    await params.result_callback(out)
 
 
 async def cancel_run_tool(params, ref: str):
