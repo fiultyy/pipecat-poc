@@ -59,6 +59,15 @@ Additional control frames (W3):
   端口自动失效），传输失败以 ``GET /health`` 探活分级；超时/上游失败回
   ``pm.res{error}`` 结构化（不崩连接）；``(client, id)`` 去重窗=内存有界窗
   （60s TTL、≤512 条），窗内同 id 重放不再转发——同 id 只回一次 res
+- PM 事件回流（GW-002，spec-gateway §GW-002）— ``pm.sub{id, kinds}``
+  注册客户端 kinds 白名单 → 每客户端订阅起一条上游 SSE 泵
+  （``GET /subscribe?consumer=<session_id>&kinds=<csv>``），服务侧快照
+  回放先行、泵原序搬运 → ``pm.event{…服务侧事件原样}``（保留服务侧
+  msgid/payload/快照标记，白名单防御性过滤）；``pm.unsub`` 或断开即
+  cancel 泵关上游（零残留）；幂等键=订阅 ``(client, kinds)``（同 kinds
+  重订 no-op），帧面沿用 GW-001 同 id 去重语义；无新持久化（游标归
+  pm-host-service 消费者账，断线重连靠快照回放兜底）；上游流终止（非
+  主动取消）回 ``pm_sub_ended`` 错误帧，恢复=客户端重订
 
 帧协议（§1）：JSON 文本帧（control/event）+ 二进制帧（raw PCM16LE/16k/mono，
 推荐 20ms=640B）。握手序：``auth`` → ``auth.ok{session_id}`` →
@@ -89,7 +98,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlencode
 
-from aiohttp import WSMsgType, web
+from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
 from rt_dsh_lane import DaisLane, DaisLaneError
 
@@ -173,6 +182,12 @@ PM_PROBE_TIMEOUT_S = 2.0              # GET /health 探活预算
 # (client, id) 去重窗：沿用现有内存窗范式（有界 OrderedDict + TTL，无持久化）
 PM_DEDUP_TTL_S = 60.0
 PM_DEDUP_MAX = 512
+# ---- GW-002 事件回流常量（<internal-repo> spec-gateway §GW-002）----
+# op=subscribe 由服务侧 PM-007 提供（收口前由替身 SSE 源验证）；端点路径与
+# query 参数名是网关侧假设，联调以 PM-007 收口形态为准，只调此处不改泵体。
+PM_SUBSCRIBE_PATH = "subscribe"
+PM_KIND_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+PM_SUB_MAX_KINDS = 32
 
 # head pipeline 需要的鸭子面（fake 见 tests；realtime 见 build_realtime_head）:
 #   transcript: TranscriptState      — take_tail()/seed() 供断线重连重播种
@@ -285,6 +300,8 @@ class WsSession:
         # pm.req (client, id) 去重窗（GW-001）：id→首见 monotonic 时刻，
         # 有界内存窗，无持久化
         self._pm_seen: OrderedDict[str, float] = OrderedDict()
+        # pm 订阅态（GW-002）：None=未订阅；{"kinds": tuple, "pump": Task}
+        self._pm_sub: dict | None = None
         self._no_session_warned = False
         self.stats = {
             "audio_in_chunks": 0,
@@ -357,6 +374,10 @@ class WsSession:
             await self._on_head_switch(data)
         elif t == "pm.req":
             await self._on_pm_req(data)
+        elif t == "pm.sub":
+            await self._on_pm_sub(data)
+        elif t == "pm.unsub":
+            await self._on_pm_unsub(data)
         else:
             await self._send_error("bad_type", f"unknown t={t!r}",
                                    req_id=data.get("req_id"))
@@ -979,6 +1000,164 @@ class WsSession:
             frame["data"] = data
         await self._reply(frame)
 
+    # ---- control: PM 事件回流（GW-002：pm.sub/pm.unsub + SSE 泵）----
+
+    @staticmethod
+    def _pm_bad_kinds(kinds: Any) -> str | None:
+        """kinds 白名单机械校验：非空串列表、词法合法、≤上限；违例回原因。"""
+        if not isinstance(kinds, list) or not kinds:
+            return "pm.sub needs a non-empty kinds list (pm.unsub to clear)"
+        if len(kinds) > PM_SUB_MAX_KINDS:
+            return f"pm.sub kinds exceeds {PM_SUB_MAX_KINDS}"
+        for k in kinds:
+            if not isinstance(k, str) or not PM_KIND_RE.fullmatch(k):
+                return f"bad kind {k!r}: must match [A-Za-z0-9_.-]{{1,64}}"
+        return None
+
+    async def _on_pm_sub(self, data: dict) -> None:
+        """pm.sub{id, kinds} → 订阅建立/替换 → pm.res（GW-002）.
+
+        幂等键=订阅 ``(client, kinds)``：同 kinds 重订是 no-op（泵不动，
+        只回 ok）；kinds 不同则 cancel 旧泵起新泵（替换语义）。帧 id 沿用
+        GW-001 去重窗——同 id 重放只回一次 res。发现失败同步快失败（该 id
+        的唯一一帧 pm.res 即 error）；泵内异步失败走 ``pm_sub_failed``/
+        ``pm_sub_ended`` 错误帧（非致命，不占 id、不崩连接）。
+        """
+        pm_id = data.get("id")
+        if (isinstance(pm_id, bool) or not isinstance(pm_id, (str, int))
+                or (isinstance(pm_id, str) and not pm_id)):
+            await self._send_error("bad_request", "pm.sub needs a non-empty id")
+            return
+        if not self._pm_dedup_first(f"{pm_id}"):
+            log.debug("pm.sub id=%s in dedup window; dropped", pm_id)
+            return
+        kinds = data.get("kinds")
+        if reason := self._pm_bad_kinds(kinds):
+            await self._pm_reply(pm_id, error={"code": "bad_request",
+                                               "message": reason})
+            return
+        fresh = tuple(kinds)
+        if self._pm_sub is not None and self._pm_sub["kinds"] == fresh:
+            await self._pm_reply(pm_id, data={"subscribed": list(fresh),
+                                              "note": "already-subscribed"})
+            return
+        if _pm_port() is None:
+            await self._pm_reply(pm_id, error={
+                "code": "pm_unavailable",
+                "message": f"pm.port unreadable: {_pm_port_path()}"})
+            return
+        await self._pm_sub_teardown()
+        pump = asyncio.create_task(self._pm_event_pump(fresh))
+        pump.add_done_callback(self._tasks.remove)
+        self._tasks.append(pump)
+        self._pm_sub = {"kinds": fresh, "pump": pump}
+        await self._pm_reply(pm_id, data={"subscribed": list(fresh)})
+
+    async def _on_pm_unsub(self, data: dict) -> None:
+        """pm.unsub{id} → 取消订阅、关上游泵 → pm.res（幂等 no-op 容忍）。"""
+        pm_id = data.get("id")
+        if (isinstance(pm_id, bool) or not isinstance(pm_id, (str, int))
+                or (isinstance(pm_id, str) and not pm_id)):
+            await self._send_error("bad_request", "pm.unsub needs a non-empty id")
+            return
+        if not self._pm_dedup_first(f"{pm_id}"):
+            log.debug("pm.unsub id=%s in dedup window; dropped", pm_id)
+            return
+        was = await self._pm_sub_teardown()
+        await self._pm_reply(pm_id, data={"subscribed": [], "was_subscribed": was})
+
+    async def _pm_sub_teardown(self) -> bool:
+        """cancel 并等干泵任务（上游连接随任务内 async-with 关闭）→ 无泄漏。
+
+        Returns:
+            是否确有订阅被拆除。
+        """
+        sub, self._pm_sub = self._pm_sub, None
+        if sub is None:
+            return False
+        pump = sub["pump"]
+        if not pump.done():
+            pump.cancel()
+        try:
+            await pump
+        except asyncio.CancelledError:
+            pass  # 泵被本函数取消：等到了干净退出即目的达成
+        except Exception as e:  # noqa: BLE001 — 泵自吞一切，这里只兜底
+            log.warning("pm event pump ended with error: %s", e)
+        return True
+
+    async def _pm_event_pump(self, kinds: tuple[str, ...]) -> None:
+        """上游 SSE 消费泵（GW-002，每客户端订阅一条）.
+
+        ``GET /subscribe?consumer=<session_id>&kinds=<csv>``：服务侧快照
+        回放先行、泵按到达序逐帧搬运（``pm.event{…原样}``，保留服务侧
+        msgid/payload/快照标记；kind 不在白名单的防御性跳过）。连接/读
+        失败、流终止或任何异常 → ``pm_sub_failed``/``pm_sub_ended`` 错误
+        帧（非致命）并退出——不做上游自动重试，恢复=客户端重订（快照
+        回放兜底，游标归 pm-host-service 消费者账）。取消路径零输出。
+        """
+        port = _pm_port()
+        consumer = f"gw-{self.session_id or uuid.uuid4().hex[:8]}"
+        query = urlencode({"consumer": consumer, "kinds": ",".join(kinds)})
+        url = f"http://127.0.0.1:{port}/{PM_SUBSCRIBE_PATH}?{query}"
+        try:
+            timeout = ClientTimeout(total=None, connect=PM_REQ_TIMEOUT_S)
+            async with ClientSession(timeout=timeout) as http:
+                async with http.get(url) as resp:
+                    if resp.status != 200:
+                        body = (await resp.text())[:200]
+                        await self._send_error(
+                            "pm_sub_failed",
+                            f"upstream HTTP {resp.status}: {body}")
+                        return
+                    await self._pm_sse_consume(resp, kinds)
+        except asyncio.CancelledError:
+            raise  # unsub/断开：静默，不发任何帧
+        except Exception as e:  # noqa: BLE001 — 结构化降级，绝不崩连接
+            if not self.closed:
+                await self._send_error("pm_sub_failed", str(e)[:160])
+        else:
+            # 流自然 EOF：仅当本泵仍是客户端在册订阅时告知（被替换/拆除的
+            # 旧泵静默退场）——恢复路径=客户端重订（快照回放兜底）
+            if (not self.closed and self._pm_sub is not None
+                    and self._pm_sub["pump"] is asyncio.current_task()):
+                await self._send_error(
+                    "pm_sub_ended", "upstream event stream ended; re-subscribe")
+
+    async def _pm_sse_consume(self, resp: Any, kinds: tuple[str, ...]) -> None:
+        """SSE 事件循环：按空行分帧，``data:`` 行 JSON 解析 → 白名单 → 搬运。"""
+        buf = b""
+        async for chunk in resp.content.iter_any():
+            buf += chunk
+            while True:
+                cut = buf.find(b"\n\n")
+                if cut < 0:
+                    if len(buf) > 1 << 20:  # 病态上游：无分帧的超长流，弃帧防涨
+                        log.warning("pm event stream frame oversized; dropped")
+                        buf = b""
+                    break
+                raw, buf = buf[:cut], buf[cut + 2:]
+                data_lines = [
+                    ln[5:].lstrip() for ln in raw.decode("utf-8",
+                                                         errors="replace").split("\n")
+                    if ln.startswith("data:")
+                ]
+                if not data_lines:
+                    continue  # 注释/keepalive 行（":"开头）或空事件
+                try:
+                    ev = json.loads("\n".join(data_lines))
+                except ValueError:
+                    log.warning("pm event stream: non-JSON data frame dropped")
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                kind = ev.get("kind")
+                if not isinstance(kind, str) or kind not in kinds:
+                    continue
+                frame = dict(ev)
+                frame["t"] = "pm.event"  # 透传保留 msgid/payload/快照标记等
+                await self._reply(frame)
+
     # ---- media ----
 
     async def _on_audio(self, pcm: bytes) -> None:
@@ -1152,6 +1331,7 @@ class WsSession:
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
+        await self._pm_sub_teardown()
         await self._stop_pipeline()
         self.gateway.release_session(self)
         for task in self._tasks:
