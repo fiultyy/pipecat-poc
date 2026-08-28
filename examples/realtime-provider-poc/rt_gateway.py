@@ -26,6 +26,10 @@
   ``conversation.item.delete``（open 工具对钉住）+ 单条 ``state.snapshot``
   user item 注入（tasks=store.list ∪ backend 运行登记−store），emit
   ``head.compact``；不换会话、doctrine 不动
+- 席位清理控制帧（KG 14 §2.4）— ``fleet.cleanup{ids,mode}``：mode=end
+  先经 dsh loopback 真死会话（已死容忍），再 fleet.json 原子摘条目；
+  mode=release 只摘条目。回包 ``fleet.cleanup.result{req_id,results}``，
+  当前 liaison 绑定席位附 ``note:active-liaison``（不阻断）
 
 帧协议（§1）：JSON 文本帧（control/event）+ 二进制帧（raw PCM16LE/16k/mono，
 推荐 20ms=640B）。握手序：``auth`` → ``auth.ok{session_id}`` →
@@ -43,7 +47,9 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
+import urllib.request
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -281,6 +287,8 @@ class WsSession:
             await self._on_gate_resolve(data)
         elif t == "body.get":
             await self._on_body_get(data)
+        elif t == "fleet.cleanup":
+            await self._on_fleet_cleanup(data)
         else:
             await self._send_error("bad_type", f"unknown t={t!r}")
 
@@ -424,6 +432,72 @@ class WsSession:
             "text": rec.get("body") or "",
             "chars": rec.get("chars") or 0,
             "ts": rec.get("updated_ts") or rec.get("ts") or time.time(),
+        })
+
+    async def _on_fleet_cleanup(self, data: dict) -> None:
+        """fleet.cleanup{ids,mode} → 逐 id 处理 → fleet.cleanup.result（KG 14 §2.4）.
+
+        mode=end 先经 loopback 真死会话（已死容忍——正常清理场景），mode=
+        release 只摘 fleet.json 条目不碰会话；id 不存在该条 not_found 其余
+        照处理；id 为当前 liaison 绑定时附 note:active-liaison（不阻断，
+        摘了下个派发自动拉新是设计内行为）。摘除走原子写；无有效摘除不
+        触碰文件（免空写触发 fleet.snapshot 重发）。
+        """
+        ids = data.get("ids")
+        mode = data.get("mode")
+        if (mode not in FLEET_CLEANUP_MODES
+                or not isinstance(ids, list) or not ids
+                or not all(isinstance(i, str) and i for i in ids)):
+            await self._send_error(
+                "bad_request",
+                f"fleet.cleanup needs non-empty string ids and mode in {FLEET_CLEANUP_MODES}",
+            )
+            return
+        path = _fleet_path()
+        try:
+            with open(path, encoding="utf-8") as fh:
+                fleet = json.load(fh)
+        except (OSError, ValueError) as e:
+            await self._send_error("internal", f"fleet.json unreadable: {e}"[:160])
+            return
+        entries = fleet.get("fleet") if isinstance(fleet, dict) else None
+        if not isinstance(entries, dict):
+            await self._send_error("internal", "fleet.json has no fleet table")
+            return
+        liaison_code = _liaison_bound_code()
+        results: list[dict] = []
+        removed = 0
+        for fid in ids:
+            entry = entries.get(fid)
+            if not isinstance(entry, dict):
+                results.append({"id": fid, "ok": False, "error": "not_found"})
+                continue
+            if mode == "end":
+                sid = str(entry.get("sessionId") or "")
+                if sid:
+                    try:
+                        await _dsh_api(SESSION_END_METHOD, {"sessionId": sid})
+                    except Exception as e:  # noqa: BLE001 — 失败不阻断摘条目
+                        if _session_gone(e):
+                            log.debug("fleet.cleanup %s already gone: %s", sid, e)
+                        else:
+                            log.warning("fleet.cleanup end %s failed: %s", sid, e)
+            item = {"id": fid, "ok": True}
+            if fid == liaison_code:
+                item["note"] = "active-liaison"
+            results.append(item)
+            del entries[fid]
+            removed += 1
+        if removed:
+            try:
+                _atomic_write_json(path, fleet)
+            except OSError as e:
+                await self._send_error("internal", f"fleet.json write failed: {e}"[:160])
+                return
+        await self._reply({
+            "t": "fleet.cleanup.result",
+            "req_id": data.get("req_id"),
+            "results": results,
         })
 
     # ---- media ----
@@ -1052,6 +1126,79 @@ async def attach_store_bridge(gateway: "VoiceGateway") -> Callable[[], None] | N
         await _store_bridge(kind, payload, gateway)
 
     return gateway.bus.subscribe(_bridge)
+
+
+# ---- 席位清理控制面（KG 14 §2.4）：fleet.cleanup → loopback + fleet.json ----
+
+FLEET_CLEANUP_MODES = ("release", "end")
+# loopback 会话真死操作。dsh web API 面无 ``session.end`` 路由；
+# ``workspace.archiveSession`` 是该面唯一的会话退役操作——对 live 会话
+# （running 与否）生效，未知会话回 ``error.code="session-not-found"``
+# （即"会话已不在"分型）。
+SESSION_END_METHOD = "workspace.archiveSession"
+# 已死会话分型标记：archiveSession 的 error.code / 错误 message 用词
+_GONE_MARKERS = ("session-not-found", "no such session")
+
+
+async def _dsh_api(method: str, payload: dict) -> Any:
+    """POST 一条 RPC 到 dsh web loopback API（镜像 rt_dsh_backend._dsh_api
+    的小实现——网关不持有 backend 实例，observe 链路也要能发）。"""
+
+    def _call() -> Any:
+        wire = {"type": "client-request", "rpcId": str(uuid.uuid4()),
+                "method": method, "payload": payload}
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{os.environ.get('DSH_PORT', '3080')}/api/{method}",
+            data=json.dumps(wire).encode(),
+            headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())["result"]
+        if not result.get("ok"):
+            raise RuntimeError(f"{method}: {result.get('error')}")
+        return result["value"]
+
+    return await asyncio.to_thread(_call)
+
+
+def _session_gone(e: BaseException) -> bool:
+    """loopback 会话操作错误是否为"会话已不在"（容忍分型，正常清理场景）。"""
+    text = str(e).lower()
+    return any(marker in text for marker in _GONE_MARKERS)
+
+
+def _fleet_path() -> str:
+    """fleet.json 路径；``MAESTRO_FLEET`` env 覆写（与 session-spawn 同一约定）。"""
+    return os.path.expanduser(
+        os.environ.get("MAESTRO_FLEET", str(MAESTRO_DIR / "fleet.json")))
+
+
+def _atomic_write_json(path: str, obj: dict) -> None:
+    """tempfile + os.replace 原子写（镜像 session-spawn 范式：读者要么见
+    旧文件要么见新文件，永不见半写截断态）。"""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".fleet-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _liaison_bound_code() -> str:
+    """当前 liaison 绑定四码（liaison.json 的 code；缺席/坏文件→空串）。"""
+    path = os.path.expanduser(os.environ.get(
+        "VOICE_LIAISON_STATE", "~/.local/state/voice-gateway/liaison.json"))
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return str(json.load(fh).get("code") or "")
+    except (OSError, ValueError):
+        return ""
 
 
 # ---- live 阶段（W4.1 e2e）：真 pipecat 头，惰性导入，单测不触达 ----

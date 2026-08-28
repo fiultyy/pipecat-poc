@@ -68,9 +68,15 @@ dispatch_plan 加 `"tasks":3`。终稿投递由 `VOICE_FINAL_MODE` 分支（✅P
 - 接线：gateway 会话 `app_resources` 加 `"voice_store"`（`_get_store()` 结果，可为 None，由工具侧降级）；`DEFAULT_VOICE_KINDS += body.push`（语音观测面自动收轻通知）。工具侧从 `params.app_resources.get("voice_store")` 解析台账（缺 key/None→error 形），同步 get/list 经 `asyncio.to_thread` 包裹、异常吞成 error 形；rt_head_tools 不 import rt_gateway（免环）。
 - 约束：工具只读台账、绝不写——`_store_bridge` 仍是唯一写入面（裁决 #8 不变），backend 不感知 store。doctrine # Tools 补两条款（read_body：用户要正文/细节时用，ref_or_no 取上下文完整 ref 或用户念的编号，超长 max_chars/from_tail 分段；list_bodies：问"都有什么任务/什么状态"时列台账），# After Tool Calls 补一条（read_body/list_bodies 结果按用户所问讲，长文先结构要点再按需分段展开）。
 
-### 2.4 显示面（rt_voice_app，✅PR5）
+### 2.4 显示面（rt_voice_app，五页签：语音/编排/回合/席位/任务）
 
-第 6 页签「详情」：左 Treeview（time/no/ref/title/chars，按 ref 去重，body.push 到达即入表）+右只读正文；选中行有 inline 缓存直渲染，否则经观测连接发 `body.get{ref}`，`body.item`/`error` 按 ref 回填右栏。语音页迷你通知行：body.push 到达显示一行（no/status/summary/chars 量级）。回合页：notify 相行 `TURN_PHASE_LABEL`+"📣"；body.push 同 ref 追加灰行「└已入详情」。新逻辑全走纯函数（detail_row/notice_line）+页签装配，无新依赖；selftest 模式覆盖详情装配（无显示环境不实测 GUI）。
+- **语音页**：迷你通知行——body.push 到达显示一行（no/status/summary/chars 量级）。
+- **编排页**：orch.* 任务树+时间线；bridge.msg 原始行独立小面板（orch_log 下方，行首标注来源）。
+- **回合页**：notify 相行 `TURN_PHASE_LABEL`+"📣"；body.push 同 ref 追加灰行「└已入详情」。
+- **席位页**：fleet_tree 表（fleet_rows 纯函数渲染）开多选（`selectmode=extended`）+底部按钮行「释放选中」「结束选中」。点击→tk confirm 确认门（必在：结束=loopback 真杀会话 workspace.archiveSession，文案明示；释放=只出册不碰会话）→确认后经观测连接 send_request 发 `fleet.cleanup{ids,mode,req_id}`（帧规格 KG 11 §3.1）；`fleet.cleanup.result` 渲染一行结果摘要（成功数/失败明细），席位表靠 fleet.snapshot 自动刷新（fleet.json 原子写即触发重快照）。
+- **任务页**：上下 PanedWindow——上=台账+正文（水平 Paned：左 Treeview time/no/ref/title/chars，按 ref 去重，body.push 到达即入表；右只读正文，选中行有 inline 缓存直渲染，否则经观测连接发 `body.get{ref}`，`body.item`/`error` 按 ref 回填），下=tickets 全文面板（tickets.snapshot 渲染）。
+
+新逻辑全走纯函数（detail_row/notice_line/cleanup 请求与结果摘要）+页签装配，无新依赖；selftest 模式覆盖任务页/编排页 bridge 面板/席位多选按钮装配（无显示环境不实测 GUI，走 skip 惯例）。
 
 ### 2.5 压缩衔接（零 LLM 确定性快照，✅PR5）
 

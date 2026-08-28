@@ -1442,3 +1442,270 @@ async def test_notify_phase_head_turn_shape_reaches_observers():
         assert got["conv_id"] == "s-n1" and got["ref"] == "vh-n1"
         assert isinstance(got["ts"], float)
         await close_ws(ws)
+
+
+# ---- M. 席位清理控制面（KG 14 §2.4）：fleet.cleanup → fleet.cleanup.result ----
+# 全程零网络：loopback rpc 以 mock 替身注入（mode=release 本就不发 rpc），
+# fleet.json/liaison.json 指 tmp 路径（MAESTRO_FLEET / VOICE_LIAISON_STATE）。
+
+
+FLEET_SEED = {
+    "port": 3080,
+    "defaultWorkspaceId": "ws-60312e7a",
+    "fleet": {
+        "aa01": {
+            "sessionId": "session-<redacted>",
+            "role": "worker", "node": "node-<redacted>", "preset": "standard",
+            "spawnedAt": "2026-08-24T11:07:16.905913+00:00", "status": "active",
+        },
+        "bb02": {
+            "sessionId": "session-<redacted>",
+            "role": "worker", "node": "vh-head-liaison", "preset": "maestro",
+            "spawnedAt": "2026-08-26T13:31:02.364158+00:00", "status": "active",
+        },
+        "cc03": {
+            "sessionId": "session-<redacted>",
+            "role": "supervisor", "node": "vh-m5-closeout-supervisor-000501",
+            "spawnedAt": "2026-08-25T09:00:00.000000+00:00", "status": "active",
+        },
+    },
+}
+
+
+def _seed_fleet(tmp_path, monkeypatch, seed: dict | None = None) -> Path:
+    path = tmp_path / "fleet.json"
+    path.write_text(json.dumps(seed or FLEET_SEED, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    monkeypatch.setenv("MAESTRO_FLEET", str(path))
+    # 缺省隔离 liaison 绑定（缺席文件→无 note）；需要 note 的测试自行覆写
+    monkeypatch.setenv("VOICE_LIAISON_STATE", str(tmp_path / "absent-liaison.json"))
+    return path
+
+
+def _mock_rpc(monkeypatch, exc: BaseException | None = None) -> list[tuple]:
+    """替身 loopback rpc：记录 (method, payload)；exc 非空则抛。"""
+    calls: list[tuple] = []
+
+    async def _fake(method: str, payload: dict):
+        calls.append((method, dict(payload)))
+        if exc is not None:
+            raise exc
+        return {"archivedSessionIds": [payload.get("sessionId")]}
+
+    monkeypatch.setattr(rt_gateway, "_dsh_api", _fake)
+    return calls
+
+
+async def _fleet_cleanup(ws, ids: list, mode: str, req_id="q-1") -> dict:
+    await ws.send_str(json.dumps(
+        {"t": "fleet.cleanup", "ids": ids, "mode": mode, "req_id": req_id}))
+    return await recv_until(ws, lambda d: d.get("t") == "fleet.cleanup.result")
+
+
+@pytest.mark.asyncio
+async def test_fleet_cleanup_release_removes_entries_without_rpc(tmp_path, monkeypatch):
+    """mode=release：只摘条目不碰会话（零 loopback 调用）；原子写保留
+    其余条目与顶层键原样、目标条目消失。"""
+    path = _seed_fleet(tmp_path, monkeypatch)
+    calls = _mock_rpc(monkeypatch)
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        got = await _fleet_cleanup(ws, ["aa01", "cc03"], "release")
+        assert got["req_id"] == "q-1"
+        assert got["results"] == [{"id": "aa01", "ok": True},
+                                  {"id": "cc03", "ok": True}]
+        await close_ws(ws)
+    assert calls == [], "release 不得触达 loopback 会话面"
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert set(after["fleet"]) == {"bb02"}, "目标条目消失"
+    assert after["fleet"]["bb02"] == FLEET_SEED["fleet"]["bb02"], "其余条目原样保留"
+    assert after["port"] == 3080 and after["defaultWorkspaceId"] == "ws-60312e7a"
+    assert not list(path.parent.glob(".fleet-*")), "原子写不留残留临时文件"
+
+
+@pytest.mark.asyncio
+async def test_fleet_cleanup_end_archives_session_then_removes(tmp_path, monkeypatch):
+    """mode=end：逐 id 先 loopback 真死会话（{sessionId}）再摘条目。"""
+    path = _seed_fleet(tmp_path, monkeypatch)
+    calls = _mock_rpc(monkeypatch)
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        got = await _fleet_cleanup(ws, ["aa01", "bb02"], "end", req_id="q-end")
+        assert got["req_id"] == "q-end"
+        assert [r["id"] for r in got["results"]] == ["aa01", "bb02"]
+        assert all(r["ok"] for r in got["results"])
+        await close_ws(ws)
+    assert calls == [
+        ("workspace.archiveSession",
+         {"sessionId": "session-<redacted>"}),
+        ("workspace.archiveSession",
+         {"sessionId": "session-<redacted>"}),
+    ]
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert set(after["fleet"]) == {"cc03"}
+
+
+@pytest.mark.asyncio
+async def test_fleet_cleanup_end_tolerates_gone_session(tmp_path, monkeypatch):
+    """会话已不在（session-not-found 分型）→ 容忍继续：条目照摘、ok:true。"""
+    path = _seed_fleet(tmp_path, monkeypatch)
+    _mock_rpc(monkeypatch, exc=RuntimeError(
+        "workspace.archiveSession: {'code': 'session-not-found', "
+        "'message': \"cannot archive session 'x': no such session\"}"))
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        got = await _fleet_cleanup(ws, ["aa01"], "end")
+        assert got["results"] == [{"id": "aa01", "ok": True}]
+        await close_ws(ws)
+    assert "aa01" not in json.loads(path.read_text(encoding="utf-8"))["fleet"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_cleanup_end_hard_rpc_failure_still_removes(tmp_path, monkeypatch):
+    """session.end 失败不阻断摘条目（硬失败亦然——注册面与真死解耦）。"""
+    path = _seed_fleet(tmp_path, monkeypatch)
+    _mock_rpc(monkeypatch, exc=OSError("connection refused"))
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        got = await _fleet_cleanup(ws, ["bb02"], "end")
+        assert got["results"] == [{"id": "bb02", "ok": True}]
+        await close_ws(ws)
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert set(after["fleet"]) == {"aa01", "cc03"}
+
+
+@pytest.mark.asyncio
+async def test_fleet_cleanup_not_found_reports_and_rest_continue(tmp_path, monkeypatch):
+    """id 不存在→该条 ok:false error:not_found，其余照处理。"""
+    path = _seed_fleet(tmp_path, monkeypatch)
+    calls = _mock_rpc(monkeypatch)
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        got = await _fleet_cleanup(ws, ["zz99", "aa01"], "end")
+        assert got["results"] == [
+            {"id": "zz99", "ok": False, "error": "not_found"},
+            {"id": "aa01", "ok": True},
+        ]
+        await close_ws(ws)
+    assert len(calls) == 1, "not_found 条目不触达 loopback"
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert set(after["fleet"]) == {"bb02", "cc03"}
+
+
+@pytest.mark.asyncio
+async def test_fleet_cleanup_all_not_found_writes_nothing(tmp_path, monkeypatch):
+    """全 not_found（零有效摘除）→ 不触碰文件（内容字节不变、无临时文件）。"""
+    path = _seed_fleet(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        got = await _fleet_cleanup(ws, ["xx00", "yy00"], "release")
+        assert all(r["ok"] is False and r["error"] == "not_found"
+                   for r in got["results"])
+        await close_ws(ws)
+    assert path.read_bytes() == before
+    assert not list(path.parent.glob(".fleet-*"))
+
+
+@pytest.mark.asyncio
+async def test_fleet_cleanup_bad_request_shapes(tmp_path, monkeypatch):
+    """ids 空/缺席/非串、mode 非法 → error bad_request；fleet.json 不动。"""
+    path = _seed_fleet(tmp_path, monkeypatch)
+    calls = _mock_rpc(monkeypatch)
+    before = path.read_bytes()
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        for payload in (
+            {"ids": [], "mode": "release"},
+            {"mode": "release"},                       # ids 缺席
+            {"ids": "aa01", "mode": "release"},        # 非列表
+            {"ids": ["aa01", 2], "mode": "release"},   # 元素非串
+            {"ids": ["aa01"], "mode": "kill"},
+            {"ids": ["aa01"]},                         # mode 缺席
+        ):
+            await ws.send_str(json.dumps({"t": "fleet.cleanup", **payload}))
+            err = await recv_json(ws)
+            assert err["t"] == "error" and err["code"] == "bad_request", payload
+        await close_ws(ws)
+    assert calls == []
+    assert path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_fleet_cleanup_missing_fleet_file_internal(tmp_path, monkeypatch):
+    """fleet.json 缺席/不可读 → error internal（非 bad_request）。"""
+    monkeypatch.setenv("MAESTRO_FLEET", str(tmp_path / "nope" / "fleet.json"))
+    _mock_rpc(monkeypatch)
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        await ws.send_str(json.dumps(
+            {"t": "fleet.cleanup", "ids": ["aa01"], "mode": "release"}))
+        err = await recv_json(ws)
+        assert err["t"] == "error" and err["code"] == "internal"
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_fleet_cleanup_liaison_note_on_bound_code(tmp_path, monkeypatch):
+    """id 恰为当前 liaison 绑定（liaison.json code）→ 该条附
+    note:active-liaison，不阻断摘除；无绑定文件时无 note。"""
+    path = _seed_fleet(tmp_path, monkeypatch)
+    liaison = tmp_path / "liaison.json"
+    liaison.write_text(json.dumps({"code": "bb02",
+                                   "sessionId": "session-<redacted>",
+                                   "spawned_at": 1787889874.6}), encoding="utf-8")
+    monkeypatch.setenv("VOICE_LIAISON_STATE", str(liaison))
+    _mock_rpc(monkeypatch)
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        got = await _fleet_cleanup(ws, ["aa01", "bb02"], "release")
+        assert got["results"] == [
+            {"id": "aa01", "ok": True},
+            {"id": "bb02", "ok": True, "note": "active-liaison"},
+        ]
+        await close_ws(ws)
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert set(after["fleet"]) == {"cc03"}, "note 不阻断摘除"
+
+    # 绑定文件缺席 → 无 note（对其他席位的清理不带误注）
+    path2 = tmp_path / "fleet2.json"
+    path2.write_text(json.dumps(FLEET_SEED, ensure_ascii=False, indent=2),
+                     encoding="utf-8")
+    monkeypatch.setenv("MAESTRO_FLEET", str(path2))
+    monkeypatch.setenv("VOICE_LIAISON_STATE", str(tmp_path / "absent-liaison.json"))
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        got = await _fleet_cleanup(ws, ["aa01"], "release")
+        assert got["results"] == [{"id": "aa01", "ok": True}]
+        await close_ws(ws)
+    assert "aa01" not in json.loads(path2.read_text(encoding="utf-8"))["fleet"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_cleanup_result_frame_shape_from_observe(tmp_path, monkeypatch):
+    """客户端真实路径（observe 会话 send_request）+ 回包帧形态：键集恰为
+    {t,req_id,results}、条目键集 {id,ok} / {id,ok,error}、顺序随 ids。"""
+    _seed_fleet(tmp_path, monkeypatch)
+    _mock_rpc(monkeypatch)
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await observe_handshake(ws)  # 客户端席位控制走 observe 连接
+        await ws.send_str(json.dumps({"t": "fleet.cleanup", "ids": ["cc03", "zz99"],
+                                      "mode": "end", "req_id": "clean-1"}))
+        got = await recv_until(ws, lambda d: d.get("t") == "fleet.cleanup.result")
+        assert set(got) == {"t", "req_id", "results"}
+        assert got["req_id"] == "clean-1"
+        assert [set(r) for r in got["results"]] == [{"id", "ok"}, {"id", "ok", "error"}]
+        assert got["results"][0] == {"id": "cc03", "ok": True}
+        assert got["results"][1] == {"id": "zz99", "ok": False, "error": "not_found"}
+        await close_ws(ws)

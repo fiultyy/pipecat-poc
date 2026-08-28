@@ -11,9 +11,11 @@ stdlib tkinter（Notebook 页签）+ sounddevice 原生采集 + numpy FFT + aioh
   RMS 电平；**按住说话**（全局热键默认 F9 或按住🎤按钮；🔒锁定=连续采集），
   静音语义只控采集上行，WS 会话保持；断线 2s 重连续接
 - 观测连接（KG 11 §3 observe:true）：独立 WS，缺省订阅全部 topic——
-  编排页（orch.* 任务树+时间线）、回合页（head.turn）、席位页
-  （fleet.snapshot 表）、消息/票板页（bridge.msg + tickets.snapshot）、
-  详情页（body.push 台账：左表右正文，body.get{ref} 拉全文，KG 14 §2.4）
+  编排页（orch.* 任务树+时间线+bridge.msg 原始行面板）、回合页
+  （head.turn）、席位页（fleet.snapshot 表+清理控制面：多选释放/结束
+  → fleet.cleanup，回包一行结果摘要）、任务页（body.push 台账：左表
+  右正文，body.get{ref} 拉全文，KG 14 §2.4；下半 tickets.snapshot 全文
+  面板）
 - 语音页迷你通知行：body.push 到达一行（no/status/summary/chars 量级）；
   回合页 notify 相（📣）+ 同 ref body.push 追加灰行「└已入详情」
 
@@ -434,6 +436,15 @@ def st_write(widget, line: str, tags: "tuple[str, ...] | list[str]" = ()):
     widget.config(state="disabled")
 
 
+def st_set(widget, text: str):
+    """ScrolledText 覆写渲染：整体替换内容——全文快照面板语义（文件原子
+    替换触发整帧重发，追加会滚动累积重复）。"""
+    widget.config(state="normal")
+    widget.delete("1.0", "end")
+    widget.insert("1.0", text)
+    widget.config(state="disabled")
+
+
 TURN_PHASE_LABEL = {
     "user_start": "🗣", "user_end": "·", "user_text": "💬",
     "assistant_start": "🤖", "assistant_end": "✅", "tool_call": "🔧",
@@ -547,6 +558,49 @@ def detail_error_line(frame: dict) -> str:
     return "⚠ " + " ".join(p for p in parts if p)
 
 
+def tickets_text(frame: dict) -> str:
+    """tickets.snapshot 帧 → 面板文本（全文快照，尾部 2000 字窗口）。
+
+    源文件 tickets.md 原子替换即触发整帧重发，面板按覆写渲染
+    （st_set），非增量追加。
+    """
+    if not isinstance(frame, dict):
+        return ""
+    return str(frame.get("text", frame.get("content", "")))[-2000:]
+
+
+def cleanup_request(ids, mode: str, req_id: str) -> dict:
+    """席位清理控制帧（fleet.cleanup）：ids=四码列表，mode=release（只出册）
+    /end（经网关 loopback 真死会话再出册），req_id 关联回包
+    fleet.cleanup.result。"""
+    return {"t": "fleet.cleanup", "ids": [str(i) for i in (ids or [])],
+            "mode": mode, "req_id": req_id}
+
+
+def cleanup_result_line(result: dict) -> str:
+    """fleet.cleanup.result 回包 → 单行结果摘要（成功数 + 失败/备注明细）。
+
+    失败条目带 error（not_found 等）；ok 条目可带 note（active-liaison：
+    该席位是当前 liaison 绑定，摘除后下个派发自动拉新属设计内行为）。
+    """
+    rows: list[dict] = []
+    if isinstance(result, dict):
+        items = result.get("results")
+        if isinstance(items, list):
+            rows = [r for r in items if isinstance(r, dict)]
+    if not rows:
+        return "⚠ 清理回包不可读"
+    ok_n = sum(1 for r in rows if r.get("ok"))
+    parts = [f"🧹 清理 {ok_n}/{len(rows)} 成功"]
+    fails = [f"{r.get('id', '?')}({r.get('error', '?')})" for r in rows if not r.get("ok")]
+    if fails:
+        parts.append("失败 " + " ".join(fails))
+    notes = [f"{r.get('id', '?')}:{r.get('note')}" for r in rows if r.get("note")]
+    if notes:
+        parts.append("备注 " + " ".join(notes))
+    return "；".join(parts)
+
+
 class PushToTalk:
     """按住说话状态机：press/release → start/stop 动作。
 
@@ -597,6 +651,7 @@ class App:
         self.detail_bodies: dict[str, str] = {}    # ref → body.get 拉取全文
         self._detail_pending: str | None = None    # 在途 body.get 的 ref
         self._notify_refs: set[str] = set()        # 回合页已见 notify 相的 ref
+        self._cleanup_seq = 0                      # fleet.cleanup req_id 序号
         self.stream: sd.InputStream | None = None
 
         root.title("rt-voice · ONE 桌面客户端（语音+观测）")
@@ -660,6 +715,7 @@ class App:
 
         # ---- 观测页签 ----
         orch_tab = ttk.Frame(self.nb, padding=6)
+        self.orch_tab = orch_tab
         self.nb.add(orch_tab, text=" 编排 ")
         self.orch_tree = scrolledtext.ScrolledText(orch_tab, font=("monospace 9"),
                                                    state="disabled", height=8)
@@ -667,6 +723,12 @@ class App:
         self.orch_log = scrolledtext.ScrolledText(orch_tab, font=("monospace 8"),
                                                   state="disabled", wrap="word")
         self.orch_log.pack(fill="both", expand=True)
+        # bridge.msg 原始行（inbox.log 增量）：编排页底部独立小面板，标注来源
+        ttk.Label(orch_tab, text="bridge.msg · inbox.log 增量行",
+                  foreground="#8a8a8a").pack(anchor="w", pady=(6, 0))
+        self.bridge_log = scrolledtext.ScrolledText(orch_tab, font=("monospace 8"),
+                                                    state="disabled", wrap="none", height=6)
+        self.bridge_log.pack(fill="both", expand=False)
 
         turn_tab = ttk.Frame(self.nb, padding=6)
         self.nb.add(turn_tab, text=" 回合 ")
@@ -678,32 +740,46 @@ class App:
         fleet_tab = ttk.Frame(self.nb, padding=6)
         self.nb.add(fleet_tab, text=" 席位 ")
         cols = ("code", "alias", "node", "role", "status")
-        self.fleet_tree = ttk.Treeview(fleet_tab, columns=cols, show="headings", height=18)
+        # 多选（extended）：清理动作按批处理所选席位
+        self.fleet_tree = ttk.Treeview(fleet_tab, columns=cols, show="headings",
+                                       height=18, selectmode="extended")
         for c, w in zip(cols, (60, 110, 190, 90, 90)):
             self.fleet_tree.heading(c, text=c)
             self.fleet_tree.column(c, width=w, anchor="w")
         self.fleet_tree.pack(fill="both", expand=True)
+        # 清理控制面：释放=只出册；结束=经网关 loopback 真死会话再出册
+        fleet_bar = ttk.Frame(fleet_tab)
+        fleet_bar.pack(fill="x", pady=(6, 0))
+        self.fleet_release_btn = ttk.Button(
+            fleet_bar, text="释放选中", command=lambda: self._fleet_cleanup("release"))
+        self.fleet_release_btn.pack(side="left")
+        self.fleet_end_btn = ttk.Button(
+            fleet_bar, text="结束选中", command=lambda: self._fleet_cleanup("end"))
+        self.fleet_end_btn.pack(side="left", padx=(8, 0))
+        self.fleet_note_var = tk.StringVar(value="")
+        ttk.Label(fleet_tab, textvariable=self.fleet_note_var,
+                  foreground="#555").pack(anchor="w", pady=(4, 0))
 
-        stream_tab = ttk.Frame(self.nb, padding=6)
-        self.nb.add(stream_tab, text=" 消息/票板 ")
-        self.bridge_log = scrolledtext.ScrolledText(stream_tab, font=("monospace 8"),
-                                                    state="disabled", wrap="none", height=12)
-        self.bridge_log.pack(fill="both", expand=True)
-        self.tickets_log = scrolledtext.ScrolledText(stream_tab, font=("monospace 8"),
-                                                     state="disabled", wrap="none", height=10)
-        self.tickets_log.pack(fill="both", expand=True)
-
-        # ---- 详情页签（KG 14 §2.4）：左台账表（按 ref 去重）+ 右只读正文 ----
-        detail_tab = ttk.Frame(self.nb, padding=6)
-        self.nb.add(detail_tab, text=" 详情 ")
-        detail_pane = self.ttk.PanedWindow(detail_tab, orient="horizontal")
+        # ---- 任务页签（详情整合 + tickets 全文）：上下 PanedWindow ----
+        # 上=台账表（body.push 按 ref 去重）+右只读正文（body.get 拉全文，
+        # KG 14 §2.4 原详情页全部内容，水平 Paned 沿用）；
+        # 下=tickets.md 全文面板（tickets.snapshot 覆写渲染）
+        task_tab = ttk.Frame(self.nb, padding=6)
+        self.nb.add(task_tab, text=" 任务 ")
+        task_pane = self.ttk.PanedWindow(task_tab, orient="vertical")
+        task_pane.pack(fill="both", expand=True)
+        task_top = ttk.Frame(task_pane)
+        self.task_bottom = ttk.Frame(task_pane)
+        task_pane.add(task_top, weight=3)
+        task_pane.add(self.task_bottom, weight=2)
+        detail_pane = self.ttk.PanedWindow(task_top, orient="horizontal")
         detail_pane.pack(fill="both", expand=True)
         detail_left = ttk.Frame(detail_pane)
         detail_right = ttk.Frame(detail_pane)
         detail_pane.add(detail_left, weight=3)
         detail_pane.add(detail_right, weight=4)
         self.detail_tree = ttk.Treeview(detail_left, columns=DETAIL_COLS,
-                                        show="headings", height=18, selectmode="browse")
+                                        show="headings", height=10, selectmode="browse")
         for c, w in zip(DETAIL_COLS, (76, 44, 130, 280, 52)):
             self.detail_tree.heading(c, text=c)
             self.detail_tree.column(c, width=w, anchor="w")
@@ -713,6 +789,12 @@ class App:
                                                      font=("monospace 9"),
                                                      state="disabled", wrap="word")
         self.detail_body.pack(fill="both", expand=True)
+        ttk.Label(self.task_bottom, text="tickets.md 全文（tickets.snapshot）",
+                  foreground="#8a8a8a").pack(anchor="w")
+        self.tickets_log = scrolledtext.ScrolledText(self.task_bottom,
+                                                     font=("monospace 8"),
+                                                     state="disabled", wrap="none")
+        self.tickets_log.pack(fill="both", expand=True)
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._draw_spectrum(np.zeros(BARS))
@@ -784,10 +866,12 @@ class App:
                     st_write(self.orch_log, f"[观测错误] {detail_error_line(f)}")
             elif t == "fleet.snapshot":
                 self._render_fleet(f)
+            elif t == "fleet.cleanup.result":
+                self.fleet_note_var.set(cleanup_result_line(f))
             elif t == "bridge.msg":
                 st_write(self.bridge_log, str(f.get("line", ""))[:300])
             elif t == "tickets.snapshot":
-                st_write(self.tickets_log, str(f.get("text", f.get("content", "")))[-2000:])
+                st_set(self.tickets_log, tickets_text(f))
             elif "_error" in f:
                 st_write(self.orch_log, f"[观测错误] {f['_error']}")
             elif "_link" in f:
@@ -805,6 +889,43 @@ class App:
         self.fleet_tree.delete(*self.fleet_tree.get_children())
         for row in rows:
             self.fleet_tree.insert("", "end", values=row)
+
+    # ---- 席位清理控制面（fleet.cleanup，经观测连接出站） ----
+
+    def _fleet_cleanup(self, mode: str):
+        """释放/结束所选席位：确认门 → observe send_request 发 fleet.cleanup。
+
+        结束=经网关 loopback 真死会话再出册（不可恢复，确认文案明示）；
+        释放=只出册不碰会话。回包 fleet.cleanup.result 渲染一行结果摘要；
+        席位表靠 fleet.snapshot（fleet.json 原子写触发）自动刷新。
+        """
+        ids = [str(self.fleet_tree.item(i, "values")[0])
+               for i in self.fleet_tree.selection()]
+        if not ids:
+            self.fleet_note_var.set("未选中席位")
+            return
+        if not (self.obs_link and self.obs_link._thread
+                and self.obs_link._thread.is_alive()):
+            self.fleet_note_var.set("观测连接未开——开启「观测」后可清理席位")
+            return
+        from tkinter import messagebox
+
+        if mode == "end":
+            msg = (f"结束 {len(ids)} 个席位（{'、'.join(ids)}）？\n\n"
+                   "结束将经网关真正终止会话进程——"
+                   "通话立即断开、不可恢复；席位条目同时出册。")
+            title, icon = "结束席位确认", "warning"
+        else:
+            msg = (f"释放 {len(ids)} 个席位（{'、'.join(ids)}）？\n\n"
+                   "释放只把席位条目从 fleet.json 出册，"
+                   "不触碰正在运行的会话。")
+            title, icon = "释放席位确认", "question"
+        if not messagebox.askyesno(title, msg, parent=self.root, icon=icon):
+            return
+        self._cleanup_seq += 1
+        req_id = f"clean-{int(time.time() * 1000)}-{self._cleanup_seq}"
+        self.fleet_note_var.set(f"已发清理请求（{mode} · {len(ids)} 个席位）…")
+        self.obs_link.send_request(cleanup_request(ids, mode, req_id))
 
     # ---- 详情页签（KG 14 §2.4：表按 ref 去重，正文两级缓存+观测拉取） ----
 
@@ -876,7 +997,8 @@ class App:
 
     def _selftest_probe(self):
         """selftest 冒烟（无显示环境 CI）：假帧走真实渲染路径——回放批入表、
-        notify 相记 ref、单条 push 入表+灰行、body.item 回填缓存。不触网。"""
+        notify 相记 ref、单条 push 入表+灰行、body.item 回填缓存；席位快照
+        入表、bridge 行入编排页、tickets 覆写、清理回包摘要行。不触网。"""
         now = time.time()
         self.obs_q.put({"t": "body.push", "items": [
             {"ref": "vh-self1", "no": 1, "status": "done", "title": "回放标题",
@@ -890,6 +1012,14 @@ class App:
                         "inline": "inline 正文", "ts": now})
         self.obs_q.put({"t": "body.item", "ref": "vh-self1", "title": "回放标题",
                         "text": "全文正文", "chars": 4, "ts": now})
+        self.obs_q.put({"t": "fleet.snapshot", "fleet": {
+            "<seat>": {"sessionId": "s-a", "alias": "webgui", "node": "voice-head",
+                     "role": "orchestrator", "status": "active"}}})
+        self.obs_q.put({"t": "bridge.msg", "line": "selftest bridge 增量行"})
+        self.obs_q.put({"t": "tickets.snapshot", "text": "# 票板\n- [ ] selftest 项"})
+        self.obs_q.put({"t": "fleet.cleanup.result", "req_id": "self-clean-1",
+                        "results": [{"id": "20d0", "ok": True,
+                                     "note": "active-liaison"}]})
 
     def end_session(self):
         """优雅收尾需要一帧 session.end——经由 tx 旁路不便，此处仅断链。

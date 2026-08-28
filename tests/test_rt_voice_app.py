@@ -6,12 +6,14 @@
 
 - ObserveLink handshake: auth → observe session.start → session.started
   echoes topics; observe flag present, no media path. Outbound request face
-  (body.get) rides the same ws; in-session ``error`` frames are per-request
-  (fed to the obs queue) instead of dropping the link.
+  (body.get / fleet.cleanup) rides the same ws; in-session ``error`` frames
+  are per-request (fed to the obs queue) instead of dropping the link.
 - Pure render helpers: fleet_rows / orch_tree_lines / turn_line plus the
   detail-tab helpers (rows from push, ref-dedup merge, notice lines, notify
-  label, ack gray line, error line).
-- Detail tab assembly smoke (real tkinter widgets, no network, no mainloop).
+  label, ack gray line, error line) and the tab-consolidation helpers
+  (cleanup_request frame, cleanup_result_line summary, tickets_text).
+- Tab assembly smoke (real tkinter widgets, no network, no mainloop):
+  detail/task tab and the fleet cleanup control face.
 """
 
 import asyncio
@@ -31,6 +33,8 @@ from rt_voice_app import (  # noqa: E402
     ObserveLink,
     PushToTalk,
     chars_mag,
+    cleanup_request,
+    cleanup_result_line,
     detail_ack_line,
     detail_error_line,
     detail_rows_from_push,
@@ -39,6 +43,7 @@ from rt_voice_app import (  # noqa: E402
     notice_line_from_push,
     orch_tree_lines,
     replay_notice_line,
+    tickets_text,
     turn_label_with_notify,
     turn_line,
 )
@@ -265,6 +270,52 @@ async def test_observe_link_body_get_roundtrip(monkeypatch):
     assert [g.get("ref") for g in gets] == ["vh-1", "vh-miss"]
 
 
+@pytest.mark.asyncio
+async def test_observe_link_fleet_cleanup_roundtrip(monkeypatch):
+    """fleet.cleanup 经观测连接发出（握手先行）；fleet.cleanup.result
+    回包按 req_id 关联进 obs 队列——send_request 出站请求面往返验证。"""
+    ws = _FakeWs([])
+
+    def on_send(obj):
+        if obj.get("t") != "fleet.cleanup":
+            return None
+        return {"t": "fleet.cleanup.result", "req_id": obj.get("req_id"),
+                "results": [{"id": i, "ok": True} for i in obj.get("ids")]}
+
+    ws.on_send = on_send
+    obs: queue.Queue = queue.Queue()
+    states: list[str] = []
+    link = ObserveLink("ws://x/ws", "tok", obs, states.append)
+    link.send_request(cleanup_request(["20d0", "9b95"], "end", "r-clean-1"))
+
+    monkeypatch.setattr(
+        "aiohttp.ClientSession",
+        lambda *a, **k: _FakeHttp(ws),
+    )
+    task = asyncio.create_task(link._worker())
+
+    deadline = time.monotonic() + 5.0
+    got = None
+    while time.monotonic() < deadline:
+        while not obs.empty():
+            f = obs.get_nowait()
+            if f.get("t") == "fleet.cleanup.result":
+                got = f
+        if got is not None:
+            break
+        await asyncio.sleep(0.01)
+
+    link._stop.set()
+    ws.closed = True
+    await asyncio.wait_for(task, timeout=5)
+
+    assert got is not None and got["req_id"] == "r-clean-1"
+    assert [r["id"] for r in got["results"]] == ["20d0", "9b95"]
+    sent = [m for m in ws.sent if m.get("t") == "fleet.cleanup"]
+    assert sent == [{"t": "fleet.cleanup", "ids": ["20d0", "9b95"],
+                     "mode": "end", "req_id": "r-clean-1"}]
+
+
 # ---- KG 14 §2.4 详情页签 / 迷你通知行 / 回合 notify 相 纯函数 ----
 
 
@@ -361,6 +412,53 @@ def test_detail_error_line():
     assert detail_error_line(None) == "⚠ 未知错误"
 
 
+# ---- 页签整合 + 席位清理控制面：纯函数 ----
+
+
+def test_cleanup_request_frame():
+    assert cleanup_request(["20d0", "9b95"], "end", "r-1") == \
+        {"t": "fleet.cleanup", "ids": ["20d0", "9b95"],
+         "mode": "end", "req_id": "r-1"}
+    assert cleanup_request(["a1b2"], "release", "r-2")["mode"] == "release"
+    assert cleanup_request([], "release", "r-3") == \
+        {"t": "fleet.cleanup", "ids": [], "mode": "release", "req_id": "r-3"}
+    assert cleanup_request([20, 30], "release", "r-4")["ids"] == ["20", "30"]  # str 归一
+    assert cleanup_request(None, "end", "r-5")["ids"] == []
+
+
+def test_cleanup_result_line():
+    ok = {"t": "fleet.cleanup.result", "req_id": "r-1", "results": [
+        {"id": "20d0", "ok": True}, {"id": "9b95", "ok": True}]}
+    assert cleanup_result_line(ok) == "🧹 清理 2/2 成功"
+    # 失败明细 + active-liaison 备注（ok 条目不阻断）
+    mixed = {"results": [
+        {"id": "20d0", "ok": True},
+        {"id": "aaaa", "ok": False, "error": "not_found"},
+        {"id": "9b95", "ok": True, "note": "active-liaison"},
+    ]}
+    line = cleanup_result_line(mixed)
+    assert "2/3" in line
+    assert "aaaa(not_found)" in line
+    assert "9b95:active-liaison" in line
+    # 畸形回包 → 占位行，不抛
+    assert cleanup_result_line({}) == "⚠ 清理回包不可读"
+    assert cleanup_result_line({"results": []}) == "⚠ 清理回包不可读"
+    assert cleanup_result_line({"results": "corrupt"}) == "⚠ 清理回包不可读"
+    assert cleanup_result_line({"results": ["x", None]}) == "⚠ 清理回包不可读"
+    assert cleanup_result_line(None) == "⚠ 清理回包不可读"
+
+
+def test_tickets_text_tail_window():
+    assert tickets_text({"t": "tickets.snapshot", "text": "# T\n- [ ] 项"}) == "# T\n- [ ] 项"
+    assert tickets_text({"content": "无 text 退 content"}) == "无 text 退 content"
+    assert tickets_text({"text": ""}) == ""
+    assert tickets_text({}) == ""
+    assert tickets_text(None) == ""
+    long = "x" * 3000
+    out = tickets_text({"text": long})
+    assert len(out) == 2000 and out == "x" * 2000   # 尾部窗口
+
+
 def test_detail_tab_assembly_smoke():
     """详情页签装配冒烟（真 tkinter、无网络、无 mainloop）：假 body.push
     进表按 ref 去重、notify 灰行、inline/回填缓存直渲染。无显示环境跳过。"""
@@ -397,6 +495,68 @@ def test_detail_tab_assembly_smoke():
         turn_text = app.turn_log.get("1.0", "end")
         assert "📣 notify → vh-self2" in turn_text
         assert turn_text.count("└ 已入详情 vh-self2") == 1
+    finally:
+        if app is not None and getattr(app, "ptt_listener", None):
+            app.ptt_listener.stop()
+        root.destroy()
+
+
+def test_task_fleet_tabs_assembly_smoke():
+    """任务页（台账+正文+tickets 面板）/编排页 bridge 行/席位多选+清理按钮
+    装配冒烟（真 tkinter、无网络、无 mainloop）。空选择与观测未开两条
+    早退路径不弹确认框——无显示环境可安全驱动。无显示环境跳过。"""
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+    except Exception as e:  # noqa: BLE001 — headless 环境
+        pytest.skip(f"no display for tkinter: {e}")
+    root.withdraw()
+    app = None
+    try:
+        app = App(root, "ws://127.0.0.1:8765/ws", "", False)
+        root.update()
+
+        # 页签序：语音/编排/回合/席位/任务（消息/票板、详情页已整合）
+        assert [app.nb.tab(t, "text").strip() for t in app.nb.tabs()] == \
+            ["语音", "编排", "回合", "席位", "任务"]
+
+        # bridge.msg → 编排页底部独立小面板（ScrolledText 内嵌一层 plain
+        # Frame，取 master.master 判真实挂载页）
+        assert app.bridge_log.master.master is app.orch_tab
+        app.obs_q.put({"t": "bridge.msg", "line": "bridge 增量行内容"})
+
+        # tickets.snapshot → 任务页下半面板（覆写渲染，面板挂任务页下栏）
+        assert app.tickets_log.master.master is app.task_bottom
+        app.obs_q.put({"t": "tickets.snapshot", "text": "# 票板\n- [ ] 项一"})
+
+        # fleet.cleanup.result → 席位页结果摘要行
+        app.obs_q.put({"t": "fleet.cleanup.result", "req_id": "r-sm",
+                       "results": [{"id": "20d0", "ok": True}]})
+        app._drain_obs()
+        root.update()
+
+        assert "bridge 增量行内容" in app.bridge_log.get("1.0", "end")
+        assert "# 票板" in app.tickets_log.get("1.0", "end")
+        assert app.fleet_note_var.get() == "🧹 清理 1/1 成功"
+
+        # 席位表多选 + 清理双按钮已装配
+        assert str(app.fleet_tree.cget("selectmode")) == "extended"
+        assert app.fleet_release_btn.winfo_exists()
+        assert app.fleet_end_btn.winfo_exists()
+
+        # 空选择点击 → 提示早退（不弹确认框）
+        app._fleet_cleanup("end")
+        assert app.fleet_note_var.get() == "未选中席位"
+
+        # 有选择但观测未开 → 提示早退（不弹确认框、不触网）
+        app._render_fleet({"fleet": {
+            "<seat>": {"sessionId": "s-a", "alias": "webgui", "node": "voice-head",
+                     "role": "orchestrator", "status": "active"}}})
+        root.update()
+        app.fleet_tree.selection_set(app.fleet_tree.get_children()[0])
+        app._fleet_cleanup("release")
+        assert "观测连接未开" in app.fleet_note_var.get()
     finally:
         if app is not None and getattr(app, "ptt_listener", None):
             app.ptt_listener.stop()
