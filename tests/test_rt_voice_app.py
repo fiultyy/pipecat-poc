@@ -845,10 +845,11 @@ def test_whiteboard_set_line():
     assert whiteboard_set_line(None) == "⚠ 白板回包不可读"
 
 
-def test_whiteboard_tab_assembly_smoke():
-    """白板页装配冒烟（真 tkinter、无网络、无 mainloop）：可编辑文本区+
-    同步按钮；观测未开提示早退；stub 连接下出站帧带整段文本、req_id
-    唯一；whiteboard.set.result 入 obs_q 后 _drain_obs 渲染结果行。
+def test_whiteboard_tab_assembly_smoke(monkeypatch):
+    """白板页装配冒烟（真 tkinter、无网络、无 mainloop）：可编辑文本区即
+    白板本体，无手动同步钮；观测未开提示早退；stub 连接下推送帧带整段
+    文本、req_id 唯一；防抖窗口内连续改动合并成一帧末版全文；
+    whiteboard.set.result 入 obs_q 后 _drain_obs 渲染结果行。
     无显示环境跳过。"""
     try:
         import tkinter as tk
@@ -862,27 +863,27 @@ def test_whiteboard_tab_assembly_smoke():
         app = App(root, "ws://127.0.0.1:8765/ws", "", False)
         root.update()
 
-        # 可编辑文本区（默认 normal）+ 同步按钮已装配
-        assert app.wb_sync_btn.winfo_exists()
+        # 可编辑文本区（默认 normal）已装配；无手动同步钮（自动同步面）
         assert str(app.wb_text.cget("state")) == "normal"
+        assert not hasattr(app, "wb_sync_btn")
         app.wb_text.insert("1.0", "白板正文\n第二行")
         assert app.wb_text.get("1.0", "end-1c") == "白板正文\n第二行"
 
-        # 观测未开 → 提示早退（不触网）
-        app._whiteboard_sync()
+        # 观测未开 → 推送早退记提示（不触网）
+        app._whiteboard_push()
         assert "观测连接未开" in app.whiteboard_note_var.get()
 
-        # stub 连接：出站 whiteboard.set 帧（整段文本）+ req_id 唯一
+        # stub 连接：推送 whiteboard.set 帧（整段文本）+ req_id 唯一
         app.obs_link = _StubObsLink()
-        app._whiteboard_sync()
+        app._whiteboard_push()
         app.wb_text.delete("1.0", "end")
         app.wb_text.insert("1.0", "第二版")
-        app._whiteboard_sync()
+        app._whiteboard_push()
         reqs = [r for r in app.obs_link.sent if r.get("t") == "whiteboard.set"]
         assert [r["text"] for r in reqs] == ["白板正文\n第二行", "第二版"]
         assert all(set(r.keys()) == {"t", "text", "req_id"} for r in reqs)
         assert reqs[0]["req_id"] != reqs[1]["req_id"]
-        assert app.whiteboard_note_var.get() == "已发同步请求（3 字）…"
+        assert app.whiteboard_note_var.get() == "白板同步中（3 字）…"
 
         # 回包入 obs_q → _drain_obs：结果行
         app.obs_q.put({"t": "whiteboard.set.result", "req_id": reqs[1]["req_id"],
@@ -890,6 +891,21 @@ def test_whiteboard_tab_assembly_smoke():
         app._drain_obs()
         root.update()
         assert app.whiteboard_note_var.get() == "✓ 白板已同步（3 字）"
+
+        # 防抖：窗口内两次改动合并一帧、推末版全文（钳短窗口注入）
+        monkeypatch.setattr("rt_voice_app.WB_SYNC_DEBOUNCE_MS", 40)
+        app.wb_text.delete("1.0", "end")
+        app.wb_text.insert("1.0", "改一")
+        app.wb_text.insert("end", "改二")
+        root.update()                     # 排程 <<Modified>> → 防抖定时器
+        assert app._wb_push_job is not None
+        for _ in range(20):               # 走完 40ms 窗口
+            root.update()
+            time.sleep(0.01)
+        assert app._wb_push_job is None
+        merged = [r for r in app.obs_link.sent
+                  if r.get("t") == "whiteboard.set" and r["text"] == "改一改二"]
+        assert len(merged) == 1
 
         # 失败回包 → 原因行
         app.obs_q.put({"t": "whiteboard.set.result", "req_id": "r-x",
