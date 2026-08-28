@@ -61,11 +61,22 @@ DB_FLOOR = -60.0
 WB_SYNC_DEBOUNCE_MS = 600              # 白板改动 → 自动同步的防抖窗口
 VAD_TAIL_MS = 1500                     # 松键尾静音总长：服务端 VAD 判句尾阈值实测 >700ms
 VAD_TAIL_STEP_MS = 50                  # 步进投递：50ms/块=32KB/s，低于网关 64KB/s 限速
+PENDING_TIMEOUT_S = 5.0                # 控制请求在途上限：超时清登记并回填提示
 
 LOG_SHORT = {
     "orch.dispatch": "派发", "orch.progress": "进展", "orch.done": "终稿",
     "auth.ok": "鉴权", "session.started": "会话", "session.ended": "结束",
     "gate.resolved": "闸解", "error": "错误", "body.push": "台账",
+}
+
+# 在途控制请求 kind → 提示中文名：error 回包/超时/发送失败按 kind 组装回填行
+PENDING_KINDS = {
+    "fleet.cleanup": "清理",
+    "fleet.brief": "席位简报",
+    "head.switch": "head 切换",
+    "head.list": "head 配置",
+    "body.get": "拉取",
+    "whiteboard.set": "白板同步",
 }
 
 
@@ -329,6 +340,9 @@ class ObserveLink:
             try:
                 await ws.send_json(req)
             except Exception:  # noqa: BLE001 — 连接已断：外层 async for 随即退出重连
+                rid = req.get("req_id") if isinstance(req, dict) else None
+                if isinstance(rid, str) and rid:
+                    self.obs.put({"_send_failed": rid})  # UI 侧回填「发送失败」
                 return
 
     async def _worker(self):
@@ -512,15 +526,16 @@ def replay_notice_line(frame: dict) -> str:
     return f"📣 台账回放 {len(items)} 条（详情页签查看）"
 
 
-DETAIL_COLS = ("time", "no", "ref", "title", "chars")
+DETAIL_COLS = ("time", "no", "ref", "title", "chars", "status")
 DETAIL_REF_I = DETAIL_COLS.index("ref")
 
 
 def detail_rows_from_push(frame: dict) -> list[tuple]:
-    """body.push 帧 → 详情表行 (time/no/ref/title/chars)。
+    """body.push 帧 → 详情表行 (time/no/ref/title/chars/status)。
 
     单条帧（ref/inline 形）出一行；回放帧（items 批、无 inline）按批
-    出多行；无 ref 条目与非 dict 条目跳过。行序=帧内序（合并时去重）。
+    出多行；无 ref 条目与非 dict 条目跳过。行序=帧内序（合并时去重）；
+    条目缺 status 键 → 空串（旧网关帧向后兼容）。
     """
     if not isinstance(frame, dict):
         return []
@@ -536,7 +551,7 @@ def detail_rows_from_push(frame: dict) -> list[tuple]:
             if isinstance(ts, (int, float)) else ""
         rows.append((when, str(e.get("no", "") if e.get("no") is not None else ""),
                      str(e.get("ref")), str(e.get("title", "") or "")[:28],
-                     str(e.get("chars", 0))))
+                     str(e.get("chars", 0)), str(e.get("status", "") or "")))
     return rows
 
 
@@ -566,6 +581,24 @@ def detail_error_line(frame: dict) -> str:
         return "⚠ 未知错误"
     parts = [str(frame.get("code") or "?"), str(frame.get("msg", "") or "")[:120]]
     return "⚠ " + " ".join(p for p in parts if p)
+
+
+def pending_error_line(kind: str, frame: dict) -> str:
+    """命中的 error 帧 → 「<中文名>失败：code msg」回填行。"""
+    name = PENDING_KINDS.get(kind, kind or "请求")
+    msg = " ".join(p for p in (str(frame.get("code") or ""),
+                               str(frame.get("msg") or "")[:120]) if p)
+    return f"{name}失败：{msg or '未知错误'}"
+
+
+def pending_timeout_line(kind: str) -> str:
+    """在途超时 → 「<中文名>超时无响应」回填行。"""
+    return f"{PENDING_KINDS.get(kind, kind or '请求')}超时无响应"
+
+
+def pending_send_fail_line(kind: str) -> str:
+    """req 泵发送失败 → 「<中文名>失败：发送失败（链路断开）」回填行。"""
+    return f"{PENDING_KINDS.get(kind, kind or '请求')}失败：发送失败（链路断开）"
 
 
 def tickets_text(frame: dict) -> str:
@@ -659,6 +692,23 @@ def fleet_brief_lines(result) -> list[str]:
             line += " (会话已死)"
         lines.append(line)
     return lines
+
+
+def liaison_line(liaison) -> str:
+    """fleet.brief.result 顶层 liaison 字段 → 席位页常显状态行。
+
+    契约：字段恒存在 ``{"bound": bool, "code": str|null,
+    "sessionId": str|null, "archived": bool}``。bound=false → 无绑定；
+    bound → 席位码（archived 追加「（已归档）」）。非 dict（防御）→
+    未知；字段缺失（旧网关回包）由调用方保持原显示不覆盖。
+    """
+    if not isinstance(liaison, dict):
+        return "对接席位：未知"
+    if not liaison.get("bound"):
+        return "对接席位：无绑定"
+    code = str(liaison.get("code") or "?")
+    suffix = "（已归档）" if liaison.get("archived") else ""
+    return f"对接席位：{code}{suffix}"
 
 
 def head_list_request(req_id: str) -> dict:
@@ -777,6 +827,10 @@ class App:
         self._brief_seq = 0                        # fleet.brief req_id 序号
         self._head_seq = 0                         # head.switch req_id 序号
         self._wb_seq = 0                           # whiteboard.set req_id 序号
+        self._body_seq = 0                         # body.get req_id 序号
+        self._pending: dict[str, dict] = {}        # req_id → {kind, ts[, ref]} 在途控制请求
+        self._fleet_codes: set[str] | None = None  # 上次 fleet.snapshot 席位码（移出 diff 源）
+        self._fleet_events: list[str] = []         # 席位移出事件行（最近若干条进提示行）
         self._wb_push_job: str | None = None       # 白板防抖自动同步定时器
         self.stream: sd.InputStream | None = None
 
@@ -900,6 +954,11 @@ class App:
         self.fleet_brief_btn = ttk.Button(
             fleet_bar, text="简报", command=self._fleet_brief)
         self.fleet_brief_btn.pack(side="left", padx=(8, 0))
+        # liaison 常显行：数据来自 fleet.brief.result 顶层 liaison 字段；
+        # 未收到过该字段（旧网关）保持「未知」
+        self.liaison_var = tk.StringVar(value="对接席位：未知")
+        ttk.Label(fleet_bar, textvariable=self.liaison_var,
+                  foreground="#555").pack(side="left", padx=(12, 0))
         # 席位简报面板：fleet.brief.result 逐行渲染（一行一席，追加式）
         self.fleet_brief_log = scrolledtext.ScrolledText(
             fleet_tab, font=("monospace 8"), state="disabled", wrap="none", height=6)
@@ -944,7 +1003,7 @@ class App:
         detail_pane.add(detail_right, weight=4)
         self.detail_tree = ttk.Treeview(detail_left, columns=DETAIL_COLS,
                                         show="headings", height=10, selectmode="browse")
-        for c, w in zip(DETAIL_COLS, (76, 44, 130, 280, 52)):
+        for c, w in zip(DETAIL_COLS, (76, 44, 130, 280, 52, 76)):
             self.detail_tree.heading(c, text=c)
             self.detail_tree.column(c, width=w, anchor="w")
         self.detail_tree.pack(fill="both", expand=True)
@@ -999,7 +1058,8 @@ class App:
         link.start()
         self.obs_btn.config(text="停观测")
         # head 配置面：观测会话就绪即拉一次（req 泵等握手完成后发出）
-        link.send_request(head_list_request(f"head-list-{int(time.time() * 1000)}"))
+        self._pending_send(head_list_request(f"head-list-{int(time.time() * 1000)}"),
+                           "head.list")
 
     def _drain_obs(self):
         """收割观测帧 → 分面渲染（_tick 内调用，UI 线程）。"""
@@ -1024,23 +1084,30 @@ class App:
             elif t == "body.item":
                 self._on_body_item(f)
             elif t == "error":
-                # 会话内请求级错误（body.get miss 等）：在途详情回填右栏
-                if self._detail_pending:
-                    self._render_detail_body(detail_error_line(f))
-                    self._detail_pending = None
+                # 请求级错误按 req_id 关联回填（命中 pending 才动 UI）；
+                # 无 req_id / 未命中只记编排页日志行——不碰 body.get 在途
+                # 态、不写详情右栏（历史误投修复：任意 error 曾被投右栏）
+                entry = self._pending_pop(f.get("req_id"))
+                if entry is not None:
+                    self._pending_fill(entry, pending_error_line(entry.get("kind", ""), f))
                 else:
                     st_write(self.orch_log, f"[观测错误] {detail_error_line(f)}")
             elif t == "fleet.snapshot":
                 self._render_fleet(f)
             elif t == "fleet.cleanup.result":
+                self._pending_pop(f.get("req_id"))
                 self.fleet_note_var.set(cleanup_result_line(f))
             elif t == "fleet.brief.result":
+                self._pending_pop(f.get("req_id"))
                 self._render_fleet_brief(f)
             elif t == "head.list.result":
+                self._pending_pop(f.get("req_id"))
                 self._render_heads(f)
             elif t == "whiteboard.set.result":
+                self._pending_pop(f.get("req_id"))
                 self.whiteboard_note_var.set(whiteboard_set_line(f))
             elif t == "head.switch.result":
+                self._pending_pop(f.get("req_id"))
                 line = head_switch_line(f)
                 self.head_note_var.set(line)
                 st_write(self.log, f"[head] {line}")
@@ -1050,6 +1117,13 @@ class App:
                 st_write(self.bridge_log, str(f.get("line", ""))[:300])
             elif t == "tickets.snapshot":
                 st_set(self.tickets_log, tickets_text(f))
+            elif "_send_failed" in f:
+                # req 泵发送失败（连接已断）：受影响 req_id 回填提示，不静默丢
+                entry = self._pending_pop(f.get("_send_failed"))
+                if entry is not None:
+                    self._pending_fill(entry, pending_send_fail_line(entry.get("kind", "")))
+                else:
+                    st_write(self.orch_log, "[观测链路] 发送失败（链路断开）")
             elif "_error" in f:
                 st_write(self.orch_log, f"[观测错误] {f['_error']}")
             elif "_link" in f:
@@ -1063,10 +1137,73 @@ class App:
         self.orch_tree.config(state="disabled")
 
     def _render_fleet(self, frame: dict):
+        """全删重插刷新席位表；与上次快照 diff，消失的席位码提示
+        「席位 <code> 已移出」（首帧无基线不 diff；事件保留最近 3 条）。"""
         rows = fleet_rows(frame)
+        codes = {r[0] for r in rows}
+        if self._fleet_codes is not None:
+            gone = sorted(self._fleet_codes - codes)
+            if gone:
+                self._fleet_events = (self._fleet_events
+                                      + [f"席位 {c} 已移出" for c in gone])[-3:]
+                self.fleet_note_var.set("\n".join(self._fleet_events))
+        self._fleet_codes = codes
         self.fleet_tree.delete(*self.fleet_tree.get_children())
         for row in rows:
             self.fleet_tree.insert("", "end", values=row)
+
+    # ---- 在途控制请求登记（req_id → kind；错误/超时/发送失败按 kind 回填） ----
+
+    def _pending_send(self, req: dict, kind: str):
+        """登记在途控制请求（req_id → kind+时刻，body.get 另记 ref）并经
+        观测连接发出：回包/error/超时/发送失败都以 req_id 关联回填。"""
+        rid = req.get("req_id")
+        if isinstance(rid, str) and rid:
+            entry = {"kind": kind, "ts": time.monotonic()}
+            if kind == "body.get":
+                entry["ref"] = str(req.get("ref") or "")
+            self._pending[rid] = entry
+        self.obs_link.send_request(req)
+
+    def _pending_pop(self, req_id) -> dict | None:
+        """按 req_id 清一条在途登记（无 req_id/未命中返 None，不动其他）。"""
+        if not isinstance(req_id, str):
+            return None
+        return self._pending.pop(req_id, None)
+
+    def _pending_clear_body(self, ref: str):
+        """body.get 回包只带 ref（不带 req_id 的网关形）：按 ref 清在途。"""
+        for rid, entry in list(self._pending.items()):
+            if entry.get("kind") == "body.get" and entry.get("ref") == ref:
+                del self._pending[rid]
+
+    def _pending_fill(self, entry: dict, line: str):
+        """按 kind 把失败/超时行回填到发起时的提示位：席位/头部/白板提示
+        行各自覆盖；body.get 只在右栏仍显示该 ref 时回填。"""
+        kind = entry.get("kind")
+        if kind == "body.get":
+            if self._detail_pending == entry.get("ref"):
+                self._detail_pending = None
+                self._render_detail_body(line)
+            return
+        var = {"fleet.cleanup": self.fleet_note_var,
+               "fleet.brief": self.fleet_note_var,
+               "head.switch": self.head_note_var,
+               "head.list": self.head_note_var,
+               "whiteboard.set": self.whiteboard_note_var}.get(kind)
+        if var is not None:
+            var.set(line)
+
+    def _pending_sweep(self, now: float | None = None):
+        """超 PENDING_TIMEOUT_S 的在途请求：清登记并回填「<中文名>超时
+        无响应」（now 可注入，测试用；_tick 每帧扫）。"""
+        if now is None:
+            now = time.monotonic()
+        for rid, entry in list(self._pending.items()):
+            if now - entry.get("ts", now) <= PENDING_TIMEOUT_S:
+                continue
+            del self._pending[rid]
+            self._pending_fill(entry, pending_timeout_line(entry.get("kind", "")))
 
     # ---- 席位控制面（fleet.cleanup 清理 / fleet.brief 简报，经观测连接出站） ----
 
@@ -1103,7 +1240,7 @@ class App:
         self._cleanup_seq += 1
         req_id = f"clean-{int(time.time() * 1000)}-{self._cleanup_seq}"
         self.fleet_note_var.set(f"已发清理请求（{mode} · {len(ids)} 个席位）…")
-        self.obs_link.send_request(cleanup_request(ids, mode, req_id))
+        self._pending_send(cleanup_request(ids, mode, req_id), "fleet.cleanup")
 
     def _fleet_brief(self):
         """拉席位状态简报（fleet.brief）：只读动作无确认门，存活检查同
@@ -1113,12 +1250,15 @@ class App:
             self.fleet_note_var.set("观测连接未开——开启「观测」后可拉取席位简报")
             return
         self._brief_seq += 1
-        self.obs_link.send_request(
-            fleet_brief_request(f"brief-{int(time.time() * 1000)}-{self._brief_seq}"))
+        req_id = f"brief-{int(time.time() * 1000)}-{self._brief_seq}"
         self.fleet_note_var.set("已请求席位简报…")
+        self._pending_send(fleet_brief_request(req_id), "fleet.brief")
 
     def _render_fleet_brief(self, frame: dict):
-        """fleet.brief.result → 摘要行（总量/在跑数）+ 简报面板逐行追加。"""
+        """fleet.brief.result → 摘要行（总量/在跑数）+ 简报面板逐行追加；
+        带顶层 liaison 字段时刷新席位页常显行（旧网关无字段不覆盖）。"""
+        if isinstance(frame, dict) and "liaison" in frame:
+            self.liaison_var.set(liaison_line(frame.get("liaison")))
         seats = frame.get("seats") if isinstance(frame, dict) else None
         if isinstance(seats, list):
             rows = [s for s in seats if isinstance(s, dict)]
@@ -1146,18 +1286,25 @@ class App:
     def _whiteboard_push(self):
         """把白板页当前文本整段自动推进网关全局白板（无手动同步步）：
         空文本也推（清板语义）；观测未开只记提示不重试，重开观测后随
-        下次改动补推。回包 whiteboard.set.result 渲染一行结果。"""
+        下次改动补推。回包 whiteboard.set.result 渲染一行结果；推送面
+        异常回填「白板同步失败」，不永停「同步中」。"""
         self._wb_push_job = None
-        if not (self.obs_link and self.obs_link._thread
-                and self.obs_link._thread.is_alive()):
-            self.whiteboard_note_var.set(
-                "观测连接未开——白板未同步（重开观测后改动即同步）")
-            return
-        text = self.wb_text.get("1.0", "end-1c")
-        self._wb_seq += 1
-        req_id = f"wb-{int(time.time() * 1000)}-{self._wb_seq}"
-        self.obs_link.send_request(whiteboard_set_request(text, req_id))
-        self.whiteboard_note_var.set(f"白板同步中（{len(text)} 字）…")
+        try:
+            if not (self.obs_link and self.obs_link._thread
+                    and self.obs_link._thread.is_alive()):
+                self.whiteboard_note_var.set(
+                    "观测连接未开——白板未同步（重开观测后改动即同步）")
+                return
+            text = self.wb_text.get("1.0", "end-1c")
+            self._wb_seq += 1
+            req_id = f"wb-{int(time.time() * 1000)}-{self._wb_seq}"
+            self._pending_send(whiteboard_set_request(text, req_id), "whiteboard.set")
+            self.whiteboard_note_var.set(f"白板同步中（{len(text)} 字）…")
+        except Exception:  # noqa: BLE001 — 同步面异常不得永停「同步中」
+            try:
+                self.whiteboard_note_var.set("白板同步失败")
+            except Exception:
+                pass
 
     # ---- head 配置面（head.list/head.switch，经观测连接出站）----
 
@@ -1189,7 +1336,7 @@ class App:
         self._head_seq += 1
         req_id = f"head-{int(time.time() * 1000)}-{self._head_seq}"
         self.head_note_var.set(f"切换 head → {name} …")
-        self.obs_link.send_request(head_switch_request(name, req_id))
+        self._pending_send(head_switch_request(name, req_id), "head.switch")
 
     # ---- 详情页签（KG 14 §2.4：表按 ref 去重，正文两级缓存+观测拉取） ----
 
@@ -1208,11 +1355,14 @@ class App:
             st_write(self.turn_log, ack, tags=("dim",))
 
     def _on_body_item(self, frame: dict):
-        """body.item（body.get 回包）→ 全文缓存；正选中该 ref 则回填右栏。"""
+        """body.item（body.get 回包）→ 全文缓存；正选中该 ref 则回填右栏；
+        清对应在途登记（req_id 命中或按 ref，两形网关都罩住）。"""
         ref = str(frame.get("ref", "") or "")
         text = str(frame.get("text", "") or "")
         if not ref:
             return
+        self._pending_pop(frame.get("req_id"))
+        self._pending_clear_body(ref)
         self.detail_bodies[ref] = text
         if self._detail_pending == ref:
             self._detail_pending = None
@@ -1257,7 +1407,10 @@ class App:
             return
         self._detail_pending = ref
         self._render_detail_body(f"（拉取中 {ref} …）")
-        self.obs_link.send_request({"t": "body.get", "ref": ref})
+        self._body_seq += 1
+        self._pending_send({"t": "body.get", "ref": ref,
+                            "req_id": f"body-{int(time.time() * 1000)}-{self._body_seq}"},
+                           "body.get")
 
     def _selftest_probe(self):
         """selftest 冒烟（无显示环境 CI）：假帧走真实渲染路径——回放批入表、
@@ -1398,7 +1551,12 @@ class App:
             try:
                 self.tx.put_nowait(b"\x00" * item[1])
             except queue.Full:
-                pass
+                pass  # 背压：丢本块（与采集回调同语义）
+            except Exception as e:  # noqa: BLE001 — 单步失败只跳过，链走完
+                try:
+                    self.log_write(f"[UI] 尾静音步进异常已跳过: {type(e).__name__}: {e}")
+                except Exception:
+                    pass
             self._tail_after = self.root.after(VAD_TAIL_STEP_MS, _step)
 
         self._tail_after = self.root.after(VAD_TAIL_STEP_MS, _step)
@@ -1440,6 +1598,7 @@ class App:
                 self.events += 1
                 self.log_write(line)
             self._drain_obs()
+            self._pending_sweep()
         except Exception as e:  # noqa: BLE001 — 单帧渲染失败只丢一帧，不杀 UI 泵
             try:
                 self.log_write(f"[UI] 渲染异常已跳过: {type(e).__name__}: {e}")

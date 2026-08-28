@@ -32,7 +32,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "realtime-pro
 
 from rt_voice_app import (  # noqa: E402
     App,
+    DETAIL_COLS,
     ObserveLink,
+    PENDING_TIMEOUT_S,
     PushToTalk,
     chars_mag,
     cleanup_request,
@@ -47,9 +49,13 @@ from rt_voice_app import (  # noqa: E402
     head_names_from_list,
     head_switch_line,
     head_switch_request,
+    liaison_line,
     merge_detail_rows,
     notice_line_from_push,
     orch_tree_lines,
+    pending_error_line,
+    pending_send_fail_line,
+    pending_timeout_line,
     replay_notice_line,
     tickets_text,
     turn_label_with_notify,
@@ -336,7 +342,7 @@ def test_detail_rows_from_push_shapes():
     single = {"t": "body.push", "ref": "vh-a", "no": 3, "status": "done",
               "title": "标题一", "summary": "摘要", "chars": 1234,
               "inline": "全文", "ts": ts}
-    assert detail_rows_from_push(single) == [(when, "3", "vh-a", "标题一", "1234")]
+    assert detail_rows_from_push(single) == [(when, "3", "vh-a", "标题一", "1234", "done")]
     replay = {"t": "body.push", "items": [
         {"ref": "vh-b", "no": 1, "status": "done", "title": "b", "chars": 9, "ts": ts},
         {"no": 8, "status": "done", "title": "无 ref 跳过"},
@@ -344,23 +350,28 @@ def test_detail_rows_from_push_shapes():
         {"ref": "vh-c", "status": "failed", "title": "c", "chars": 0},
     ], "ts": ts}
     assert detail_rows_from_push(replay) == [
-        (when, "1", "vh-b", "b", "9"),
-        ("", "", "vh-c", "c", "0"),
+        (when, "1", "vh-b", "b", "9", "done"),
+        ("", "", "vh-c", "c", "0", "failed"),
     ]
+    # 缺 status 键 → 空串（旧网关帧向后兼容）
+    assert detail_rows_from_push({"ref": "vh-d", "no": 2, "chars": 1, "ts": ts}) == \
+        [(when, "2", "vh-d", "", "1", "")]
     assert detail_rows_from_push({}) == []
     assert detail_rows_from_push({"items": "corrupt"}) == []
     assert detail_rows_from_push(None) == []
 
 
 def test_merge_detail_rows_dedup_by_ref():
-    prev = [("10:00:00", "1", "vh-a", "旧标题", "5"), ("10:01:00", "2", "vh-b", "b", "6")]
-    # 同 ref 更新：原位换值（含 time——行显示最新推送态）、行不跳动
-    merged = merge_detail_rows(prev, [("10:02:00", "1", "vh-a", "新标题", "90")])
-    assert merged == [("10:02:00", "1", "vh-a", "新标题", "90"),
-                      ("10:01:00", "2", "vh-b", "b", "6")]
+    prev = [("10:00:00", "1", "vh-a", "旧标题", "5", "done"),
+            ("10:01:00", "2", "vh-b", "b", "6", "done")]
+    # 同 ref 更新：原位换值（含 time/status——行显示最新推送态）、行不跳动
+    merged = merge_detail_rows(prev, [("10:02:00", "1", "vh-a", "新标题", "90", "failed")])
+    assert merged == [("10:02:00", "1", "vh-a", "新标题", "90", "failed"),
+                      ("10:01:00", "2", "vh-b", "b", "6", "done")]
     # 新 ref 追加尾部
-    merged2 = merge_detail_rows(merged, [("10:03:00", "7", "vh-z", "z", "1")])
-    assert len(merged2) == 3 and merged2[-1] == ("10:03:00", "7", "vh-z", "z", "1")
+    merged2 = merge_detail_rows(merged, [("10:03:00", "7", "vh-z", "z", "1", "cancelled")])
+    assert len(merged2) == 3 and \
+        merged2[-1] == ("10:03:00", "7", "vh-z", "z", "1", "cancelled")
 
 
 def test_notice_line_from_push():
@@ -1046,3 +1057,322 @@ def test_spectrum_draws_from_latest_block():
         if app is not None and getattr(app, "ptt_listener", None):
             app.ptt_listener.stop()
         root.destroy()
+
+
+# ---- P1：req_id 贯穿（在途登记 / error 关联回填 / 超时 / 发送失败） ----
+
+
+def _tk_app():
+    """装配真 App（无网络、无 mainloop）；无显示环境跳过。"""
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+    except Exception as e:  # noqa: BLE001 — headless 环境
+        pytest.skip(f"no display for tkinter: {e}")
+    root.withdraw()
+    app = App(root, "ws://127.0.0.1:8765/ws", "", False)
+    root.update()
+    return root, app
+
+
+def _teardown(root, app):
+    if app is not None:
+        app._cancel_vad_tail()
+        if getattr(app, "ptt_listener", None):
+            app.ptt_listener.stop()
+    root.destroy()
+
+
+def test_error_with_req_id_resolves_pending():
+    """(a) error 帧带 req_id 且命中 pending → 登记清除 + 按 kind 回填提示
+    （清理 → 席位提示行；body.get → 详情右栏 + 在途态清空）。"""
+    root, app = _tk_app()
+    try:
+        app.obs_link = _StubObsLink()
+        app._pending_send(cleanup_request(["20d0"], "end", "r-err-1"), "fleet.cleanup")
+        app.fleet_note_var.set("已发清理请求（end · 1 个席位）…")
+        assert "r-err-1" in app._pending
+
+        app.obs_q.put({"t": "error", "req_id": "r-err-1", "code": "internal",
+                       "msg": "fleet.json write failed"})
+        app._drain_obs()
+        assert app._pending == {}
+        assert app.fleet_note_var.get() == "清理失败：internal fleet.json write failed"
+
+        # body.get 命中：右栏回填「拉取失败：…」且在途 ref 清空
+        app._pending_send({"t": "body.get", "ref": "vh-e", "req_id": "r-err-2"}, "body.get")
+        app._detail_pending = "vh-e"
+        app._render_detail_body("（拉取中 vh-e …）")
+        app.obs_q.put({"t": "error", "req_id": "r-err-2", "code": "body_miss",
+                       "msg": "no stored body for ref vh-e"})
+        app._drain_obs()
+        assert app._pending == {}
+        assert app._detail_pending is None
+        assert app.detail_body.get("1.0", "end").strip() == \
+            "拉取失败：body_miss no stored body for ref vh-e"
+    finally:
+        _teardown(root, app)
+
+
+def test_error_without_req_id_keeps_body_pending():
+    """(b) error 帧不带 req_id（或 req_id 未命中）→ 只进编排页日志行：
+    body.get 在途态保持、详情右栏不被写入、pending 不清。"""
+    root, app = _tk_app()
+    try:
+        app.obs_link = _StubObsLink()
+        app._pending_send({"t": "body.get", "ref": "vh-x", "req_id": "r-body-1"}, "body.get")
+        app._detail_pending = "vh-x"
+        app._render_detail_body("（拉取中 vh-x …）")
+
+        app.obs_q.put({"t": "error", "code": "body_miss",
+                       "msg": "no stored body for ref vh-x"})
+        app._drain_obs()
+        assert app._detail_pending == "vh-x"                 # 在途保持
+        assert "r-body-1" in app._pending                    # 登记保持
+        assert app.detail_body.get("1.0", "end").strip() == "（拉取中 vh-x …）"
+        assert "body_miss" in app.orch_log.get("1.0", "end")  # 只进日志行
+
+        # req_id 存在但未命中（别的请求/旧回包）→ 同样不动在途与右栏
+        app.obs_q.put({"t": "error", "req_id": "r-unknown", "code": "x", "msg": "y"})
+        app._drain_obs()
+        assert app._detail_pending == "vh-x"
+        assert "r-body-1" in app._pending
+        assert app.detail_body.get("1.0", "end").strip() == "（拉取中 vh-x …）"
+    finally:
+        _teardown(root, app)
+
+
+def test_pending_timeout_sweep_fills_notes():
+    """(c) 在途请求超 PENDING_TIMEOUT_S → _pending_sweep（_tick 内调用）
+    清登记并回填「<中文名>超时无响应」；未超时不动。"""
+    root, app = _tk_app()
+    try:
+        app.obs_link = _StubObsLink()
+        app._pending_send(cleanup_request(["20d0"], "release", "r-t1"), "fleet.cleanup")
+        app.fleet_note_var.set("已发清理请求（release · 1 个席位）…")
+        app._pending_send({"t": "body.get", "ref": "vh-t", "req_id": "r-t2"}, "body.get")
+        app._detail_pending = "vh-t"
+        app._render_detail_body("（拉取中 vh-t …）")
+
+        app._pending_sweep()                                 # 时刻未超：不动
+        assert set(app._pending) == {"r-t1", "r-t2"}
+        assert app.fleet_note_var.get().startswith("已发清理请求")
+
+        # 注入未来时钟：全部超时
+        app._pending_sweep(now=time.monotonic() + PENDING_TIMEOUT_S + 0.1)
+        assert app._pending == {}
+        assert app.fleet_note_var.get() == "清理超时无响应"
+        assert app._detail_pending is None
+        assert app.detail_body.get("1.0", "end").strip() == "拉取超时无响应"
+
+        # _tick 集成：直改 ts 为过期值，一帧 UI 泵内完成清扫
+        app._pending_send(fleet_brief_request("r-t3"), "fleet.brief")
+        app._pending["r-t3"]["ts"] = time.monotonic() - PENDING_TIMEOUT_S - 1
+        app._pending_send(head_switch_request("nova", "r-t4"), "head.switch")
+        app._tick()
+        assert "r-t3" not in app._pending
+        assert app.fleet_note_var.get() == "席位简报超时无响应"
+        assert "r-t4" in app._pending                          # 未超时者保留
+    finally:
+        _teardown(root, app)
+
+
+def test_pending_line_builders():
+    """kind → 回填行的三形：error/超时/发送失败（含未知 kind 防御）。"""
+    err = {"code": "body_miss", "msg": "no stored body for ref vh-x"}
+    assert pending_error_line("body.get", err) == \
+        "拉取失败：body_miss no stored body for ref vh-x"
+    assert pending_error_line("fleet.brief", {"msg": "boom"}) == "席位简报失败：boom"
+    assert pending_error_line("fleet.cleanup", {}) == "清理失败：未知错误"
+    assert pending_timeout_line("fleet.cleanup") == "清理超时无响应"
+    assert pending_timeout_line("head.switch") == "head 切换超时无响应"
+    assert pending_timeout_line("body.get") == "拉取超时无响应"
+    assert pending_send_fail_line("whiteboard.set") == "白板同步失败：发送失败（链路断开）"
+    assert pending_timeout_line("mystery") == "mystery超时无响应"
+
+
+@pytest.mark.asyncio
+async def test_req_pump_send_failure_reports_req_id():
+    """_req_pump 发送失败（连接断）→ `_send_failed` 帧进 obs 队列（带受影响
+    req_id），不再静默丢；无 req_id 的请求只退出不发帧。"""
+    class _DeadWs:
+        async def send_json(self, obj):
+            raise ConnectionResetError("dead")
+
+    obs: queue.Queue = queue.Queue()
+    link = ObserveLink("ws://x/ws", "tok", obs, lambda _s: None)
+    ready = asyncio.Event()
+    ready.set()
+    link.req.put({"t": "fleet.brief", "req_id": "r-dead-1"})
+    link.req.put({"t": "body.get", "ref": "vh-noid"})
+    pump = asyncio.create_task(link._req_pump(_DeadWs(), ready))
+    await asyncio.wait_for(asyncio.shield(pump), timeout=5)   # 泵发送失败即返回
+    frames = []
+    while not obs.empty():
+        frames.append(obs.get_nowait())
+    assert frames == [{"_send_failed": "r-dead-1"}]
+
+
+def test_send_failed_frame_fills_note():
+    """`_send_failed` 回填：受影响 req_id 按 kind 落「发送失败（链路断开）」
+    并清登记；未知 req_id 只记编排页日志行。"""
+    root, app = _tk_app()
+    try:
+        app.obs_link = _StubObsLink()
+        app._pending_send(cleanup_request(["20d0"], "end", "r-d1"), "fleet.cleanup")
+        app._pending_send({"t": "body.get", "ref": "vh-d", "req_id": "r-d2"}, "body.get")
+        app._detail_pending = "vh-d"
+        app._render_detail_body("（拉取中 vh-d …）")
+
+        app.obs_q.put({"_send_failed": "r-d1"})
+        app.obs_q.put({"_send_failed": "r-d2"})
+        app._drain_obs()
+        assert app._pending == {}
+        assert app.fleet_note_var.get() == "清理失败：发送失败（链路断开）"
+        assert app._detail_pending is None
+        assert app.detail_body.get("1.0", "end").strip() == "拉取失败：发送失败（链路断开）"
+
+        app.obs_q.put({"_send_failed": "r-nobody"})
+        app._drain_obs()
+        assert "发送失败（链路断开）" in app.orch_log.get("1.0", "end")
+    finally:
+        _teardown(root, app)
+
+
+# ---- P1：after 循环加固 + liaison 常显 + 席位移出提示 + status 列 ----
+
+
+def test_send_vad_tail_step_exception_chain_continues(monkeypatch):
+    """(d) _send_vad_tail._step 步进体抛异常 → 记「尾静音步进异常已跳过」
+    并继续重排：计划 30 步走完自然结束（_tail_after 归 None）。"""
+    class _BoomTx:
+        calls = 0
+
+        def put_nowait(self, _chunk):
+            type(self).calls += 1
+            raise RuntimeError("boom")
+
+    root, app = _tk_app()
+    try:
+        app.tx = _BoomTx()
+        app.state_var.set("open")
+        monkeypatch.setattr("rt_voice_app.VAD_TAIL_STEP_MS", 1)  # 快进节奏
+        app._send_vad_tail()
+        assert app._tail_after is not None
+        deadline = time.monotonic() + 3.0
+        while app._tail_after is not None and time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.002)
+        assert app._tail_after is None                    # 链走完自然结束
+        assert _BoomTx.calls == 30                        # 每步都试投且未断链
+        assert "尾静音步进异常已跳过" in app.log.get("1.0", "end")
+    finally:
+        _teardown(root, app)
+
+
+def test_whiteboard_push_exception_note(monkeypatch):
+    """(e) _whiteboard_push 抛异常 → note 回填「白板同步失败」，不永停
+    「同步中」，且无出站帧。"""
+    root, app = _tk_app()
+    try:
+        app.obs_link = _StubObsLink()
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("wb boom")
+
+        monkeypatch.setattr(app.wb_text, "get", _boom)
+        app._whiteboard_push()
+        assert app.whiteboard_note_var.get() == "白板同步失败"
+        assert app.obs_link.sent == []
+    finally:
+        _teardown(root, app)
+
+
+def test_liaison_line_states():
+    """(f) liaison 三态 + 畸形防御：无绑定 / 席位码 / 席位码（已归档）。"""
+    assert liaison_line({"bound": False, "code": None, "sessionId": None,
+                         "archived": False}) == "对接席位：无绑定"
+    assert liaison_line({"bound": True, "code": "3103", "sessionId": "s-1",
+                         "archived": False}) == "对接席位：3103"
+    assert liaison_line({"bound": True, "code": "db05", "sessionId": "s-2",
+                         "archived": True}) == "对接席位：db05（已归档）"
+    assert liaison_line(None) == "对接席位：未知"
+    assert liaison_line("corrupt") == "对接席位：未知"
+
+
+def test_liaison_var_refresh_on_brief():
+    """(f) 席位页常显行：brief.result 带 liaison 即刷新；旧网关（无字段）
+    不覆盖现有显示；初始态「未知」。"""
+    root, app = _tk_app()
+    try:
+        assert app.liaison_var.get() == "对接席位：未知"
+
+        app.obs_q.put({"t": "fleet.brief.result", "req_id": "r-l1", "seats": [],
+                       "liaison": {"bound": True, "code": "db05",
+                                   "sessionId": "s-1", "archived": True}})
+        app._drain_obs()
+        assert app.liaison_var.get() == "对接席位：db05（已归档）"
+
+        app.obs_q.put({"t": "fleet.brief.result", "req_id": "r-l2", "seats": [],
+                       "liaison": {"bound": False, "code": None,
+                                   "sessionId": None, "archived": False}})
+        app._drain_obs()
+        assert app.liaison_var.get() == "对接席位：无绑定"
+
+        # 旧网关回包无 liaison 字段 → 保持上次显示
+        app.obs_q.put({"t": "fleet.brief.result", "req_id": "r-l3", "seats": []})
+        app._drain_obs()
+        assert app.liaison_var.get() == "对接席位：无绑定"
+    finally:
+        _teardown(root, app)
+
+
+def test_fleet_snapshot_removal_note():
+    """(g) snapshot 前后 diff：上次存在的席位码消失 → 提示行「席位 <code>
+    已移出」（最近若干条；首帧无基线不 diff）。"""
+    root, app = _tk_app()
+    try:
+        seat = {"sessionId": "s-a", "node": "voice-head",
+                "role": "worker", "status": "active"}
+        app.obs_q.put({"t": "fleet.snapshot", "fleet": {"<seat>": seat, "<seat>": seat}})
+        app._drain_obs()
+        assert app.fleet_note_var.get() == ""              # 首帧无基线
+
+        app.obs_q.put({"t": "fleet.snapshot", "fleet": {"<seat>": seat}})
+        app._drain_obs()
+        assert app.fleet_note_var.get() == "席位 9b95 已移出"
+        assert len(app.fleet_tree.get_children()) == 1
+
+        # 席位回来再消失 → 仍是新事件；多条保留（截最近 3 条）
+        app.obs_q.put({"t": "fleet.snapshot", "fleet": {"<seat>": seat, "<seat>": seat}})
+        app._drain_obs()
+        app.obs_q.put({"t": "fleet.snapshot", "fleet": {}})
+        app._drain_obs()
+        note = app.fleet_note_var.get()
+        assert note == "席位 9b95 已移出\n席位 20d0 已移出\n席位 9b95 已移出"
+        assert len(app.fleet_tree.get_children()) == 0
+    finally:
+        _teardown(root, app)
+
+
+def test_detail_status_column():
+    """(h) 任务表 status 列：DETAIL_COLS 含 status；行数据带 status 显示
+    （如 cancelled）；缺 status 键 → 空串不崩。"""
+    assert "status" in DETAIL_COLS
+    assert DETAIL_COLS.index("chars") < DETAIL_COLS.index("status")
+    root, app = _tk_app()
+    try:
+        now = time.time()
+        app.obs_q.put({"t": "body.push", "ref": "vh-s1", "no": 1, "status": "cancelled",
+                       "title": "已取消任务", "chars": 5, "ts": now})
+        app.obs_q.put({"t": "body.push", "ref": "vh-s2", "no": 2, "title": "无状态",
+                       "chars": 6, "ts": now})              # 缺 status 键
+        app._drain_obs()
+        root.update()
+        si = DETAIL_COLS.index("status")
+        assert app.detail_tree.item("vh-s1", "values")[si] == "cancelled"
+        assert app.detail_tree.item("vh-s2", "values")[si] == ""
+        assert list(app.detail_tree.get_children()) == ["vh-s1", "vh-s2"]
+    finally:
+        _teardown(root, app)
