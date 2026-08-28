@@ -289,6 +289,10 @@ class WsSession:
             await self._on_body_get(data)
         elif t == "fleet.cleanup":
             await self._on_fleet_cleanup(data)
+        elif t == "head.list":
+            await self._on_head_list(data)
+        elif t == "head.switch":
+            await self._on_head_switch(data)
         else:
             await self._send_error("bad_type", f"unknown t={t!r}")
 
@@ -498,6 +502,72 @@ class WsSession:
             "t": "fleet.cleanup.result",
             "req_id": data.get("req_id"),
             "results": results,
+        })
+
+    # ---- control: head 配置面（PR8：多 head 配置，激活单例）----
+
+    async def _on_head_list(self, data: dict) -> None:
+        """head.list → head.list.result：配置表 + 当前激活（只读）。"""
+        reg = _head_registry()
+        await self._reply({
+            "t": "head.list.result",
+            "req_id": data.get("req_id"),
+            "active": reg.active,
+            "file_backed": reg.file_backed,
+            "env_pinned": reg.env_pinned,
+            "profiles": reg.describe(),
+        })
+
+    async def _on_head_switch(self, data: dict) -> None:
+        """head.switch{name} → 换激活 head；下一次语音会话生效。
+
+        激活是单例且活会话不拆——切换只改下一次构建的选择并写回
+        profiles 文件（原子写；写回失败时内存选择仍生效但不跨重启，
+        结果帧如实说明）。单头模式（无 profiles 文件）与
+        ``VOICE_HEAD_PROFILE`` 钉住时拒绝。
+        """
+        name = data.get("name")
+        reg = _head_registry()
+        if not isinstance(name, str) or not name.strip():
+            await self._send_error("bad_request", "head.switch needs a name")
+            return
+        name = name.strip()
+        if not reg.file_backed:
+            await self._send_error(
+                "bad_request", "single-head mode: no profiles file")
+            return
+        if reg.env_pinned:
+            await self._send_error(
+                "bad_request", "active head pinned by VOICE_HEAD_PROFILE")
+            return
+        if not any(p.name == name for p in reg.profiles):
+            await self._send_error(
+                "bad_request",
+                f"unknown head {name!r}; valid: {[p.name for p in reg.profiles]}")
+            return
+        if reg.active == name:
+            await self._reply({
+                "t": "head.switch.result", "req_id": data.get("req_id"),
+                "ok": True, "active": name, "note": "已是激活 head",
+            })
+            return
+        reg.active = name
+        try:
+            with open(reg.path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            doc["active"] = name
+            _atomic_write_json(reg.path, doc)
+        except (OSError, ValueError) as e:
+            await self._reply({
+                "t": "head.switch.result", "req_id": data.get("req_id"),
+                "ok": True, "active": name,
+                "note": f"已切换，但写回失败（{e}）——重启后回旧值",
+            })
+            return
+        log.info("head switched to %s (effective next session)", name)
+        await self._reply({
+            "t": "head.switch.result", "req_id": data.get("req_id"),
+            "ok": True, "active": name, "note": "下一次语音连接生效",
         })
 
     # ---- media ----
@@ -1016,6 +1086,67 @@ def _workspace_root() -> str:
     return str(Path(__file__).resolve().parents[2])
 
 
+# ---- head 配置注册表（PR8：多 head 配置，激活单例）----
+
+_HEAD_REGISTRY: Any = None
+
+
+def _head_registry() -> Any:
+    """注册表惰性单例；首载打一行日志（文件位形 + 当前激活）。"""
+    global _HEAD_REGISTRY
+    if _HEAD_REGISTRY is None:
+        from rt_head_registry import load_head_registry
+
+        _HEAD_REGISTRY = load_head_registry()
+        if _HEAD_REGISTRY.file_backed:
+            log.info("head profiles: %d from %s (active=%s)",
+                     len(_HEAD_REGISTRY.profiles), _HEAD_REGISTRY.path,
+                     _HEAD_REGISTRY.active)
+        else:
+            log.info("head profiles: single-head mode (no profiles file)")
+    return _HEAD_REGISTRY
+
+
+def _reset_head_registry() -> None:
+    """单测用：丢掉缓存的单例，下一次 _head_registry() 重载。"""
+    global _HEAD_REGISTRY
+    _HEAD_REGISTRY = None
+
+
+def _profile_doctrine(profile: Any) -> str:
+    """profile 的 doctrine 解析：inline → doctrine_file → 旧路径
+    （``VOICE_HEAD_DOCTRINE`` 外置文件 → 内置常量）。坏文件只告警回落。"""
+    if profile.doctrine:
+        return profile.doctrine
+    if profile.doctrine_file:
+        try:
+            with open(profile.doctrine_file, encoding="utf-8") as fh:
+                text = fh.read()
+            if text.strip():
+                return text
+            print(f"rt_gateway: doctrine_file {profile.doctrine_file} blank; "
+                  "falling back", file=sys.stderr)
+        except OSError as e:
+            print(f"rt_gateway: doctrine_file {profile.doctrine_file} "
+                  f"unreadable ({e}); falling back", file=sys.stderr)
+    from rt_head_tools import DoctrineSource
+
+    return DoctrineSource().load()
+
+
+def _profile_turn_detection(profile: Any) -> dict | None:
+    """profile 的 VAD 旋钮：任一设了才组装 ``server_vad``；全 None →
+    旧路径（``VOICE_TURN_*`` env → 服务端默认）。"""
+    td = {field: getattr(profile, attr) for attr, field in (
+        ("turn_silence_ms", "silence_duration_ms"),
+        ("turn_prefix_ms", "prefix_padding_ms"),
+        ("turn_threshold", "threshold"),
+    ) if getattr(profile, attr) is not None}
+    if td:
+        return {"type": "server_vad", **td}
+    return _turn_detection_from_env()
+
+
 async def _store_call(fn: Callable, *a, **kw) -> Any:
     """store 调用统一包装：``asyncio.to_thread`` 包裹（store 为同步 API，
     见其模块头约定）；任何失败只 stderr 告警、返回 None，绝不抛——
@@ -1478,7 +1609,7 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
 
     from providers import RealtimeHeadConfig, RealtimeProtocol, RealtimeProvider, create_realtime_head
     from rt_conversation_items import ConversationCompactor, ConversationLog
-    from rt_head_tools import DoctrineSource, dsh_head_tools
+    from rt_head_tools import dsh_head_tools
 
     transcript = TranscriptState()
     tools = dsh_head_tools()
@@ -1540,19 +1671,22 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     conv_log = ConversationLog()
     compactor = ConversationCompactor(conv_log, trigger_chars=_compact_threshold())
 
+    head_profile = _head_registry().active_profile()
     head = create_realtime_head(
         RealtimeHeadConfig(
             provider=RealtimeProvider.QWEN,
             protocol=RealtimeProtocol.DASHSCOPE_RT,
-            # 空串/缺省→服务默认；非空→覆盖（模型与音色，实测 plus 受理
-            # 14 个音色：Tina/Cherry/Serena/Ethan/Lily/Griffin/Dana/Sandy/
-            # Yuanjia/Jada/Alex/Aria/Nofish/Loongzai）
-            model=os.environ.get("VOICE_HEAD_MODEL") or None,
-            voice=os.environ.get("VOICE_HEAD_VOICE") or None,
-            # VOICE_HEAD_DOCTRINE 指外置 doctrine 文件；缺省回落内置常量
-            system_instruction=DoctrineSource().load(),
-            # 服务端 VAD 旋钮（VOICE_TURN_*）：全未设→None→服务端默认
-            turn_detection=_turn_detection_from_env(),
+            # 激活 head 的 profile 字段优先；None 字段回落旧 env 单头路径
+            # （模型与音色，实测 plus 受理 14 个音色：Tina/Cherry/Serena/
+            # Ethan/Lily/Griffin/Dana/Sandy/Yuanjia/Jada/Alex/Aria/Nofish/
+            # Loongzai）
+            model=head_profile.model or (os.environ.get("VOICE_HEAD_MODEL") or None),
+            voice=head_profile.voice or (os.environ.get("VOICE_HEAD_VOICE") or None),
+            # profile.doctrine → profile.doctrine_file → VOICE_HEAD_DOCTRINE
+            # 外置文件 → 内置常量
+            system_instruction=_profile_doctrine(head_profile),
+            # profile VAD 旋钮 → VOICE_TURN_* env → 服务端默认
+            turn_detection=_profile_turn_detection(head_profile),
             tools=tools,
         )
     )

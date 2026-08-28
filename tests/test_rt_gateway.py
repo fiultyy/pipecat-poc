@@ -1044,7 +1044,7 @@ async def test_final_split_notice_degrades_without_record(tmp_path, monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_realtime_head_wires_voice_store_into_app_resources(monkeypatch):
+async def test_realtime_head_wires_voice_store_into_app_resources(tmp_path, monkeypatch):
     """build_realtime_head 组 PipelineWorker 时 app_resources 同时携带
     dsh_backend 与 voice_store（=_get_store() 构建时快照，可能 None 由工具侧
     C 降级兜住）。providers 与 PipelineWorker/WorkerRunner 均以替身注入——
@@ -1093,6 +1093,9 @@ async def test_realtime_head_wires_voice_store_into_app_resources(monkeypatch):
     monkeypatch.setitem(sys.modules, "providers", fake_providers)
     monkeypatch.setattr(worker_mod, "PipelineWorker", _FakeWorker)
     monkeypatch.setattr(runner_mod, "WorkerRunner", _FakeRunner)
+    # head 注册表隔离：不读真实 ~/.config/voice-gateway/heads.json
+    monkeypatch.setenv("VOICE_HEAD_PROFILES", str(tmp_path / "no-heads.json"))
+    rt_gateway._reset_head_registry()
 
     async def _noop(*a, **k):
         pass
@@ -1709,3 +1712,217 @@ async def test_fleet_cleanup_result_frame_shape_from_observe(tmp_path, monkeypat
         assert got["results"][0] == {"id": "cc03", "ok": True}
         assert got["results"][1] == {"id": "zz99", "ok": False, "error": "not_found"}
         await close_ws(ws)
+
+
+# ---- M2. head 配置注册表（PR8：多 head 配置，激活单例）----
+
+_HEAD_ENV_KEYS = ("VOICE_HEAD_MODEL", "VOICE_HEAD_VOICE", "VOICE_HEAD_DOCTRINE",
+                  "VOICE_TURN_SILENCE_MS", "VOICE_TURN_PREFIX_MS",
+                  "VOICE_TURN_THRESHOLD", "VOICE_HEAD_PROFILE")
+
+
+def _fake_head_build_module(monkeypatch, wired: dict):
+    """build_realtime_head 的 providers/worker 替身（同 wires 测试形制），
+    额外把 RealtimeHeadConfig 收到的 kwargs 整包记进 wired["config"]。"""
+    import types
+
+    from pipecat.pipeline import worker as worker_mod
+    from pipecat.processors.frame_processor import FrameProcessor
+    from pipecat.workers import runner as runner_mod
+
+    class _PassthroughHead(FrameProcessor):
+        async def process_frame(self, frame, direction):
+            await self.push_frame(frame, direction)
+
+    class _FakeWorker:
+        def __init__(self, pipeline, **kwargs):
+            wired["app_resources"] = kwargs.get("app_resources")
+
+        async def queue_frame(self, frame):
+            pass
+
+    class _FakeRunner:
+        def __init__(self, handle_sigint=False):
+            pass
+
+        async def add_workers(self, *workers):
+            pass
+
+        async def run(self):
+            await asyncio.Event().wait()
+
+    def _fake_config(**kw):
+        wired["config"] = kw
+        return types.SimpleNamespace(**kw)
+
+    fake_providers = types.ModuleType("providers")
+    fake_providers.RealtimeProvider = types.SimpleNamespace(QWEN="qwen")
+    fake_providers.RealtimeProtocol = types.SimpleNamespace(DASHSCOPE_RT="dashscope-rt")
+    fake_providers.RealtimeHeadConfig = _fake_config
+    fake_providers.create_realtime_head = lambda config: _PassthroughHead()
+    monkeypatch.setitem(sys.modules, "providers", fake_providers)
+    monkeypatch.setattr(worker_mod, "PipelineWorker", _FakeWorker)
+    monkeypatch.setattr(runner_mod, "WorkerRunner", _FakeRunner)
+
+
+async def _build_with_heads(tmp_path, monkeypatch, heads_doc, env_extra=None) -> dict:
+    """隔离 env + 注册表后走一次 build_realtime_head，回 config kwargs。"""
+    import types
+
+    wired: dict = {}
+    _fake_head_build_module(monkeypatch, wired)
+    for k in _HEAD_ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    if heads_doc is not None:
+        p = tmp_path / "heads.json"
+        p.write_text(json.dumps(heads_doc, ensure_ascii=False), encoding="utf-8")
+        monkeypatch.setenv("VOICE_HEAD_PROFILES", str(p))
+    else:
+        monkeypatch.setenv("VOICE_HEAD_PROFILES", str(tmp_path / "missing.json"))
+    for k, v in (env_extra or {}).items():
+        monkeypatch.setenv(k, v)
+    rt_gateway._reset_head_registry()
+
+    async def _noop(*a, **k):
+        pass
+
+    session = types.SimpleNamespace(conv_id="s-prof", send_audio=_noop,
+                                    drop_pending_audio=_noop)
+    backend = types.SimpleNamespace(liaison_session="")
+    adapter = await rt_gateway.build_realtime_head(session, EventBus(), backend)
+    await adapter.stop()
+    rt_gateway._reset_head_registry()
+    return wired["config"]
+
+
+@pytest.mark.asyncio
+async def test_head_build_profile_fields_override_env(tmp_path, monkeypatch):
+    """激活 profile 的字段优先；占位副本（全 null）不设字段。"""
+    cfg = await _build_with_heads(tmp_path, monkeypatch, {
+        "active": "alpha",
+        "profiles": [
+            {"name": "alpha", "model": "m-profile", "voice": "v-profile",
+             "doctrine": "# Persona inline", "turn_silence_ms": 900},
+            {"name": "beta"},
+        ],
+    }, env_extra={"VOICE_HEAD_MODEL": "m-env", "VOICE_HEAD_VOICE": "v-env"})
+    assert cfg["model"] == "m-profile" and cfg["voice"] == "v-profile"
+    assert cfg["system_instruction"] == "# Persona inline"
+    assert cfg["turn_detection"] == {"type": "server_vad",
+                                     "silence_duration_ms": 900}
+
+
+@pytest.mark.asyncio
+async def test_head_build_null_fields_fall_back_to_env(tmp_path, monkeypatch):
+    """全 null 副本 = 旧单头路径：model/voice/VAD 走 env，doctrine 走内置。"""
+    cfg = await _build_with_heads(tmp_path, monkeypatch, {
+        "active": "beta",
+        "profiles": [{"name": "alpha", "model": "x"}, {"name": "beta"}],
+    }, env_extra={"VOICE_HEAD_MODEL": "m-env", "VOICE_HEAD_VOICE": "v-env",
+                  "VOICE_TURN_SILENCE_MS": "800"})
+    assert cfg["model"] == "m-env" and cfg["voice"] == "v-env"
+    assert cfg["turn_detection"] == {"type": "server_vad",
+                                     "silence_duration_ms": 800}
+    assert cfg["system_instruction"].startswith("# Persona")
+
+
+@pytest.mark.asyncio
+async def test_head_build_doctrine_file_with_blank_fallback(tmp_path, monkeypatch):
+    d = tmp_path / "doctrine.md"
+    d.write_text("DOCTRINE-FILE", encoding="utf-8")
+    cfg = await _build_with_heads(tmp_path, monkeypatch, {
+        "active": "a", "profiles": [{"name": "a", "doctrine_file": str(d)}]})
+    assert cfg["system_instruction"] == "DOCTRINE-FILE"
+    blank = tmp_path / "blank.md"
+    blank.write_text("   \n", encoding="utf-8")
+    cfg2 = await _build_with_heads(tmp_path, monkeypatch, {
+        "active": "a", "profiles": [{"name": "a", "doctrine_file": str(blank)}]})
+    assert cfg2["system_instruction"].startswith("# Persona")
+
+
+async def _switch_heads_file(tmp_path, active="nova", pin=None):
+    heads = tmp_path / "heads.json"
+    heads.write_text(json.dumps({
+        "active": active,
+        "profiles": [{"name": "nova", "label": "N"}, {"name": "echo", "label": "E"}],
+    }), encoding="utf-8")
+    return heads
+
+
+@pytest.mark.asyncio
+async def test_head_list_and_switch_roundtrip(tmp_path, monkeypatch):
+    """head.list/switch 全链路：切换写回文件、重复切换幂等、未知名 bad_request。"""
+    heads = await _switch_heads_file(tmp_path)
+    monkeypatch.setenv("VOICE_HEAD_PROFILES", str(heads))
+    rt_gateway._reset_head_registry()
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        await ws.send_str(json.dumps({"t": "head.list", "req_id": "q1"}))
+        got = await recv_until(ws, lambda d: d.get("t") == "head.list.result")
+        assert got["active"] == "nova" and got["file_backed"] is True
+        assert got["env_pinned"] is False
+        assert [p["name"] for p in got["profiles"]] == ["nova", "echo"]
+        assert got["profiles"][0]["active"] is True
+
+        await ws.send_str(json.dumps({"t": "head.switch", "name": "echo",
+                                      "req_id": "q2"}))
+        sw = await recv_until(ws, lambda d: d.get("t") == "head.switch.result")
+        assert sw["ok"] is True and sw["active"] == "echo"
+        assert "下一次" in sw["note"]
+        assert json.loads(heads.read_text(encoding="utf-8"))["active"] == "echo"
+
+        await ws.send_str(json.dumps({"t": "head.list", "req_id": "q3"}))
+        got2 = await recv_until(
+            ws, lambda d: d.get("t") == "head.list.result" and d.get("req_id") == "q3")
+        assert got2["active"] == "echo"
+
+        await ws.send_str(json.dumps({"t": "head.switch", "name": "echo",
+                                      "req_id": "q4"}))
+        sw2 = await recv_until(
+            ws, lambda d: d.get("t") == "head.switch.result" and d.get("req_id") == "q4")
+        assert sw2["ok"] is True and sw2["note"] == "已是激活 head"
+
+        await ws.send_str(json.dumps({"t": "head.switch", "name": "ghost"}))
+        err = await recv_until(ws, lambda d: d.get("t") == "error")
+        assert err["code"] == "bad_request" and "ghost" in err["msg"]
+        await close_ws(ws)
+    rt_gateway._reset_head_registry()
+
+
+@pytest.mark.asyncio
+async def test_head_switch_rejected_in_single_head_mode(tmp_path, monkeypatch):
+    """无 profiles 文件：head.list 报单头模式，head.switch 拒绝。"""
+    monkeypatch.setenv("VOICE_HEAD_PROFILES", str(tmp_path / "missing.json"))
+    rt_gateway._reset_head_registry()
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        await ws.send_str(json.dumps({"t": "head.list", "req_id": "q1"}))
+        got = await recv_until(ws, lambda d: d.get("t") == "head.list.result")
+        assert got["file_backed"] is False and got["active"] == "default"
+        await ws.send_str(json.dumps({"t": "head.switch", "name": "default"}))
+        err = await recv_until(ws, lambda d: d.get("t") == "error")
+        assert err["code"] == "bad_request" and "single-head" in err["msg"]
+        await close_ws(ws)
+    rt_gateway._reset_head_registry()
+
+
+@pytest.mark.asyncio
+async def test_head_switch_rejected_when_env_pinned(tmp_path, monkeypatch):
+    """VOICE_HEAD_PROFILE 钉住：list 标 env_pinned，switch 拒绝。"""
+    heads = await _switch_heads_file(tmp_path)
+    monkeypatch.setenv("VOICE_HEAD_PROFILES", str(heads))
+    monkeypatch.setenv("VOICE_HEAD_PROFILE", "nova")
+    rt_gateway._reset_head_registry()
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        await ws.send_str(json.dumps({"t": "head.list", "req_id": "q1"}))
+        got = await recv_until(ws, lambda d: d.get("t") == "head.list.result")
+        assert got["env_pinned"] is True and got["active"] == "nova"
+        await ws.send_str(json.dumps({"t": "head.switch", "name": "echo"}))
+        err = await recv_until(ws, lambda d: d.get("t") == "error")
+        assert err["code"] == "bad_request" and "pinned" in err["msg"]
+        await close_ws(ws)
+    rt_gateway._reset_head_registry()

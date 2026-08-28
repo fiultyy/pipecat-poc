@@ -18,6 +18,8 @@ stdlib tkinter（Notebook 页签）+ sounddevice 原生采集 + numpy FFT + aioh
   面板）
 - 语音页迷你通知行：body.push 到达一行（no/status/summary/chars 量级）；
   回合页 notify 相（📣）+ 同 ref body.push 追加灰行「└已入详情」
+- 语音页 head 选择行（PR8）：观测开启即 head.list 拉配置表渲染单选钮；
+  切换发 head.switch——激活单例，活会话不拆，下一次语音连接生效
 
 两连接同 token 计入网关并发上限 ≤2（即本客户端独占单 token 配额）。
 帧协议与 rt_gateway.py §1 逐字对齐。
@@ -601,6 +603,38 @@ def cleanup_result_line(result: dict) -> str:
     return "；".join(parts)
 
 
+def head_list_request(req_id: str) -> dict:
+    """head 配置查询控制帧：回包 head.list.result（配置表+当前激活）。"""
+    return {"t": "head.list", "req_id": req_id}
+
+
+def head_switch_request(name: str, req_id: str) -> dict:
+    """head 切换控制帧：激活单例——只改下一次语音会话的 head 选择。"""
+    return {"t": "head.switch", "name": str(name), "req_id": req_id}
+
+
+def head_switch_line(frame: dict) -> str:
+    """head.switch.result 回包 → 单行结果（切换目标 + 生效说明）。"""
+    if not isinstance(frame, dict) or not frame.get("ok"):
+        return f"⚠ head 切换失败：{(frame or {}).get('reason', '未知原因')}"
+    line = f"head → {frame.get('active', '?')}"
+    if frame.get("note"):
+        line += f"（{frame['note']}）"
+    return line
+
+
+def head_names_from_list(frame: dict) -> tuple[list[tuple[str, str]], str, bool]:
+    """head.list.result 回包 → ([(name,label)…], active, file_backed)。
+
+    单头模式（file_backed=False）也回一行 default——UI 据此只显示
+    「单头模式」不渲染切换钮。
+    """
+    profiles = frame.get("profiles") if isinstance(frame, dict) else None
+    rows = [(str(p.get("name")), str(p.get("label") or p.get("name")))
+            for p in profiles if isinstance(p, dict)] if isinstance(profiles, list) else []
+    return rows, str(frame.get("active", "")), bool(frame.get("file_backed"))
+
+
 class PushToTalk:
     """按住说话状态机：press/release → start/stop 动作。
 
@@ -652,6 +686,7 @@ class App:
         self._detail_pending: str | None = None    # 在途 body.get 的 ref
         self._notify_refs: set[str] = set()        # 回合页已见 notify 相的 ref
         self._cleanup_seq = 0                      # fleet.cleanup req_id 序号
+        self._head_seq = 0                         # head.switch req_id 序号
         self.stream: sd.InputStream | None = None
 
         root.title("rt-voice · ONE 桌面客户端（语音+观测）")
@@ -685,7 +720,17 @@ class App:
         self.end_btn = ttk.Button(top, text="结束会话", command=self.end_session, width=10)
         self.end_btn.pack(side="right")
 
-        # ---- 语音页：频谱 + 开关 + 事件面板 ----
+        # ---- 语音页：head 选择行 + 频谱 + 开关 + 事件面板 ----
+        head_row = ttk.Frame(voice_tab, padding=(10, 6))
+        head_row.pack(fill="x")
+        self.head_row = head_row
+        ttk.Label(head_row, text="head").pack(side="left")
+        self.head_var = tk.StringVar(value="")
+        self.head_buttons: dict = {}
+        self.head_note_var = tk.StringVar(value="（观测开启后显示 head 配置）")
+        ttk.Label(head_row, textvariable=self.head_note_var,
+                  foreground="#8a8a8a").pack(side="left", padx=10)
+
         self.canvas = tk.Canvas(voice_tab, bg="#0b0f14", height=240, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=8, pady=(6, 0))
         self.level_var = tk.StringVar(value="电平 ──────────")
@@ -834,6 +879,8 @@ class App:
         self.obs_link = link
         link.start()
         self.obs_btn.config(text="停观测")
+        # head 配置面：观测会话就绪即拉一次（req 泵等握手完成后发出）
+        link.send_request(head_list_request(f"head-list-{int(time.time() * 1000)}"))
 
     def _drain_obs(self):
         """收割观测帧 → 分面渲染（_tick 内调用，UI 线程）。"""
@@ -868,6 +915,14 @@ class App:
                 self._render_fleet(f)
             elif t == "fleet.cleanup.result":
                 self.fleet_note_var.set(cleanup_result_line(f))
+            elif t == "head.list.result":
+                self._render_heads(f)
+            elif t == "head.switch.result":
+                line = head_switch_line(f)
+                self.head_note_var.set(line)
+                st_write(self.log, f"[head] {line}")
+                if f.get("ok"):
+                    self.head_var.set(str(f.get("active", "")))
             elif t == "bridge.msg":
                 st_write(self.bridge_log, str(f.get("line", ""))[:300])
             elif t == "tickets.snapshot":
@@ -926,6 +981,37 @@ class App:
         req_id = f"clean-{int(time.time() * 1000)}-{self._cleanup_seq}"
         self.fleet_note_var.set(f"已发清理请求（{mode} · {len(ids)} 个席位）…")
         self.obs_link.send_request(cleanup_request(ids, mode, req_id))
+
+    # ---- head 配置面（head.list/head.switch，经观测连接出站）----
+
+    def _render_heads(self, frame: dict):
+        """head.list.result → 单选钮行；单头模式只留说明不渲染钮。"""
+        rows, active, file_backed = head_names_from_list(frame)
+        for btn in self.head_buttons.values():
+            btn.destroy()
+        self.head_buttons.clear()
+        if not file_backed:
+            self.head_note_var.set("单头模式（无 profiles 文件）")
+            self.head_var.set(active)
+            return
+        for name, label in rows:
+            rb = ttk.Radiobutton(self.head_row, value=name, variable=self.head_var,
+                                 text=label, command=lambda n=name: self._head_switch(n))
+            rb.pack(side="left", padx=(6, 0))
+            self.head_buttons[name] = rb
+        self.head_var.set(active)
+        self.head_note_var.set("切换对下一次语音连接生效")
+
+    def _head_switch(self, name: str):
+        """切激活 head：观测连接出站 head.switch；活会话不拆（单例语义）。"""
+        if not (self.obs_link and self.obs_link._thread
+                and self.obs_link._thread.is_alive()):
+            self.head_note_var.set("观测连接未开——开启「观测」后可切换 head")
+            return
+        self._head_seq += 1
+        req_id = f"head-{int(time.time() * 1000)}-{self._head_seq}"
+        self.head_note_var.set(f"切换 head → {name} …")
+        self.obs_link.send_request(head_switch_request(name, req_id))
 
     # ---- 详情页签（KG 14 §2.4：表按 ref 去重，正文两级缓存+观测拉取） ----
 

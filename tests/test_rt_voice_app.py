@@ -39,6 +39,10 @@ from rt_voice_app import (  # noqa: E402
     detail_error_line,
     detail_rows_from_push,
     fleet_rows,
+    head_list_request,
+    head_names_from_list,
+    head_switch_line,
+    head_switch_request,
     merge_detail_rows,
     notice_line_from_push,
     orch_tree_lines,
@@ -561,3 +565,39 @@ def test_task_fleet_tabs_assembly_smoke():
         if app is not None and getattr(app, "ptt_listener", None):
             app.ptt_listener.stop()
         root.destroy()
+
+
+# ---- head 配置面（PR8：head.list/head.switch 纯函数）----
+
+
+def test_head_request_frames():
+    assert head_list_request("r-1") == {"t": "head.list", "req_id": "r-1"}
+    assert head_switch_request("echo", "r-2") == \
+        {"t": "head.switch", "name": "echo", "req_id": "r-2"}
+
+
+def test_head_switch_line():
+    ok = {"t": "head.switch.result", "ok": True, "active": "echo",
+          "note": "下一次语音连接生效"}
+    assert head_switch_line(ok) == "head → echo（下一次语音连接生效）"
+    assert head_switch_line({"ok": True, "active": "nova", "note": "已是激活 head"}) \
+        == "head → nova（已是激活 head）"
+    assert head_switch_line({"ok": True, "active": "x"}) == "head → x"  # 无 note
+    assert head_switch_line({"ok": False, "reason": "pinned"}).startswith("⚠")
+    assert head_switch_line({}).startswith("⚠")
+
+
+def test_head_names_from_list():
+    frame = {"t": "head.list.result", "active": "nova", "file_backed": True,
+             "profiles": [{"name": "nova", "label": "Nova·任务助手", "active": True},
+                          {"name": "echo", "label": "", "active": False}]}
+    rows, active, backed = head_names_from_list(frame)
+    assert rows == [("nova", "Nova·任务助手"), ("echo", "echo")]  # 空 label 回落 name
+    assert active == "nova" and backed is True
+    single = {"active": "default", "file_backed": False,
+              "profiles": [{"name": "default", "active": True}]}
+    rows2, active2, backed2 = head_names_from_list(single)
+    assert rows2 == [("default", "default")] and active2 == "default" and backed2 is False
+    # 畸形帧不抛：空表 + 空 active
+    assert head_names_from_list({}) == ([], "", False)
+    assert head_names_from_list({"profiles": "corrupt"}) == ([], "", False)

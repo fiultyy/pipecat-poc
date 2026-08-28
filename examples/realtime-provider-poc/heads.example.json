@@ -1,0 +1,37 @@
+{
+  "_comment": "head 配置表示例（复制到 ~/.config/voice-gateway/heads.json 或以 VOICE_HEAD_PROFILES 指定路径）。active=单例激活；voice/session 各字段见 rt_head_registry.py 模块头。所有 null 字段回落旧单头路径（VOICE_HEAD_MODEL/VOICE_HEAD_VOICE/VOICE_HEAD_DOCTRINE/VOICE_TURN_* env → 内置缺省），因此全 null 的条目即当前 head 的精确副本——占位副本即此形态。切换：观测面 head.switch（写回 active，下一次语音连接生效）或 env VOICE_HEAD_PROFILE 钉住（钉住时 head.switch 拒绝）。",
+  "active": "nova",
+  "profiles": [
+    {
+      "name": "nova",
+      "label": "Nova·任务助手",
+      "model": null,
+      "voice": null,
+      "doctrine": null,
+      "doctrine_file": null,
+      "turn_silence_ms": null,
+      "turn_prefix_ms": null,
+      "turn_threshold": null
+    },
+    {
+      "name": "echo",
+      "label": "Echo·快答",
+      "model": null,
+      "voice": "Cherry",
+      "doctrine_file": null,
+      "turn_silence_ms": 600,
+      "turn_prefix_ms": null,
+      "turn_threshold": null
+    },
+    {
+      "name": "scribe",
+      "label": "Scribe·文档",
+      "model": null,
+      "voice": null,
+      "doctrine_file": "/absolute/path/to/scribe-doctrine.md",
+      "turn_silence_ms": null,
+      "turn_prefix_ms": null,
+      "turn_threshold": null
+    }
+  ]
+}
