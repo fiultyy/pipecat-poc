@@ -601,3 +601,35 @@ def test_head_names_from_list():
     # 畸形帧不抛：空表 + 空 active
     assert head_names_from_list({}) == ([], "", False)
     assert head_names_from_list({"profiles": "corrupt"}) == ([], "", False)
+
+
+def test_connection_bar_stays_visible_above_tabs():
+    """回归：连接控制条（连接/观测/结束会话）是窗口级 chrome——先于
+    Notebook pack，固定窗高下页签内容再高也不得把它挤没（PR8 head 行
+    曾把它压到 0 高）。无显示环境跳过。"""
+    try:
+        import tkinter as tk
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"no tkinter: {e}")
+    try:
+        root = tk.Tk()
+    except Exception as e:  # noqa: BLE001 — headless 环境
+        pytest.skip(f"no display for tkinter: {e}")
+    app = None
+    try:
+        root.geometry("980x640")  # 与生产同参：固定窗高才复现历史挤压
+        app = App(root, "ws://127.0.0.1:8765/ws", "", False)
+        root.update()
+        # 固定窗高（与生产同参）：三钮映射可见、正高度、位于 Notebook 之上
+        for btn in (app.conn_btn, app.obs_btn, app.end_btn):
+            assert btn.winfo_ismapped(), f"{btn['text']} 未渲染"
+            assert btn.winfo_height() > 0, f"{btn['text']} 被压到 0 高"
+        assert app.conn_btn.winfo_rooty() <= app.nb.winfo_rooty()
+        # 顶栏是 root 首个 pack 的子控件
+        assert root.pack_slaves()[0] is app.conn_btn.master
+    finally:
+        if app is not None:
+            try:
+                app.root.destroy()
+            except Exception:  # noqa: BLE001
+                pass

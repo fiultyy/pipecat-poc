@@ -693,14 +693,9 @@ class App:
         root.geometry("980x640")
         root.minsize(780, 520)
 
-        # ---- Notebook：语音页 + 观测四页签 ----
-        self.nb = ttk.Notebook(root)
-        self.nb.pack(fill="both", expand=True)
-
-        voice_tab = ttk.Frame(self.nb, padding=0)
-        self.nb.add(voice_tab, text=" 语音 ")
-
         # ---- 顶栏：地址 / token / 双连接开关 ----
+        # （先于 Notebook pack：连接控制是窗口级 chrome，页签内容再高也
+        # 不许把它挤没——历史上后 pack 在固定窗高下会被压缩到 0 高）
         top = ttk.Frame(root, padding=(8, 6))
         top.pack(fill="x")
         ttk.Label(top, text="网关").pack(side="left")
@@ -719,6 +714,13 @@ class App:
         ttk.Label(top, textvariable=self.obs_state_var, foreground="#555").pack(side="left", padx=10)
         self.end_btn = ttk.Button(top, text="结束会话", command=self.end_session, width=10)
         self.end_btn.pack(side="right")
+
+        # ---- Notebook：语音页 + 观测四页签 ----
+        self.nb = ttk.Notebook(root)
+        self.nb.pack(fill="both", expand=True)
+
+        voice_tab = ttk.Frame(self.nb, padding=0)
+        self.nb.add(voice_tab, text=" 语音 ")
 
         # ---- 语音页：head 选择行 + 频谱 + 开关 + 事件面板 ----
         head_row = ttk.Frame(voice_tab, padding=(10, 6))
