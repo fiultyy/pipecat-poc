@@ -98,6 +98,26 @@ def test_list_index_without_body(store):
     assert store.list(limit=5)[0]["ref"] == "vh-055"
 
 
+def test_list_before_ts_pages_older_rows(store):
+    """before_ts 游标翻页（body.list_more 控制帧）：只返回 ts 严格早于
+    游标的行（等 ts 不计入）、按 no 升序取其中最近 limit 条；同游标重复
+    调用结果一致（纯读幂等）。"""
+    for i in range(5):
+        store.put(_entry(f"vh-{i}", ts=1000.0 + i))
+    page = store.list(limit=2, before_ts=1002.5)
+    assert [r["ref"] for r in page] == ["vh-1", "vh-2"], "游标前最近 limit 条"
+    assert page == store.list(limit=2, before_ts=1002.5), "同游标幂等"
+    # 游标更早：窗口收窄
+    assert [r["ref"] for r in store.list(limit=2, before_ts=1000.5)] == ["vh-0"]
+    # 游标更晚：仍只取窗口内最近 limit 条（no 降序截断再升序返回）
+    assert [r["ref"] for r in store.list(limit=2, before_ts=1004.5)] == \
+        ["vh-3", "vh-4"]
+    # 等 ts 严格排除 + 游标早于全部行 → 空页
+    store.put(_entry("vh-dup", ts=1000.0))
+    assert [r["ref"] for r in store.list(before_ts=1000.0)] == []
+    assert store.list(before_ts=999.0) == []
+
+
 # ---- 幂等 / 校验 ----
 
 

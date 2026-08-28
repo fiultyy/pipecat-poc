@@ -114,12 +114,14 @@ function handleControl(msg) {
       if (state.micWanted) startMic();
       break;
     case "pong": break;
-    case "error":
-      logLine(`错误 ${msg.code}: ${msg.msg}`);
-      if (msg.code === "auth" || msg.code === "concurrent_limit") {
+    case "error": {
+      const err = errorText(msg);
+      logLine(`错误 ${err.text}`);
+      if (err.kind === "auth" || err.kind === "concurrent_limit") {
         state.micWanted = false; $("micBtn").textContent = "开播麦克风";
       }
       break;
+    }
     case "session.ended":
       logLine("会话已结束");
       state.micWanted = false; $("micBtn").textContent = "开播麦克风";
@@ -134,6 +136,16 @@ function handleControl(msg) {
 
 function wsSend(obj) {
   if (state.ws && state.ws.readyState === 1) state.ws.send(JSON.stringify(obj));
+}
+
+// 错误帧契约（与网关共享）：{t:"error", type:"error", message, req_id?}。
+// 渲染按新字段 type/message 优先、旧字段 msg 兜底（网关两套同帧同发，
+// 仅携带新字段的帧也能完整渲染）；细分码（auth/concurrent_limit 等）
+// 契约里没有，只能从旧字段 code 读。
+function errorText(msg) {
+  const type = msg.type || "error";
+  const message = msg.message || msg.msg || "";
+  return { text: `${type}: ${message}`, kind: msg.code || "" };
 }
 
 function summarize(m) {

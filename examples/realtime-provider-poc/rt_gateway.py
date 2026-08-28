@@ -36,7 +36,22 @@
   ``session.list`` 活性（live=在列且未归档；running/title/task/idle_s）、
   顶层恒带 ``liaison`` 绑定对象（bound/code/sessionId/archived）；
   loopback 不可达降级纯席位表附 note，回包 ``fleet.brief.result``；
-  并以 ``fleet_brief`` app resource 暴露给 head 工具
+  并以 ``fleet_brief`` app resource 暴露给 head 工具；归档集带 30s
+  TTL 模块级缓存（cleanup 归档/摘除成功即失效）
+
+Additional control frames (W3):
+
+- ``body.list_more{req_id, before_ts, limit?}`` — 台账索引向前翻页 →
+  ``body.list_more.result{req_id, items, eof}``（items 与 body.push 索引
+  行同构；只返回 ts 早于 before_ts 的行；eof=返回数<limit；同游标重放
+  同结果）
+- ``liaison.unbind{req_id}`` → ``liaison.result{op:"unbind", ok, was_bound}``
+  （未绑定为幂等 no-op）
+- ``liaison.bind{req_id, code}`` → ``liaison.result{op:"bind", ok, liaison}``
+  — 仅允许绑到 fleet.json 在册且未归档席位；重复绑定同 code 幂等 no-op
+- ``run.cancel{req_id, ref}`` → ``run.cancel.result{req_id, ref, ok,
+  state?, error?}`` — 复用 ``backend.cancel`` 内部路径；未知 ref 报
+  ``unknown-ref``，重复取消幂等返回 ``state:"cancelled"``
 
 帧协议（§1）：JSON 文本帧（control/event）+ 二进制帧（raw PCM16LE/16k/mono，
 推荐 20ms=640B）。握手序：``auth`` → ``auth.ok{session_id}`` →
@@ -105,6 +120,10 @@ ORCH_KINDS = (
 BODY_PUSH_KIND = "body.push"
 BODY_INDEX_LIMIT = 50               # 回放索引条数（兼掉 list 帧，裁决 #3）
 BODY_INLINE_MAX_CHARS = 4096        # ≤ 此长度轻通知附 inline 全文
+# body.list_more 翻页（W3）：缺省页大小与 rt_session_store.DEFAULT_LIST_LIMIT
+# 同值（50）；上限封顶防一次拉穿 LRU 全库。
+BODY_LIST_MORE_DEFAULT_LIMIT = 50
+BODY_LIST_MORE_MAX_LIMIT = 200
 CANCEL_ARTIFACT = "(已取消)"         # orch.done 的 cancel 语义标记 → status=cancelled
 # split 完成通报前缀（KG 14 §2.3/裁决 #7）：注入载荷是纯数据、单行 JSON，
 # 不接任何指令句——行为约定只在 doctrine，载荷嵌指令即漂移源
@@ -295,10 +314,18 @@ class WsSession:
             await self._on_gate_resolve(data)
         elif t == "body.get":
             await self._on_body_get(data)
+        elif t == "body.list_more":
+            await self._on_body_list_more(data)
         elif t == "fleet.cleanup":
             await self._on_fleet_cleanup(data)
         elif t == "fleet.brief":
             await self._on_fleet_brief(data)
+        elif t == "liaison.unbind":
+            await self._on_liaison_unbind(data)
+        elif t == "liaison.bind":
+            await self._on_liaison_bind(data)
+        elif t == "run.cancel":
+            await self._on_run_cancel(data)
         elif t == "whiteboard.set":
             await self._on_whiteboard_set(data)
         elif t == "head.list":
@@ -306,7 +333,8 @@ class WsSession:
         elif t == "head.switch":
             await self._on_head_switch(data)
         else:
-            await self._send_error("bad_type", f"unknown t={t!r}")
+            await self._send_error("bad_type", f"unknown t={t!r}",
+                                   req_id=data.get("req_id"))
 
     # ---- control: auth / start / end / gate.resolve ----
 
@@ -457,18 +485,69 @@ class WsSession:
             "ts": rec.get("updated_ts") or rec.get("ts") or time.time(),
         })
 
+    async def _on_body_list_more(self, data: dict) -> None:
+        """body.list_more{req_id,before_ts,limit?} → 台账索引翻页（W3）.
+
+        ``before_ts`` 是游标：只返回台账 ``ts`` 严格早于该值的行（no 升序、
+        去 body，行与 body.push 索引行同构——:func:`_index_entry`）。
+        ``limit`` 缺省 :data:`BODY_LIST_MORE_DEFAULT_LIMIT`（与
+        ``rt_session_store.DEFAULT_LIST_LIMIT`` 同值），1..200 钳制；
+        ``eof``=返回数<limit（不足一页即到头）。纯读、同 before_ts 重放
+        同结果（幂等）。store 未初始化/读失败 → internal 错误帧。
+        """
+        req_id = data.get("req_id")
+        before_ts = data.get("before_ts")
+        if isinstance(before_ts, bool) or not isinstance(before_ts, (int, float)):
+            await self._send_error("bad_request",
+                                   "body.list_more needs a numeric before_ts",
+                                   req_id=req_id)
+            return
+        limit = BODY_LIST_MORE_DEFAULT_LIMIT
+        if data.get("limit") is not None:
+            try:
+                limit = int(data["limit"])
+            except (TypeError, ValueError):
+                await self._send_error("bad_request",
+                                       "body.list_more limit must be an integer",
+                                       req_id=req_id)
+                return
+        limit = min(max(limit, 1), BODY_LIST_MORE_MAX_LIMIT)
+        store = _get_store()
+        if store is None:
+            await self._send_error("internal", "session store unavailable",
+                                   req_id=req_id)
+            return
+        rows = await _store_call(store.list, limit, before_ts=float(before_ts))
+        if not isinstance(rows, list):
+            await self._send_error("internal", "session store read failed",
+                                   req_id=req_id)
+            return
+        await self._reply({
+            "t": "body.list_more.result",
+            "req_id": req_id,
+            "items": [_index_entry(r) for r in rows],
+            "eof": len(rows) < limit,
+        })
+
     async def _on_fleet_cleanup(self, data: dict) -> None:
         """fleet.cleanup{ids,mode} → 逐 id 处理 → fleet.cleanup.result（KG 14 §2.4）.
 
-        mode=end 先经 loopback 真死会话（已死容忍——正常清理场景）；硬失败
-        （非 gone 分型）该条标 ``error:end-failed``、fleet.json 条目保留并计入
-        汇总 ``failed`` 数。mode=release 只摘 fleet.json 条目不碰会话；id 不
-        存在该条 not_found 其余照处理。被摘席位（end 真死成功 / release 出册）
-        若是当前 liaison 绑定 → 删除 liaison.json（result 标
-        ``binding-cleared``；此后派发不再续投旧席——AUTO_NEW 开启时换新，
-        未开启时按无绑定口径报错）。摘除走 fleet-touch 同款锁下原子写；
-        无有效摘除不触碰文件（免空写触发 fleet.snapshot 重发）；锁超时放弃
-        本次写并记日志（fleet 状态是缓存性快照，可接受）。
+        mode=end 先经 loopback 真死会话（已死容忍——正常清理场景，锁外
+        发rpc）；硬失败（非 gone 分型）该条标 ``error:end-failed``、
+        fleet.json 条目保留并计入汇总 ``failed`` 数。mode=release 只摘
+        fleet.json 条目不碰会话；id 不存在该条 not_found 其余照处理。
+        被摘席位（end 真死成功 / release 出册）若是当前 liaison 绑定 →
+        删除 liaison.json（result 标 ``binding-cleared``；此后派发不再
+        续投旧席——AUTO_NEW 开启时换新，未开启时按无绑定口径报错）。
+
+        摘除的读-改-写全程走 :func:`_fleet_update`（fleet-touch 同款
+        flock 哨兵锁互斥、锁内读→删→写，B1）；无有效摘除不触碰文件
+        （免空写触发 fleet.snapshot 重发）。获锁超时 → 待摘条目全部
+        ``{"ok": false, "error": "fleet-lock-timeout"}``、条目保留、计入
+        failed（B2 如实回包；锁释放后重放同请求即成功）。end 归档成功
+        （含 gone 分型）或条目实际摘除后立即失效归档集缓存（B3：后续
+        brief 不再看到幽灵席位）。重复 cleanup 同输入：条目已摘 → 全
+        not_found、文件零写，终态一致（幂等）。
         """
         req_id = data.get("req_id")
         ids = data.get("ids")
@@ -497,8 +576,8 @@ class WsSession:
             return
         liaison_code = _liaison_bound_code()
         results: list[dict] = []
-        removed = 0
-        failed = 0
+        removable: list[str] = []
+        archived_any = False
         for fid in ids:
             entry = entries.get(fid)
             if not isinstance(entry, dict):
@@ -509,37 +588,56 @@ class WsSession:
                 if sid:
                     try:
                         await _dsh_api(SESSION_END_METHOD, {"sessionId": sid})
+                        archived_any = True
                     except Exception as e:  # noqa: BLE001 — 会话真死失败：条目保留
                         if _session_gone(e):
                             log.debug("fleet.cleanup %s already gone: %s", sid, e)
+                            archived_any = True  # 会话确不在，归档口径同已归档
                         else:
                             log.warning("fleet.cleanup end %s failed: %s", sid, e)
                             results.append({"id": fid, "ok": False,
                                             "error": "end-failed"})
-                            failed += 1
                             continue  # 真死未确认 → 不摘册（残席可重试清理）
-            item = {"id": fid, "ok": True}
-            if fid == liaison_code:
-                item["note"] = "active-liaison"
-                if _liaison_bound_clear():
-                    item["binding-cleared"] = True
-            results.append(item)
-            del entries[fid]
-            removed += 1
-        if removed:
+            results.append({"id": fid, "ok": True})
+            removable.append(fid)
+        removed: list[str] = []
+        if removable:
+            def _apply(fleet_now: dict) -> list[str]:
+                table = fleet_now.get("fleet")
+                removed_ids: list[str] = []
+                if isinstance(table, dict):
+                    for fid in removable:
+                        if table.pop(fid, None) is not None:
+                            removed_ids.append(fid)
+                return removed_ids
+
             try:
-                await asyncio.to_thread(_atomic_write_json, path, fleet,
-                                        fleet_sync=True)
-            except OSError as e:
+                removed = await _fleet_update(path, _apply)
+            except FleetLockTimeout:
+                for item in results:
+                    if item.get("ok"):
+                        item.update(ok=False, error="fleet-lock-timeout")
+                removed = []
+            except (OSError, ValueError) as e:
                 await self._send_error(
                     "internal", f"fleet.json write failed: {e}"[:160],
                     req_id=req_id)
                 return
+            for fid in removed:
+                if fid == liaison_code:
+                    for item in results:
+                        if item.get("id") == fid and item.get("ok"):
+                            item["note"] = "active-liaison"
+                            if _liaison_bound_clear():
+                                item["binding-cleared"] = True
+        if removed or archived_any:
+            _reset_archived_cache()
         await self._reply({
             "t": "fleet.cleanup.result",
             "req_id": req_id,
             "results": results,
-            "failed": failed,
+            "failed": sum(1 for r in results
+                          if r.get("error") in ("end-failed", "fleet-lock-timeout")),
         })
 
     async def _on_fleet_brief(self, data: dict) -> None:
@@ -560,6 +658,121 @@ class WsSession:
             "req_id": data.get("req_id"),
             **payload,
         })
+
+    async def _on_liaison_unbind(self, data: dict) -> None:
+        """liaison.unbind{req_id} → liaison.result{op:"unbind",ok,was_bound}（W3）.
+
+        删除当前 liaison 绑定文件；未绑定时 ``ok:true, was_bound:false``
+        （幂等 no-op）。删除失败（文件在而删不掉）→ ``ok:false`` 附
+        ``error``，绑定保持原样。
+        """
+        req_id = data.get("req_id")
+        was_bound = os.path.exists(_liaison_state_path())
+        ok, error = True, None
+        if was_bound and not _liaison_bound_clear():
+            # clear 返回 False 且文件仍不在了 → 并发删除，等效已解绑
+            ok = os.path.exists(_liaison_state_path())
+            if not ok:
+                was_bound = True
+            else:
+                error = "liaison state clear failed"
+        frame = {"t": "liaison.result", "req_id": req_id, "op": "unbind",
+                 "ok": ok, "was_bound": was_bound}
+        if error is not None:
+            frame["error"] = error
+        await self._reply(frame)
+
+    async def _on_liaison_bind(self, data: dict) -> None:
+        """liaison.bind{req_id,code} → liaison.result{op:"bind",…}（W3）.
+
+        仅允许绑到 fleet.json 在册席位：code 不在 fleet 表（或条目无
+        sessionId）→ ``ok:false``；目标会话已归档（workspace.list 归档集，
+        带 TTL 缓存）→ ``ok:false`` 且 ``error`` 注明归档；成功写
+        liaison.json（``{"code","sessionId","bound_at"}``）。重复绑定同
+        code 且文件已同值 → 不重写文件（幂等 no-op），回包同值。失败帧
+        的 ``liaison`` 对象回报操作后的当前绑定（未动即旧值/无绑定）。
+        """
+        req_id = data.get("req_id")
+        code = data.get("code")
+        if not isinstance(code, str) or not code.strip():
+            await self._send_error("bad_request", "liaison.bind needs a code",
+                                   req_id=req_id)
+            return
+        code = code.strip()
+
+        def _frame(ok: bool, error: str | None, liaison: dict) -> dict:
+            frame = {"t": "liaison.result", "req_id": req_id, "op": "bind",
+                     "ok": ok, "liaison": liaison}
+            if error is not None:
+                frame["error"] = error
+            return frame
+
+        try:
+            with open(_fleet_path(), encoding="utf-8") as fh:
+                fleet = json.load(fh)
+        except (OSError, ValueError) as e:
+            await self._reply(_frame(False, f"fleet.json unreadable: {e}"[:160],
+                                     await _liaison_view_after()))
+            return
+        table = fleet.get("fleet") if isinstance(fleet, dict) else None
+        entry = table.get(code) if isinstance(table, dict) else None
+        sid = str(entry.get("sessionId") or "") if isinstance(entry, dict) else ""
+        if not sid:
+            await self._reply(_frame(False, "code-not-in-fleet",
+                                     await _liaison_view_after()))
+            return
+        archived = await _archived_session_ids()
+        if archived is not None and sid in archived:
+            await self._reply(_frame(False, f"target session archived: {sid}",
+                                     await _liaison_view_after()))
+            return
+        current = _liaison_bound_state()
+        if current.get("code") != code or current.get("sessionId") != sid:
+            doc = {"code": code, "sessionId": sid, "bound_at": time.time()}
+            try:
+                await asyncio.to_thread(_write_json_atomic, _liaison_state_path(), doc)
+            except OSError as e:
+                await self._reply(_frame(False, f"liaison state write failed: {e}"[:160],
+                                         await _liaison_view_after()))
+                return
+        await self._reply(_frame(True, None, {
+            "bound": True, "code": code, "sessionId": sid, "archived": False,
+        }))
+
+    async def _on_run_cancel(self, data: dict) -> None:
+        """run.cancel{req_id,ref} → run.cancel.result{req_id,ref,ok,state?}（W3）.
+
+        复用 ``backend.cancel(ref)`` 现有内部路径（本地 phase-2 kill 是权威
+        取消，``state`` 恒报 ``"cancelled"``）。ref 不在 backend ``_runs``
+        运行登记 → ``ok:false, error:"unknown-ref"``；重复取消同一 ref →
+        第二次仍 ``ok:true, state:"cancelled"``（幂等 no-op：pending 任务
+        已死，路径内 ``done()`` 短路）。backend 未接线（echo 模式/未建
+        live 头）→ internal 错误帧。
+        """
+        req_id = data.get("req_id")
+        ref = data.get("ref")
+        if not isinstance(ref, str) or not ref:
+            await self._send_error("bad_request", "run.cancel needs a ref",
+                                   req_id=req_id)
+            return
+        backend = _get_backend()
+        if backend is None:
+            await self._send_error("internal", "no dsh backend wired",
+                                   req_id=req_id)
+            return
+        runs = getattr(backend, "_runs", None)
+        if not isinstance(runs, dict) or ref not in runs:
+            await self._reply({"t": "run.cancel.result", "req_id": req_id,
+                               "ref": ref, "ok": False, "error": "unknown-ref"})
+            return
+        try:
+            await backend.cancel(ref)
+        except Exception as e:  # noqa: BLE001 — 取消失败如实回包
+            await self._reply({"t": "run.cancel.result", "req_id": req_id,
+                               "ref": ref, "ok": False, "error": str(e)[:160]})
+            return
+        await self._reply({"t": "run.cancel.result", "req_id": req_id,
+                           "ref": ref, "ok": True, "state": "cancelled"})
 
     async def _on_whiteboard_set(self, data: dict) -> None:
         """whiteboard.set{text} → whiteboard.set.result（PR10）.
@@ -645,7 +858,7 @@ class WsSession:
             with open(reg.path, encoding="utf-8") as fh:
                 doc = json.load(fh)
             doc["active"] = name
-            _atomic_write_json(reg.path, doc)
+            _write_json_atomic(reg.path, doc)
         except (OSError, ValueError) as e:
             await self._reply({
                 "t": "head.switch.result", "req_id": data.get("req_id"),
@@ -783,8 +996,9 @@ class WsSession:
                           req_id: str | None = None) -> None:
         """错误帧（契约形态，与前端共享）：``{"type":"error",
         "req_id"?: str, "message": str}`` —— req_id 仅在收到时携带，供
-        请求级错误回填关联。旧字段 ``t``/``code``/``msg`` 原样保留（web
-        控制台与语音壳仍按其渲染分发，勿删）。"""
+        请求级错误回填关联。``t:"error"`` 是本应用 ws 帧路由键，永久保留
+        （勿删）；旧字段 ``code``/``msg`` 与新字段同帧同发（web 控制台
+        渲染按新字段优先、旧字段兜底；细分码仅旧字段携带）。"""
         frame = {"t": "error", "code": code, "msg": msg,
                  "type": "error", "message": msg}
         if req_id is not None:
@@ -1429,7 +1643,8 @@ def _fleet_path() -> str:
 # fleet.json 写锁（与 maestro bin/fleet-touch 同一锁对象）：哨兵文件 =
 # $MAESTRO_STATE（缺省 $MAESTRO_HOME|~/.dsh 下 maestro/state）/
 # <fleet.json basename>.lock —— 独立 inode，不随 os.replace 换代。
-# 等待上限与自旋步长：fleet 状态是缓存性快照，拿不到锁放弃本次写可接受。
+# 等待上限与自旋步长：fleet 状态是缓存性快照，拿不到锁放弃本次更新并
+# 如实回包（FleetLockTimeout，B2）。
 FLEET_LOCK_WAIT_S = 2.0
 FLEET_LOCK_SPIN_S = 0.05
 
@@ -1443,75 +1658,96 @@ def _fleet_lock_path(fleet_path: str) -> str:
         state, os.path.basename(os.path.abspath(fleet_path)) + ".lock")
 
 
-def _atomic_write_json(path: str, obj: dict, *, fleet_sync: bool = False) -> bool:
+class FleetLockTimeout(Exception):
+    """fleet.json 写锁在 ``FLEET_LOCK_WAIT_S`` 预算内不可得.
+
+    读-改-写未发生（未读未写，条目保持原样）；调用方按
+    ``fleet-lock-timeout`` 口径如实回包（B2）。
+    """
+
+
+def _write_json_atomic(path: str, obj: dict) -> None:
     """tempfile + os.replace 原子写（镜像 session-spawn 范式：读者要么见
     旧文件要么见新文件，永不见半写截断态）。
 
-    ``fleet_sync=True``（fleet.json 专用）：写前取 fleet-touch 同款
-    fcntl.flock 哨兵锁（LOCK_EX；获取方式差异——fleet-touch 无限阻塞，
-    网关以 LOCK_NB 自旋最多 FLEET_LOCK_WAIT_S，超时放弃本次写并记日志，
-    返回 False）。锁语义与残余窗口：锁只覆盖本函数的写半程；调用方的
-    先读-再改-后写里的读不在锁内，与 fleet-touch 的 lock(load→save)
-    全程串行相比仍留读-改-写竞窗；写半程互斥已消除网关 vs fleet-touch
-    的并发双写丢更新，不走该锁的第三方写者不受互斥。
-
-    Returns False 仅当 fleet_sync 锁超时/锁文件不可用而放弃写；其余
-    失败照旧抛 OSError。
+    无锁——需要 fleet.json 写互斥的调用方走 :func:`_fleet_update`
+    （锁内读-改-写全程，B1）。失败抛 OSError。
     """
-    lock_fh = None
-    if fleet_sync:
-        lock_path = _fleet_lock_path(path)
-        try:
-            os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
-            lock_fh = open(lock_path, "a+", encoding="utf-8")
-        except OSError as e:
-            log.warning("fleet lock %s unavailable; skip write: %s",
-                        lock_path, e)
-            return False
-        deadline = time.monotonic() + FLEET_LOCK_WAIT_S
-        while True:
-            try:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    log.warning("fleet lock %s busy >%.1fs; skip write "
-                                "(cacheable snapshot)", lock_path,
-                                FLEET_LOCK_WAIT_S)
-                    lock_fh.close()
-                    return False
-                time.sleep(FLEET_LOCK_SPIN_S)
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".fleet-", suffix=".json")
     try:
-        d = os.path.dirname(path) or "."
-        os.makedirs(d, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".fleet-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(obj, fh, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        return True
-    finally:
-        if lock_fh is not None:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+async def _fleet_update(path: str, fn: Callable[[dict], Any]) -> Any:
+    """fleet.json 锁内读-改-写唯一通道（B1：锁覆盖 读→fn→写 全程）.
+
+    与 maestro bin/fleet-touch 的 flock 哨兵锁互斥：获锁 → 读 fleet.json →
+    ``fn(fleet)``（就地修改；返回值透传给调用方）→ dict 有变更才原子写
+    （无变更零写：免空写触发 fleet.snapshot 重发）→ 放锁。全程经
+    ``asyncio.to_thread`` 执行——阻塞的 LOCK_NB 自旋与文件 IO 不占事件
+    循环。``fn`` 抛错 → 不写、锁照放、异常透传（条目保持原样）。
+
+    Returns:
+        ``fn`` 的返回值。
+
+    Raises:
+        FleetLockTimeout: ``FLEET_LOCK_WAIT_S`` 内未获锁（未读未写）。
+        OSError: 锁文件不可用 / fleet.json 读写失败。
+        ValueError: fleet.json 不是合法 JSON。
+    """
+
+    def _run() -> Any:
+        lock_path = _fleet_lock_path(path)
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+        lock_fh = open(lock_path, "a+", encoding="utf-8")
+        try:
+            deadline = time.monotonic() + FLEET_LOCK_WAIT_S
+            while True:
+                try:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        log.warning("fleet lock %s busy >%.1fs; skip update",
+                                    lock_path, FLEET_LOCK_WAIT_S)
+                        raise FleetLockTimeout(lock_path)
+                    time.sleep(FLEET_LOCK_SPIN_S)
+            with open(path, encoding="utf-8") as fh:
+                fleet = json.load(fh)
+            before = json.dumps(fleet, ensure_ascii=False, indent=2)
+            result = fn(fleet)
+            if json.dumps(fleet, ensure_ascii=False, indent=2) != before:
+                _write_json_atomic(path, fleet)
+            return result
+        finally:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
             lock_fh.close()
 
+    return await asyncio.to_thread(_run)
+
+
+def _liaison_state_path() -> str:
+    """liaison 绑定文件路径（``VOICE_LIAISON_STATE`` 覆写；与
+    rt_dsh_backend.DshBackend._liaison_state_path 同一 env 口径——网关
+    不持有 backend 实例，两侧镜像）。"""
+    return os.path.expanduser(os.environ.get(
+        "VOICE_LIAISON_STATE", "~/.local/state/voice-gateway/liaison.json"))
+
 
 def _liaison_bound_state() -> dict:
-    """liaison.json 绑定 ``{code, sessionId}``；缺席/坏文件→``{}``。
-
-    路径口径与 rt_dsh_backend.DshBackend._liaison_state_path 同一 env
-    约定（VOICE_LIAISON_STATE）——网关不持有 backend 实例，两侧镜像。
-    """
-    path = os.path.expanduser(os.environ.get(
-        "VOICE_LIAISON_STATE", "~/.local/state/voice-gateway/liaison.json"))
+    """liaison.json 绑定 ``{code, sessionId}``；缺席/坏文件→``{}``。"""
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(_liaison_state_path(), encoding="utf-8") as fh:
             doc = json.load(fh)
     except (OSError, ValueError):
         return {}
@@ -1535,13 +1771,29 @@ def _liaison_bound_clear() -> bool:
     path = os.path.expanduser(os.environ.get(
         "VOICE_LIAISON_STATE", "~/.local/state/voice-gateway/liaison.json"))
     try:
-        os.unlink(path)
+        os.unlink(_liaison_state_path())
     except FileNotFoundError:
         return False
     except OSError as e:
         log.warning("liaison state clear failed: %s", e)
         return False
     return True
+
+
+def _liaison_payload(bound: dict, archived: set[str] | None) -> dict:
+    """liaison 绑定对象（fleet.brief 顶层与 liaison.result 共用形态）：
+    ``{bound, code, sessionId, archived}``；归档核验降级（archived 为
+    None）时 archived=False（不臆断）。"""
+    sid = str(bound.get("sessionId") or "")
+    return {"bound": bool(sid),
+            "code": bound.get("code") or None,
+            "sessionId": sid or None,
+            "archived": bool(sid and archived is not None and sid in archived)}
+
+
+async def _liaison_view_after() -> dict:
+    """操作后的当前绑定视图（liaison.bind 失败帧用：绑定未动即旧值）。"""
+    return _liaison_payload(_liaison_bound_state(), await _archived_session_ids())
 
 
 # ---- 席位状态简报（PR9）：fleet.json join session.list 活性 ----
@@ -1575,6 +1827,22 @@ def _brief_task_status(long_task: Any) -> str:
     return ""
 
 
+ARCHIVED_CACHE_TTL_S = 30.0
+# 归档集模块级缓存（B3）：{"at": 取得时刻（_archived_clock 口径）|None,
+# "ids": set|None}——at=None 即空。失败（None 结果）不缓存：下一次调用
+# 即重试。cleanup 归档成功/条目摘除后 _reset_archived_cache() 立即失效
+# （后续 brief 不再看到幽灵席位）。
+_ARCHIVED_CACHE: dict = {"at": None, "ids": None}
+# 时钟注入面（单测翻 TTL 用）；缺省单调时钟
+_archived_clock: Callable[[], float] = time.monotonic
+
+
+def _reset_archived_cache() -> None:
+    """立即失效归档集缓存（cleanup 归档/摘除成功后调用；单测隔离同用）。"""
+    _ARCHIVED_CACHE["at"] = None
+    _ARCHIVED_CACHE["ids"] = None
+
+
 async def _archived_session_ids() -> set[str] | None:
     """归档会话集（workspace.list 的 archivedSessionIds）——网关侧等价
     helper，镜像 rt_dsh_backend.DshBackend._archived_session_ids。
@@ -1582,7 +1850,15 @@ async def _archived_session_ids() -> set[str] | None:
     已知 wire 形态是顶层 ``{"items": […], "archivedSessionIds": [sid…]}``；
     递归遍历收集以容忍结构嵌套/演进。不可达 → None：调用方降级为不核验
     并附 note（核验失败不得阻断简报）。
+
+    模块级缓存（B3）：成功结果缓存 :data:`ARCHIVED_CACHE_TTL_S`
+    （时钟经 ``_archived_clock``，可注入）——窗口内重复调用零 loopback
+    往返（brief 是交互面，逐次 workspace.list 过重）。失败不缓存。
     """
+    now = _archived_clock()
+    if (_ARCHIVED_CACHE["at"] is not None
+            and now - _ARCHIVED_CACHE["at"] < ARCHIVED_CACHE_TTL_S):
+        return _ARCHIVED_CACHE["ids"]
     try:
         value = await asyncio.wait_for(
             _dsh_api(WORKSPACE_LIST_METHOD, {}), timeout=BRIEF_DSH_TIMEOUT_S)
@@ -1604,28 +1880,46 @@ async def _archived_session_ids() -> set[str] | None:
 
     if isinstance(value, dict):
         _walk(value)
+    _ARCHIVED_CACHE["at"] = _archived_clock()
+    _ARCHIVED_CACHE["ids"] = ids
     return ids
 
 
+# 席位口径 status 白名单（B4，词表实据 maestro bin/）：``active`` 是
+# session-spawn 的出生值（bin/session-spawn）也是 fleet-touch 心跳的
+# 缺省状态；``verified`` 是 fleet-probe 终端准入通过（bin/fleet-probe）。
+# 词表其余——``probing``/``mismatch``（fleet-probe 探测中/回报不符）、
+# ``stale``（fleet-probe --reverify 判失效）、``retired``（fleet-touch
+# sweep --apply 退役）、运维经 fleet-touch --status 自设的任意值
+# （idle/paused/…）及缺席——不占席位列，只计入顶层 ``inactive`` 数。
+SEAT_STATUSES = ("active", "verified")
+
+
 async def _fleet_brief_payload() -> dict:
-    """席位状态简报 payload（PR9）：fleet.json 席位表 join dsh session.list.
+    """席位状态简报 payload（PR9 + B4 席位口径过滤）：fleet.json join dsh.
+
+    席位口径（B4）：fleet 条目 ``status`` ∈ :data:`SEAT_STATUSES`
+    （``active``/``verified``，词表实据见其注释）才入 ``seats``；其余
+    status 一律不占席位列，只计入顶层 ``inactive`` 数（恒在场——含
+    dsh 降级形态）。
 
     join 口径：sessionId 出现在 session.list 条目且不在归档集 → live=true、
     running/title/task/idle_s 取该条目（title=projections.values.title 缺则
     空串、task=longTask 投影状态、idle_s=(now-updatedAt)/1000 下限 0，
     updatedAt 为毫秒纪元）；不在列表或已归档（workspace.list 的
     archivedSessionIds；归档席位留在 session.list 里但不得视为活——
-    幽灵 worker 口径修正），含 fleet status 已 inactive/released/verified
-    的退役条目 → live=false、running=false、title/task 空、idle_s=null。
+    幽灵 worker 口径修正）→ live=false、running=false、title/task 空、
+    idle_s=null。席位行透传 ``last_seen``=条目 ``lastSeenAt``，缺则
+    ``heartbeatAt``，皆无则 null（ISO 串原样，fleet-touch 心跳口径）。
 
     顶层恒带 ``liaison`` 绑定对象：无绑定 ``{"bound": false, "code":
     null, "sessionId": null, "archived": false}``；有绑定填 code/sessionId，
     archived=绑定 sid 是否在归档集（核验降级时 false）。
 
     loopback 失败/超时（wait_for 8s）→ 降级 ``{seats:[纯席位字段],
-    note, liaison}``；session.list 通而 workspace.list（归档核验）败 →
-    live 口径退回「在列即活」附 BRIEF_ARCH_NOTE；fleet.json 读不了 → 抛
-    （调用方回 internal 错误帧）。
+    note, inactive, liaison}``；session.list 通而 workspace.list（归档
+    核验）败 → live 口径退回「在列即活」附 BRIEF_ARCH_NOTE；
+    fleet.json 读不了 → 抛（调用方回 internal 错误帧）。
     """
     path = _fleet_path()
     with open(path, encoding="utf-8") as fh:
@@ -1635,11 +1929,16 @@ async def _fleet_brief_payload() -> dict:
         raise ValueError("fleet.json has no fleet table")
 
     def _seat(code: str, entry: dict) -> dict:
+        seen = entry.get("lastSeenAt") or entry.get("heartbeatAt") or None
         return {"id": code, "node": str(entry.get("node") or ""),
                 "role": str(entry.get("role") or ""),
-                "status": str(entry.get("status") or "")}
+                "status": str(entry.get("status") or ""),
+                "last_seen": seen}
 
     codes = [code for code, entry in entries.items() if isinstance(entry, dict)]
+    seat_codes = [c for c in codes
+                  if str(entries[c].get("status") or "") in SEAT_STATUSES]
+    inactive = len(codes) - len(seat_codes)
     bound = _liaison_bound_state()
     liaison_sid = str(bound.get("sessionId") or "")
     liaison = {"bound": bool(liaison_sid),
@@ -1654,8 +1953,8 @@ async def _fleet_brief_payload() -> dict:
                   if isinstance(it, dict) and it.get("sessionId")}
     except Exception as e:  # noqa: BLE001 — loopback 不可达 → 纯席位表降级
         log.warning("fleet.brief session.list failed: %s", e)
-        return {"seats": [_seat(c, entries[c]) for c in codes],
-                "note": BRIEF_DSH_NOTE, "liaison": liaison}
+        return {"seats": [_seat(c, entries[c]) for c in seat_codes],
+                "note": BRIEF_DSH_NOTE, "inactive": inactive, "liaison": liaison}
 
     archived = await _archived_session_ids()
     note = BRIEF_ARCH_NOTE if archived is None else None
@@ -1664,7 +1963,7 @@ async def _fleet_brief_payload() -> dict:
 
     now_ms = time.time() * 1000
     seats: list[dict] = []
-    for code in codes:
+    for code in seat_codes:
         entry = entries[code]
         sid = str(entry.get("sessionId") or "")
         item = by_sid.get(sid) if sid else None
@@ -1685,7 +1984,7 @@ async def _fleet_brief_payload() -> dict:
                         task=_brief_task_status(values.get("longTask")),
                         idle_s=idle_s)
         seats.append(seat)
-    payload = {"seats": seats, "liaison": liaison}
+    payload = {"seats": seats, "inactive": inactive, "liaison": liaison}
     if note is not None:
         payload["note"] = note
     return payload
@@ -1695,6 +1994,16 @@ async def _fleet_brief_payload() -> dict:
 
 
 _live_heads: dict = {"head": None, "pending": []}  # 活 head + 无 head 期到达的终稿 (ref, 注入串)
+
+# live DshBackend 槽（W3 ``run.cancel`` 控制帧的取消面）：build_realtime_head
+# 接线时填入。backend 与 main() 同生命周期、跨语音会话存活，故不随单个
+# head 的 stop 清除；echo 模式/未建 live 头时恒 None（run.cancel 回 internal）。
+_live_backend: dict = {"backend": None}
+
+
+def _get_backend() -> Any:
+    """live DshBackend 单例读取（None=未接线：echo 模式/未建 live 头）。"""
+    return _live_backend["backend"]
 
 # 终稿注入串行锁：并发的终稿（phase-2 多路 + 会话补投）排队走同一个
 # active-response 槽，否则后到的 response.create 撞前一个被服务端静默丢弃。
@@ -2093,6 +2402,7 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     await runner.add_workers(worker)
     run_task = asyncio.create_task(runner.run())
     _live_heads["head"] = head  # 终稿注入目标切到本会话
+    _live_backend["backend"] = backend  # run.cancel 控制帧的取消面（W3）
     # 无会话期缓冲的终稿：新会话就绪即补投（session.updated 后注入才生效）
     if _live_heads["pending"]:
 

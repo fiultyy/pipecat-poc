@@ -33,15 +33,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "realtime-pro
 from rt_voice_app import (  # noqa: E402
     App,
     DETAIL_COLS,
+    FLEET_EVENT_KEEP,
+    FLEET_STALE_S,
     ObserveLink,
     PENDING_TIMEOUT_S,
     PushToTalk,
+    VAD_TAIL_STEP_MS,
+    body_list_more_request,
     chars_mag,
     cleanup_request,
     cleanup_result_line,
     detail_ack_line,
     detail_error_line,
     detail_rows_from_push,
+    detail_ts_map,
+    error_identity,
     fleet_brief_lines,
     fleet_brief_request,
     fleet_rows,
@@ -49,7 +55,11 @@ from rt_voice_app import (  # noqa: E402
     head_names_from_list,
     head_switch_line,
     head_switch_request,
+    last_seen_label,
+    liaison_bind_request,
     liaison_line,
+    liaison_result_line,
+    liaison_unbind_request,
     merge_detail_rows,
     notice_line_from_push,
     orch_tree_lines,
@@ -57,6 +67,8 @@ from rt_voice_app import (  # noqa: E402
     pending_send_fail_line,
     pending_timeout_line,
     replay_notice_line,
+    run_cancel_request,
+    run_cancel_result_line,
     tickets_text,
     turn_label_with_notify,
     turn_line,
@@ -951,42 +963,119 @@ def test_vad_tail_plan_constraints():
     assert vad_tail_plan(700, 0) == []
 
 
-def test_send_vad_tail_pacing_and_cancel_on_press():
-    """松键 → 步进定时器投 50ms 静音块；再按下 → 取消剩余尾巴。"""
-    try:
-        import tkinter as tk
+class _ManualAfter:
+    """``root.after``/``after_cancel`` 的确定性替身：只登记 (delay, fn) 不
+    排程，测试按 id 手动驱动回调——尾静音节奏断言全走 delay 序列与手动
+    fire，不看墙钟（并发负载下不抖）。"""
 
-        root = tk.Tk()
-    except Exception as e:  # noqa: BLE001 — headless 环境
-        pytest.skip(f"no display for tkinter: {e}")
-    root.withdraw()
-    app = None
+    def __init__(self):
+        self.scheduled: dict = {}
+        self.delays: list[int] = []
+        self.cancelled: list = []
+        self._n = 0
+
+    def __call__(self, delay, fn):
+        self._n += 1
+        tid = f"after-{self._n}"
+        self.scheduled[tid] = fn
+        self.delays.append(delay)
+        return tid
+
+    def cancel(self, tid):
+        self.cancelled.append(tid)
+        self.scheduled.pop(tid, None)
+
+    def fire(self, tid):
+        fn = self.scheduled.pop(tid, None)
+        if fn is not None:
+            fn()
+
+
+def _manual_after(monkeypatch, root, app):
+    """把 root.after/after_cancel 换成 _ManualAfter 并返回它。"""
+    sched = _ManualAfter()
+    monkeypatch.setattr(root, "after", sched)
+    monkeypatch.setattr(root, "after_cancel", sched.cancel)
+    return sched
+
+
+def test_send_vad_tail_pacing_and_cancel_on_press(monkeypatch):
+    """松键 → 尾静音只排程不落块；手动驱动步进回调验证节奏契约：
+
+    - 不打块：首块非同步投递（排程后 tx 仍空）；
+    - 步进 delay 全为 VAD_TAIL_STEP_MS、每步一块 1600 字节；
+    - 不打爆：计划步数上限 30，走完后无可驱动回调、队列不再增长；
+    - 可取消：再按下 → after_cancel 待发定时器、无新块投递。
+    """
+    root, app = _tk_app()
     try:
-        app = App(root, "ws://127.0.0.1:8765/ws", "", False)
+        sched = _manual_after(monkeypatch, root, app)
         app.state_var.set("open")
+        base = len(sched.delays)
+
         app._send_vad_tail()
         assert app._tail_after is not None
-        assert app.tx.qsize() == 0                    # 首块 50ms 后才投
-        for _ in range(15):                           # ~150ms → 2-3 步
-            root.update()
-            time.sleep(0.01)
-        n_paced = app.tx.qsize()
-        assert 1 <= n_paced <= 3
-        assert all(len(chunk) == 1600 for chunk in app.tx.queue)
+        assert app.tx.qsize() == 0                       # 首块 50ms 后才投
+        assert sched.delays[base:] == [VAD_TAIL_STEP_MS]  # 首个 delay 即步长
 
-        app.ptt.held = True                           # 预持有：press 不开真实麦克风
+        steps = 0
+        while app._tail_after is not None:               # 手动驱动整条步进链
+            sched.fire(app._tail_after)
+            steps += 1
+            assert app.tx.qsize() == min(steps, 30)      # 每个投递步恰一块
+            assert all(len(chunk) == 1600 for chunk in app.tx.queue)
+            assert sched.delays[base:] == [VAD_TAIL_STEP_MS] * min(steps + 1, 31)
+        assert steps == 31                               # 30 个投递步 + 1 个收尾步
+        assert app.tx.qsize() == 30                      # 步数上限（1500ms/50ms）
+        sched.fire("after-nothing")                      # 计划走完：无可驱动回调
+        assert app.tx.qsize() == 30                      # 队列不再增长
+
+        # 取消语义：新尾巴排程后立即按下 → 定时器撤销、零块投递
+        while not app.tx.empty():
+            app.tx.get_nowait()
+        base2 = len(sched.delays)
+        app._send_vad_tail()
+        tail_id = app._tail_after
+        app.ptt.held = True                              # 预持有：press 不开真实麦克风
         app._ptt_press()
-        assert app._tail_after is None                # 尾巴已取消
-        for _ in range(10):                           # 100ms 内不再有新块
-            root.update()
-            time.sleep(0.01)
-        assert app.tx.qsize() == n_paced
+        assert app._tail_after is None                   # 尾巴已取消
+        assert sched.cancelled == [tail_id]
+        sched.fire(tail_id)                              # 已取消的定时器不可再驱动
+        assert app.tx.qsize() == 0                       # 无任何新块
+        assert sched.delays[base2:] == [VAD_TAIL_STEP_MS]  # 取消后无新排程
     finally:
-        if app is not None:
-            app._cancel_vad_tail()
-            if getattr(app, "ptt_listener", None):
-                app.ptt_listener.stop()
-        root.destroy()
+        _teardown(root, app)
+
+
+def test_send_vad_tail_step_exception_chain_continues(monkeypatch):
+    """(d) _send_vad_tail._step 步进体抛异常 → 记「尾静音步进异常已跳过」
+    并继续重排：计划 30 步全部试投、链走完自然结束（_tail_after 归
+    None）。确定性驱动（_ManualAfter），不看墙钟。"""
+    class _BoomTx:
+        calls = 0
+
+        def put_nowait(self, _chunk):
+            type(self).calls += 1
+            raise RuntimeError("boom")
+
+    root, app = _tk_app()
+    try:
+        sched = _manual_after(monkeypatch, root, app)
+        app.tx = _BoomTx()
+        app.state_var.set("open")
+        base = len(sched.delays)
+        app._send_vad_tail()
+        assert app._tail_after is not None
+        steps = 0
+        while app._tail_after is not None:
+            sched.fire(app._tail_after)
+            steps += 1
+            assert sched.delays[base:] == [VAD_TAIL_STEP_MS] * min(steps + 1, 31)
+        assert steps == 31                               # 30 投递步 + 1 收尾步
+        assert _BoomTx.calls == 30                       # 异常不断链：投递步全试投
+        assert "尾静音步进异常已跳过" in app.log.get("1.0", "end")
+    finally:
+        _teardown(root, app)
 
 
 def test_render_heads_does_not_kill_tick():
@@ -1243,34 +1332,6 @@ def test_send_failed_frame_fills_note():
 # ---- P1：after 循环加固 + liaison 常显 + 席位移出提示 + status 列 ----
 
 
-def test_send_vad_tail_step_exception_chain_continues(monkeypatch):
-    """(d) _send_vad_tail._step 步进体抛异常 → 记「尾静音步进异常已跳过」
-    并继续重排：计划 30 步走完自然结束（_tail_after 归 None）。"""
-    class _BoomTx:
-        calls = 0
-
-        def put_nowait(self, _chunk):
-            type(self).calls += 1
-            raise RuntimeError("boom")
-
-    root, app = _tk_app()
-    try:
-        app.tx = _BoomTx()
-        app.state_var.set("open")
-        monkeypatch.setattr("rt_voice_app.VAD_TAIL_STEP_MS", 1)  # 快进节奏
-        app._send_vad_tail()
-        assert app._tail_after is not None
-        deadline = time.monotonic() + 3.0
-        while app._tail_after is not None and time.monotonic() < deadline:
-            root.update()
-            time.sleep(0.002)
-        assert app._tail_after is None                    # 链走完自然结束
-        assert _BoomTx.calls == 30                        # 每步都试投且未断链
-        assert "尾静音步进异常已跳过" in app.log.get("1.0", "end")
-    finally:
-        _teardown(root, app)
-
-
 def test_whiteboard_push_exception_note(monkeypatch):
     """(e) _whiteboard_push 抛异常 → note 回填「白板同步失败」，不永停
     「同步中」，且无出站帧。"""
@@ -1329,28 +1390,30 @@ def test_liaison_var_refresh_on_brief():
 
 
 def test_fleet_snapshot_removal_note():
-    """(g) snapshot 前后 diff：上次存在的席位码消失 → 提示行「席位 <code>
-    已移出」（最近若干条；首帧无基线不 diff）。"""
+    """(g) snapshot 前后 diff：上次存在的席位码消失 → 事件区一条「席位
+    <code> 已移出」（去重键 removed:<code>：同码反复移出归并一条刷新到
+    最新位）；首帧无基线不 diff；席位表随之刷新。"""
     root, app = _tk_app()
     try:
         seat = {"sessionId": "s-a", "node": "voice-head",
                 "role": "worker", "status": "active"}
         app.obs_q.put({"t": "fleet.snapshot", "fleet": {"<seat>": seat, "<seat>": seat}})
         app._drain_obs()
-        assert app.fleet_note_var.get() == ""              # 首帧无基线
+        assert app.fleet_event_log.get("1.0", "end").strip() == ""  # 首帧无基线
 
         app.obs_q.put({"t": "fleet.snapshot", "fleet": {"<seat>": seat}})
         app._drain_obs()
-        assert app.fleet_note_var.get() == "席位 9b95 已移出"
+        assert app.fleet_event_log.get("1.0", "end") == "▸ 席位 9b95 已移出\n"
         assert len(app.fleet_tree.get_children()) == 1
 
-        # 席位回来再消失 → 仍是新事件；多条保留（截最近 3 条）
+        # 席位回来再消失：同码归并一条（不堆积重复行），另一码新增一条；
+        # 两码同帧移出按码序入史，后入者（9b95）为最新
         app.obs_q.put({"t": "fleet.snapshot", "fleet": {"<seat>": seat, "<seat>": seat}})
         app._drain_obs()
         app.obs_q.put({"t": "fleet.snapshot", "fleet": {}})
         app._drain_obs()
-        note = app.fleet_note_var.get()
-        assert note == "席位 9b95 已移出\n席位 20d0 已移出\n席位 9b95 已移出"
+        assert app.fleet_event_log.get("1.0", "end") == \
+            "▸ 席位 9b95 已移出\n席位 20d0 已移出\n"
         assert len(app.fleet_tree.get_children()) == 0
     finally:
         _teardown(root, app)
@@ -1376,3 +1439,439 @@ def test_detail_status_column():
         assert list(app.detail_tree.get_children()) == ["vh-s1", "vh-s2"]
     finally:
         _teardown(root, app)
+
+
+# ---- body.item 回包清在途：误清防护（发起序号校验） ----
+
+
+def test_body_item_old_reply_clears_only_corresponding_pending():
+    """同 ref 两次在途（发起序 1 旧、2 新），旧回包先到 → 仅清对应者 b1；
+    同 ref 的更新在途 b2 保留（超时/错误回填保护不丢）；重复旧回包是
+    no-op；纯 ref 形回包按 FIFO 清最老一条。"""
+    root, app = _tk_app()
+    try:
+        app.obs_link = _StubObsLink()
+        app._pending_send({"t": "body.get", "ref": "vh-dup", "req_id": "b1"},
+                          "body.get", seq=1)
+        app._pending_send({"t": "body.get", "ref": "vh-dup", "req_id": "b2"},
+                          "body.get", seq=2)
+        app._pending_send({"t": "body.get", "ref": "vh-other", "req_id": "b3"},
+                          "body.get", seq=3)
+
+        # 旧回包（req_id 命中 seq=1 者）→ 只清 b1，b2/b3 在途保持
+        app.obs_q.put({"t": "body.item", "ref": "vh-dup", "req_id": "b1",
+                       "text": "旧文"})
+        app._drain_obs()
+        assert set(app._pending) == {"b2", "b3"}
+        assert app.detail_bodies["vh-dup"] == "旧文"     # 全文照常缓存
+
+        # 重复旧回包（同 req_id 再到，未命中）→ 幂等 no-op，不动其余在途
+        app.obs_q.put({"t": "body.item", "ref": "vh-dup", "req_id": "b1",
+                       "text": "旧文"})
+        app._drain_obs()
+        assert set(app._pending) == {"b2", "b3"}
+
+        # 新回包 → 清 b2；纯 ref 形（无 req_id）→ FIFO 清最老一条（b3）
+        app.obs_q.put({"t": "body.item", "ref": "vh-dup", "req_id": "b2",
+                       "text": "新文"})
+        app._drain_obs()
+        assert set(app._pending) == {"b3"}
+        app.obs_q.put({"t": "body.item", "ref": "vh-other", "text": "另文"})
+        app._drain_obs()
+        assert app._pending == {}
+    finally:
+        _teardown(root, app)
+
+
+# ---- 席位事件历史（去重键 + 最近 8 条裁剪） ----
+
+
+def test_fleet_event_history_trim_and_dedup():
+    """事件历史：超 FLEET_EVENT_KEEP 条裁剪稳定——重复补投「存留集」后
+    顺序与渲染同值（第二次 no-op）；同一事件重复到达按去重键归并不
+    堆积。"""
+    root, app = _tk_app()
+    try:
+        for i in range(10):                              # 10 条不同主体事件
+            app._fleet_event_add(f"removed:code{i}", f"席位 code{i} 已移出")
+        assert [e["key"] for e in app._fleet_events] == \
+            [f"removed:code{i}" for i in range(2, 10)]   # 只留最近 8 条
+        first = app.fleet_event_log.get("1.0", "end")
+        assert first.splitlines()[0] == "▸ 席位 code9 已移出"   # 最新置顶标 ▸
+        assert "code0" not in first and "code1" not in first
+
+        # 幂等：重复补投存留的 8 条 → 事件序与渲染同值（no-op）
+        for i in range(2, 10):
+            app._fleet_event_add(f"removed:code{i}", f"席位 code{i} 已移出")
+        assert [e["key"] for e in app._fleet_events] == \
+            [f"removed:code{i}" for i in range(2, 10)]
+        assert app.fleet_event_log.get("1.0", "end") == first
+
+        # 同一事件重复到达：归并一条、刷新到最新位（不堆积重复行）
+        for _ in range(3):
+            app._fleet_event_add("brief", "3 席位 · 1 在跑")
+        assert [e for e in app._fleet_events if e["key"] == "brief"] == \
+            [{"key": "brief", "line": "3 席位 · 1 在跑"}]
+        assert app.fleet_event_log.get("1.0", "end").splitlines()[0] == \
+            "▸ 3 席位 · 1 在跑"
+        assert FLEET_EVENT_KEEP == 8
+    finally:
+        _teardown(root, app)
+
+
+# ---- 任务历史翻页（body.list_more） ----
+
+
+def test_body_list_more_request_frame():
+    assert body_list_more_request(123.5, "r-1") == \
+        {"t": "body.list_more", "req_id": "r-1", "before_ts": 123.5, "limit": 50}
+    assert body_list_more_request(7, "r-2", 20)["limit"] == 20
+    assert body_list_more_request("9", "r-3")["before_ts"] == 9.0   # float 归一
+
+
+def test_detail_ts_map_shapes():
+    assert detail_ts_map({"ref": "vh-a", "ts": 1700000000.0}) == \
+        {"vh-a": 1700000000.0}
+    batch = {"items": [{"ref": "vh-b", "ts": 1}, {"ref": "vh-c"},   # 无 ts 跳过
+                        {"ts": 9}]}                                  # 无 ref 跳过
+    assert detail_ts_map(batch) == {"vh-b": 1.0}
+    assert detail_ts_map({}) == {}
+    assert detail_ts_map(None) == {}
+
+
+def test_task_list_more_pagination_and_eof():
+    """翻页游标=表内最旧 ts；回包行追加（ref+no 同行原位同值，不增行）；
+    同 before_ts 重复拉取行集不增不减；eof 后按钮置灰、再点无请求。"""
+    root, app = _tk_app()
+    try:
+        # 观测未开 → 提示早退；开了但无行 → 提示早退
+        app._task_list_more()
+        assert "观测连接未开" in app.task_note_var.get()
+        app.obs_link = _StubObsLink()
+        app._task_list_more()
+        assert app.task_note_var.get() == "暂无可翻页的台账行"
+
+        # 种子两行（ts 700/800）→ 游标取 min=700
+        app.obs_q.put({"t": "body.push", "ref": "vh-a", "no": 1, "status": "done",
+                       "title": "a", "chars": 1, "ts": 700})
+        app.obs_q.put({"t": "body.push", "ref": "vh-b", "no": 2, "status": "done",
+                       "title": "b", "chars": 2, "ts": 800})
+        app._drain_obs()
+        root.update()
+        assert app._oldest_detail_ts() == 700.0
+
+        page = {"t": "body.list_more.result", "eof": False, "items": [
+            {"ref": "vh-c", "no": 3, "status": "done", "title": "c",
+             "chars": 3, "ts": 750},
+            {"ref": "vh-d", "no": 4, "status": "done", "title": "d",
+             "chars": 4, "ts": 780}]}
+
+        # 首次拉取：帧形状（before_ts=700/limit=50）+ 行追加
+        app._task_list_more()
+        reqs = [r for r in app.obs_link.sent if r.get("t") == "body.list_more"]
+        assert len(reqs) == 1
+        assert reqs[0] == {"t": "body.list_more", "req_id": reqs[0]["req_id"],
+                           "before_ts": 700.0, "limit": 50}
+        app.obs_q.put(page | {"req_id": reqs[0]["req_id"]})
+        app._drain_obs()
+        root.update()
+        assert list(app.detail_tree.get_children()) == ["vh-a", "vh-b", "vh-c", "vh-d"]
+        assert app.task_note_var.get() == "追加 2 行"
+        assert str(app.task_more_btn.cget("state")) == "normal"
+
+        # 幂等：同 before_ts（游标仍 700）重复拉取同一页 → 行集不增不减
+        rows_once = list(app.detail_tree.get_children())
+        app._task_list_more()
+        reqs2 = [r for r in app.obs_link.sent if r.get("t") == "body.list_more"]
+        assert len(reqs2) == 2 and reqs2[1]["before_ts"] == 700.0
+        app.obs_q.put(page | {"req_id": reqs2[1]["req_id"]})
+        app._drain_obs()
+        root.update()
+        assert list(app.detail_tree.get_children()) == rows_once
+        assert [tuple(app.detail_tree.item(i, "values")) for i in rows_once] == \
+            [tuple(app.detail_tree.item(i, "values")) for i in rows_once]
+
+        # eof：按钮置灰 + 提示到底；再点（直接调）无请求发出
+        app._task_list_more()
+        reqs3 = [r for r in app.obs_link.sent if r.get("t") == "body.list_more"]
+        assert len(reqs3) == 3
+        app.obs_q.put({"t": "body.list_more.result", "req_id": reqs3[2]["req_id"],
+                       "items": [], "eof": True})
+        app._drain_obs()
+        root.update()
+        assert str(app.task_more_btn.cget("state")) == "disabled"
+        assert app.task_note_var.get() == "历史已到底"
+        n_sent = len(app.obs_link.sent)
+        app._task_list_more()
+        assert len(app.obs_link.sent) == n_sent           # 无请求发出
+    finally:
+        _teardown(root, app)
+
+
+# ---- 席位陈旧指示（快照标签）+ last_seen 列 ----
+
+
+def test_last_seen_label():
+    epoch = 1700000000
+    assert last_seen_label(epoch) == \
+        time.strftime("%H:%M:%S", time.localtime(epoch))
+    assert last_seen_label(None) == "—"
+    assert last_seen_label("") == "—"
+    assert last_seen_label("12:00:00Z") == "12:00:00Z"    # 文本原样
+    assert last_seen_label(True) == "—"
+
+
+def test_fleet_stale_label_and_last_seen():
+    """快照标签：阈内常显「快照 HH:MM:SS」；注入时钟超 FLEET_STALE_S 切
+    「（可能陈旧）」；重收快照复位。last_seen 列 brief 回填、缺省「—」。"""
+    root, app = _tk_app()
+    try:
+        assert app.fleet_snap_var.get() == "快照 —"       # 未收快照占位
+        seat = {"sessionId": "s-a", "node": "voice-head",
+                "role": "worker", "status": "active"}
+        app.obs_q.put({"t": "fleet.snapshot", "fleet": {"<seat>": seat}})
+        app._drain_obs()
+        snap = app._fleet_snap_ts
+        assert snap is not None
+        when = time.strftime("%H:%M:%S", time.localtime(snap))
+
+        app._tick(now=snap + FLEET_STALE_S)               # 阈界（含）不陈旧
+        assert app.fleet_snap_var.get() == f"快照 {when}"
+        app._tick(now=snap + FLEET_STALE_S + 0.001)       # 注入时钟推进 → 陈旧
+        assert app.fleet_snap_var.get() == f"快照 {when}（可能陈旧）"
+
+        # 重收快照复位：陈旧标记消失
+        app.obs_q.put({"t": "fleet.snapshot", "fleet": {"<seat>": seat}})
+        app._drain_obs()
+        snap2 = app._fleet_snap_ts
+        when2 = time.strftime("%H:%M:%S", time.localtime(snap2))
+        app._tick(now=snap2 + 1)
+        assert app.fleet_snap_var.get() == f"快照 {when2}"
+        assert "可能陈旧" not in app.fleet_snap_var.get()
+
+        # last_seen 列：快照行缺省「—」；brief 回填数值时刻（重绘后行
+        # iid 重新分配，按当前 children 取）
+        li = ("code", "alias", "node", "role", "status", "last_seen").index(
+            "last_seen")
+        assert app.fleet_tree.item(app.fleet_tree.get_children()[0],
+                                   "values")[li] == "—"
+        app.obs_q.put({"t": "fleet.brief.result", "req_id": "r-ls", "seats": [
+            {"id": "3103", "node": "voice-head", "role": "worker",
+             "status": "active", "live": True, "running": True,
+             "title": "t", "task": "", "idle_s": 5, "last_seen": snap2},
+            {"id": "99aa", "node": "x", "live": False, "running": False}]})
+        app._drain_obs()
+        assert app.fleet_tree.item(app.fleet_tree.get_children()[0],
+                                   "values")[li] == \
+            time.strftime("%H:%M:%S", time.localtime(snap2))
+        # 同值 brief 重放 → 列值不变（幂等）
+        app.obs_q.put({"t": "fleet.brief.result", "req_id": "r-ls2", "seats": [
+            {"id": "3103", "node": "voice-head", "role": "worker",
+             "status": "active", "live": True, "running": True,
+             "title": "t", "task": "", "idle_s": 5, "last_seen": snap2}]})
+        app._drain_obs()
+        assert app.fleet_tree.item(app.fleet_tree.get_children()[0],
+                                   "values")[li] == \
+            time.strftime("%H:%M:%S", time.localtime(snap2))
+    finally:
+        _teardown(root, app)
+
+
+# ---- liaison 运维入口（unbind / bind） ----
+
+
+def test_liaison_request_frames():
+    assert liaison_unbind_request("r-1") == {"t": "liaison.unbind", "req_id": "r-1"}
+    assert liaison_bind_request("3103", "r-2") == \
+        {"t": "liaison.bind", "code": "3103", "req_id": "r-2"}
+    assert liaison_bind_request(20, "r-3")["code"] == "20"    # str 归一
+
+
+def test_liaison_result_line_states():
+    assert liaison_result_line({"t": "liaison.result", "req_id": "r-1",
+                                "op": "unbind", "ok": True,
+                                "was_bound": False}) == "对接解绑：本就无绑定"
+    assert liaison_result_line({"op": "unbind", "ok": True,
+                                "was_bound": True}) == "对接解绑：已解绑"
+    bind_ok = {"op": "bind", "ok": True,
+               "liaison": {"bound": True, "code": "3103", "sessionId": "s-1",
+                           "archived": False}}
+    assert liaison_result_line(bind_ok) == "对接绑定：3103"
+    archived = {"op": "bind", "ok": True,
+                "liaison": {"bound": True, "code": "db05", "sessionId": "s-2",
+                            "archived": True}}
+    assert liaison_result_line(archived) == "对接绑定：db05（已归档）"
+    assert liaison_result_line({"op": "bind", "ok": False,
+                                "error": "seat-not-found"}) == \
+        "⚠ 对接绑定失败：seat-not-found"
+    assert liaison_result_line({"op": "unbind", "ok": False}) == \
+        "⚠ 对接解绑失败：未知错误"
+    assert liaison_result_line({}) == "⚠ 对接回包不可读"
+    assert liaison_result_line(None) == "⚠ 对接回包不可读"
+
+
+def test_liaison_ops_tab_assembly(monkeypatch):
+    """席位页对接运维装配：双按钮；未选席位/观测未开早退；确认门可注入；
+    出站帧形状；回包按 op 回填事件区（未绑定解绑→「本就无绑定」不报错、
+    bind ok:false→error 原文、重复回包不堆积）。"""
+    root, app = _tk_app()
+    try:
+        assert app.liaison_unbind_btn.winfo_exists()
+        assert app.liaison_bind_btn.winfo_exists()
+
+        app._liaison_unbind()                            # 观测未开 → 早退
+        assert "观测连接未开" in app.fleet_note_var.get()
+        app.obs_link = _StubObsLink()
+        app._liaison_bind_selected()                     # 未选席位 → 早退
+        assert app.fleet_note_var.get() == "未选中席位"
+
+        monkeypatch.setattr("tkinter.messagebox.askyesno", lambda *a, **k: True)
+        seat = {"sessionId": "s-a", "node": "voice-head",
+                "role": "worker", "status": "active"}
+        app.obs_q.put({"t": "fleet.snapshot", "fleet": {"<seat>": seat}})
+        app._drain_obs()
+        app.fleet_tree.selection_set(app.fleet_tree.get_children()[0])
+
+        app._liaison_unbind()
+        unbind_reqs = [r for r in app.obs_link.sent if r.get("t") == "liaison.unbind"]
+        assert len(unbind_reqs) == 1 and set(unbind_reqs[0].keys()) == {"t", "req_id"}
+        app._liaison_bind_selected()
+        bind_reqs = [r for r in app.obs_link.sent if r.get("t") == "liaison.bind"]
+        assert bind_reqs == [{"t": "liaison.bind", "code": "3103",
+                              "req_id": bind_reqs[0]["req_id"]}]
+
+        # 未绑定时解绑 → 事件区/提示「本就无绑定」，常显行同步无绑定
+        app.obs_q.put({"t": "liaison.result", "req_id": unbind_reqs[0]["req_id"],
+                       "op": "unbind", "ok": True, "was_bound": False})
+        app._drain_obs()
+        assert app.fleet_note_var.get() == "对接解绑：本就无绑定"
+        assert app.liaison_var.get() == "对接席位：无绑定"
+        assert "对接解绑：本就无绑定" in app.fleet_event_log.get("1.0", "end")
+        # 同 req_id 重复回包 → 事件区不重复堆积
+        app.obs_q.put({"t": "liaison.result", "req_id": unbind_reqs[0]["req_id"],
+                       "op": "unbind", "ok": True, "was_bound": False})
+        app._drain_obs()
+        assert app.fleet_event_log.get("1.0", "end").count("本就无绑定") == 1
+
+        # bind ok:false → 事件区 error 原文（置顶最新）
+        app.obs_q.put({"t": "liaison.result", "req_id": bind_reqs[0]["req_id"],
+                       "op": "bind", "ok": False, "error": "seat-not-found"})
+        app._drain_obs()
+        assert app.fleet_event_log.get("1.0", "end").splitlines()[0] == \
+            "▸ ⚠ 对接绑定失败：seat-not-found"
+        assert app.fleet_note_var.get() == "⚠ 对接绑定失败：seat-not-found"
+
+        # bind ok → 常显行刷新 + 事件
+        app.obs_q.put({"t": "liaison.result", "req_id": "r-bind-2",
+                       "op": "bind", "ok": True,
+                       "liaison": {"bound": True, "code": "3103",
+                                   "sessionId": "s-9", "archived": False}})
+        app._drain_obs()
+        assert app.liaison_var.get() == "对接席位：3103"
+        assert "对接绑定：3103" in app.fleet_event_log.get("1.0", "end")
+    finally:
+        _teardown(root, app)
+
+
+# ---- 任务取消入口（run.cancel） ----
+
+
+def test_run_cancel_request_and_result_lines():
+    assert run_cancel_request("vh-1", "r-1") == \
+        {"t": "run.cancel", "ref": "vh-1", "req_id": "r-1"}
+    ok = {"t": "run.cancel.result", "req_id": "r-1", "ref": "vh-1",
+          "ok": True, "state": "cancelled"}
+    assert run_cancel_result_line(ok) == "已取消 vh-1（cancelled）"
+    assert run_cancel_result_line({"req_id": "r-2", "ref": "vh-1",
+                                   "ok": True}) == "已取消 vh-1（cancelled）"
+    assert run_cancel_result_line({"req_id": "r-3", "ref": "vh-x", "ok": False,
+                                   "error": "unknown-ref"}) == \
+        "⚠ 取消失败：unknown-ref"
+    assert run_cancel_result_line({"ok": False}) == "⚠ 取消失败：未知错误"
+    assert run_cancel_result_line({}) == "⚠ 取消回包不可读"
+    assert run_cancel_result_line(None) == "⚠ 取消回包不可读"
+
+
+def test_task_cancel_flow_idempotent(monkeypatch):
+    """取消流：确认门 → run.cancel{ref}；ok 回包行状态转 cancelled、按钮
+    置灰；同一 ref 连续第二次取消不再发底层取消（重复 ok 回包终态不
+    变）；ok:false 显示 error 原文且行状态不动。"""
+    root, app = _tk_app()
+    try:
+        app._task_cancel()                               # 未选中 → 提示
+        assert app.task_note_var.get() == "未选中任务行"
+
+        app.obs_q.put({"t": "body.push", "ref": "vh-run", "no": 1,
+                       "status": "running", "title": "t", "chars": 5,
+                       "ts": 1700000000})
+        app._drain_obs()
+        root.update()
+        app.detail_tree.selection_set("vh-run")
+        app._task_cancel()                               # 观测未开 → 提示
+        assert "观测连接未开" in app.task_note_var.get()
+
+        app.obs_link = _StubObsLink()
+        monkeypatch.setattr("tkinter.messagebox.askyesno", lambda *a, **k: True)
+        si = DETAIL_COLS.index("status")
+        assert str(app.task_cancel_btn.cget("state")) == "normal"
+
+        app._task_cancel()                               # 首次取消 → 发帧
+        reqs = [r for r in app.obs_link.sent if r.get("t") == "run.cancel"]
+        assert len(reqs) == 1 and reqs[0]["ref"] == "vh-run"
+        app.obs_q.put({"t": "run.cancel.result", "req_id": reqs[0]["req_id"],
+                       "ref": "vh-run", "ok": True, "state": "cancelled"})
+        app._drain_obs()
+        root.update()
+        assert app.detail_tree.item("vh-run", "values")[si] == "cancelled"
+        assert str(app.task_cancel_btn.cget("state")) == "disabled"
+        assert app.task_note_var.get() == "已取消 vh-run（cancelled）"
+
+        # 幂等：第二次取消（同一 ref）→ 不重复发；迟到同形 ok 回包不改终态
+        app._task_cancel()
+        assert len([r for r in app.obs_link.sent
+                    if r.get("t") == "run.cancel"]) == 1
+        assert app.task_note_var.get() == "vh-run 已取消"
+        app.obs_q.put({"t": "run.cancel.result", "req_id": "r-late",
+                       "ref": "vh-run", "ok": True, "state": "cancelled"})
+        app._drain_obs()
+        assert app.detail_tree.item("vh-run", "values")[si] == "cancelled"
+        assert str(app.task_cancel_btn.cget("state")) == "disabled"
+
+        # ok:false（unknown-ref）→ error 原文，行状态不动、按钮可再点
+        app.obs_q.put({"t": "body.push", "ref": "vh-run2", "no": 2,
+                       "status": "running", "title": "t2", "chars": 6,
+                       "ts": 1700000060})
+        app._drain_obs()
+        root.update()
+        app.detail_tree.selection_set("vh-run2")
+        app._task_cancel()
+        reqs2 = [r for r in app.obs_link.sent if r.get("t") == "run.cancel"]
+        assert len(reqs2) == 2
+        app.obs_q.put({"t": "run.cancel.result", "req_id": reqs2[1]["req_id"],
+                       "ref": "vh-run2", "ok": False, "error": "unknown-ref"})
+        app._drain_obs()
+        assert app.task_note_var.get() == "⚠ 取消失败：unknown-ref"
+        assert app.detail_tree.item("vh-run2", "values")[si] == "running"
+        assert str(app.task_cancel_btn.cget("state")) == "normal"
+    finally:
+        _teardown(root, app)
+
+
+# ---- error 帧新契约（type/message 优先，兜底 code/msg） ----
+
+
+def test_error_identity_prefers_type_message():
+    new = {"t": "error", "type": "error", "req_id": "r-1", "message": "body miss"}
+    assert error_identity(new) == ("error", "body miss")
+    old = {"t": "error", "code": "body_miss", "msg": "no stored body"}
+    assert error_identity(old) == ("body_miss", "no stored body")
+    both = {"t": "error", "type": "error", "message": "新消息",
+            "code": "body_miss", "msg": "旧消息"}
+    assert error_identity(both) == ("error", "新消息")   # 新字段优先
+    assert error_identity({}) == ("", "")
+    assert error_identity(None) == ("", "")
+    # 渲染行同口径（右栏提示 / pending 回填）
+    assert detail_error_line(new) == "⚠ error body miss"
+    assert pending_error_line("body.get", new) == "拉取失败：error body miss"
+    assert detail_error_line({}) == "⚠ 未知错误"
+    assert pending_error_line("fleet.cleanup", {}) == "清理失败：未知错误"

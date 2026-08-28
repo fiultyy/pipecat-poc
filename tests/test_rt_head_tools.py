@@ -16,6 +16,22 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples" / "realtime-provider-poc"))
 
+
+@pytest.fixture(autouse=True)
+def _hermetic_voice_env(monkeypatch):
+    """Strip ambient voice-gateway env so backend lane/liaison selection is
+    deterministic: with a real liaison env these tests would take the liaison
+    dispatch path (and, with AUTO_NEW, spawn real sessions)."""
+    for var in (
+        "VOICE_LIAISON_SESSION",
+        "VOICE_LIAISON_STATE",
+        "VOICE_LIAISON_AUTO_NEW",
+        "VOICE_GATEWAY_TOKEN",
+        "DSH_PORT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 from rt_dsh_backend import DshBackend  # noqa: E402
 from rt_dsh_lane import DaisLane  # noqa: E402
 from rt_event_bus import EventBus  # noqa: E402

@@ -11,7 +11,8 @@
 - ``SessionStore.put``    — orch.dispatch 受理落库（幂等；no 受理时分配）
 - ``SessionStore.update`` — done/failed/cancelled/conv_id 回填等局部更新
 - ``SessionStore.get``    — 正文全文取出（body.get → body.item）
-- ``SessionStore.list``   — 最近 N 条索引（无 body；topic_cache 回放）
+- ``SessionStore.list``   — 最近 N 条索引（无 body；topic_cache 回放；
+  ``before_ts`` 游标翻页——body.list_more 控制帧，只返回 ts 更早行）
 
 字段对齐设计文档 JSON：ref/no/status/title/summary/body/chars/credentials_json/
 run_id/conv_id/ts/updated_ts。credentials 落库为 JSON 字符串、API 出入口转
@@ -217,12 +218,26 @@ class SessionStore:
             row = self._fetch(ref)
             return self._row_to_dict(row) if row is not None else None
 
-    def list(self, limit: int = DEFAULT_LIST_LIMIT) -> list[dict]:
-        """最近 ``limit`` 条索引（按 no 升序、去 body；回放/快照拼装用）。"""
+    def list(self, limit: int = DEFAULT_LIST_LIMIT,
+             before_ts: float | None = None) -> list[dict]:
+        """最近 ``limit`` 条索引（按 no 升序、去 body；回放/快照拼装用）。
+
+        Args:
+            limit: 返回条数上限。
+            before_ts: 可选翻页游标——给定时只返回 ``ts`` 严格早于该值的
+                行（仍按 no 升序取最近 ``limit`` 条）。同游标重复调用结果
+                一致（纯读，幂等）。
+        """
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM sessions ORDER BY no DESC LIMIT ?", (limit,)
-            ).fetchall()
+            if before_ts is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM sessions ORDER BY no DESC LIMIT ?", (limit,)
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM sessions WHERE ts < ?"
+                    " ORDER BY no DESC LIMIT ?", (before_ts, limit)
+                ).fetchall()
         return [self._row_to_dict(row, with_body=False) for row in reversed(rows)]
 
     def count(self) -> int:
