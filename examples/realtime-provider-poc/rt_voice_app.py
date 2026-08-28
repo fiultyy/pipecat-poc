@@ -36,6 +36,10 @@ stdlib tkinter（Notebook 页签）+ sounddevice 原生采集 + numpy FFT + aioh
   deps 边/refs chips/lease_owner/outcome；数据面=pm.event(kind=tickets
   失效通知，无载荷) 防抖合并 → op=tickets 全量重拉 → state 整体替换 →
   渲染纯函数（state→view）覆写重绘 + ticket_events 侧栏
+- 席位舰页签（TK-003）：fleet 卡片墙（短码/term_·准入态
+  probing/verified/stale·preset·lastSeen 时长 + 租约到期倒计时 + 换代中
+  瞬态）；数据面=op=fleet 全量 + fleet.kind 失效通知防抖重拉 + 尾随
+  fleet.snapshot 全文双源共一卡模；stale 高亮阈值页签内可配
 
 两连接同 token 计入网关并发上限 ≤2（即本客户端独占单 token 配额）。
 帧协议与 rt_gateway.py §1 逐字对齐。
@@ -55,7 +59,7 @@ import queue
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -87,6 +91,9 @@ PM_RESUB_DELAY_S = 10.0                # 上游事件流断（pm_sub_failed/ende
 PM_BANNER_OFF = "PM 未接入（开启「观测」后自动订阅）"
 TICKET_STATES = ("dispatched", "running", "blocked", "done", "merged")
 TICKETS_REFETCH_DEBOUNCE_MS = 400      # tickets 事件→全量重拉的合并窗（事件只作失效通知）
+FLEET_REFETCH_DEBOUNCE_MS = 400        # fleet 事件→全量重拉的合并窗（同票板语义）
+FLEET_VERIFY_STALE_S = 120             # 席位舰 stale 判定缺省阈值（页签内可调）
+FLEET_VERIFY_STATES = ("probing", "verified", "mismatch")  # 准入探测态原样透出
 
 LOG_SHORT = {
     "orch.dispatch": "派发", "orch.progress": "进展", "orch.done": "终稿",
@@ -108,6 +115,7 @@ PENDING_KINDS = {
     "run.cancel": "任务取消",
     "pm.req": "PM 请求",
     "pm.tickets": "票板拉取",
+    "pm.fleet": "席位舰拉取",
 }
 
 
@@ -1144,6 +1152,140 @@ def tickets_kanban_view(state: dict[str, dict]) -> dict[str, list[str]]:
     return view
 
 
+def _iso_ts(v) -> float | None:
+    """ISO 时间串 → epoch 秒；数字直通，解析失败/缺省 None。"""
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return datetime.fromisoformat(str(v)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def fleet_ship_card_of(code: str, e: dict) -> dict:
+    """单席位条目（fleet.json 原条目或 op=fleet 投影 seat）→ 规范卡。
+
+    两源一卡：尾随 fleet.snapshot（fleet.json 全文，带租约/准入字段）与
+    op=fleet 投影（SEAT_KEYS+session join，无租约字段）共用一模型；缺的
+    字段落 None/空，渲染层按「—」透出。"""
+    status = str(e.get("status") or "")
+    return {
+        "code": str(code),
+        "kind": str(e.get("kind") or "maestro"),
+        "term": str(e.get("handle") or ""),
+        "status": status,
+        "preset": str(e.get("preset") or ""),
+        "node": str(e.get("node") or ""),
+        "role": str(e.get("role") or ""),
+        "alias": str(e.get("alias") or ""),
+        "last_seen": _iso_ts(e.get("lastSeenAt") or e.get("heartbeatAt")
+                             or e.get("spawnedAt")),
+        "lease_until": _iso_ts(e.get("leaseExpiresAt")),
+        "lease_owner": str(e["owner"]) if e.get("owner") else None,
+        "handover": bool(e.get("retiring"))
+        or status in ("handover", "retiring"),
+    }
+
+
+def fleet_ship_cards_doc(doc) -> dict[str, dict]:
+    """fleet.snapshot 帧/fleet.json 全文 → 码→卡（内层 fleet 键解包）。"""
+    entries = doc.get("fleet") if isinstance(doc, dict) else None
+    if isinstance(entries, dict) and isinstance(entries.get("fleet"), dict):
+        entries = entries["fleet"]          # tailer 实形：载荷是 fleet.json 全文
+    if not isinstance(entries, dict):
+        return {}
+    return {str(c): fleet_ship_card_of(c, e) for c, e in entries.items()
+            if isinstance(e, dict)}
+
+
+def fleet_ship_cards_seats(seats) -> dict[str, dict]:
+    """op=fleet 投影 seats 列表 → 码→卡（session join 的 running 并入）。"""
+    out: dict[str, dict] = {}
+    if not isinstance(seats, list):
+        return out
+    for s in seats:
+        if not isinstance(s, dict) or not s.get("code"):
+            continue
+        card = fleet_ship_card_of(str(s["code"]), s)
+        session = s.get("session")
+        if isinstance(session, dict):
+            card["running"] = bool(session.get("running"))
+        out[card["code"]] = card
+    return out
+
+
+def fleet_verify_of(card: dict, now: float, stale_s: float) -> str:
+    """准入态透出：probing/verified/mismatch 原样；lastSeen 超（可配）阈值
+    判 stale；无准入态且新鲜的 maestro 席落「—」。"""
+    v = card.get("status", "")
+    if v in FLEET_VERIFY_STATES:
+        return v
+    ls = card.get("last_seen")
+    if ls is not None and now - ls > stale_s:
+        return "stale"
+    return "—"
+
+
+def fleet_last_seen_label(last_seen, now: float) -> str:
+    """lastSeen 时长（epoch 差→人读时长）；缺省「—」。"""
+    if last_seen is None:
+        return "—"
+    d = max(0, int(now - last_seen))
+    if d < 60:
+        return f"{d}s前"
+    if d < 3600:
+        return f"{d // 60}m前"
+    if d < 86400:
+        return f"{d // 3600}h前"
+    return f"{d // 86400}d前"
+
+
+def fleet_lease_label(card: dict, now: float) -> str:
+    """租约到期倒计时（fleet-touch claim 写 leaseExpiresAt/owner）。"""
+    until = card.get("lease_until")
+    if until is None:
+        return ""
+    left = int(until - now)
+    owner = card.get("lease_owner") or ""
+    who = f"{owner} " if owner else ""
+    if left >= 0:
+        return f"⏳租约 {who}还剩{left // 60}m{left % 60:02d}s"
+    return f"⏳租约 {who}已过期{-left // 60}m{-left % 60:02d}s"
+
+
+def fleet_ship_card_lines(card: dict, now: float,
+                          stale_s: float = FLEET_VERIFY_STALE_S) -> list[str]:
+    """单席位 → 卡片行块：短码·状态·preset / term_·准入态·lastSeen 时长 /
+    节点·角色 / 租约倒计时 / 换代中瞬态（空段省略）。"""
+    verify = fleet_verify_of(card, now, stale_s)
+    mark = "⚠" if verify == "stale" else ("✓" if verify == "verified" else "·")
+    lines = [f"{card['code']} · {card['status'] or '—'}"
+             + (f" · {card['preset']}" if card["preset"] else "")]
+    lines.append(f"term {card['term'] or '—'} · {mark}{verify} · lastSeen "
+                 f"{fleet_last_seen_label(card['last_seen'], now)}")
+    seg = " · ".join(x for x in (card["node"], card["role"]) if x)
+    if seg:
+        lines.append(seg)
+    lease = fleet_lease_label(card, now)
+    if lease:
+        lines.append(lease)
+    if card["handover"]:
+        lines.append("⟳ 换代中")
+    return lines
+
+
+def fleet_ship_view(cards: dict[str, dict], now: float,
+                    stale_s: float = FLEET_VERIFY_STALE_S) -> list[str]:
+    """席位卡 state → 视图（纯函数）：码序稳定、卡间空行；同 state+now
+    必得同视图（全量重放一致门的幂等键）。"""
+    block: list[str] = []
+    for i, code in enumerate(sorted(cards)):
+        if i:
+            block.append("")
+        block.extend(fleet_ship_card_lines(cards[code], now, stale_s))
+    return block
+
+
 def vad_tail_plan(total_ms: int = VAD_TAIL_MS,
                   step_ms: int = VAD_TAIL_STEP_MS) -> list[tuple[int, int]]:
     """尾静音投递表：``[(距松键毫秒, 块字节数), …]``。
@@ -1222,6 +1364,10 @@ class App:
         self._ticket_events: list[str] = []        # tickets 事件侧栏行（最新在尾）
         self._tickets_fetch_job: str | None = None  # 防抖全量重拉定时器
         self._tickets_seq = 0                      # 票板拉取 id 序号
+        self._pm_fleet_cards: dict[str, dict] = {}  # 席位舰 state（码→卡，TK-003）
+        self._fleet_ship_fetch_job: str | None = None  # 防抖全量重拉定时器
+        self._fleet_ship_seq = 0                   # 席位舰拉取 id 序号
+        self._fleet_ship_snap_ts: float | None = None  # 舰页收帧时刻（断流陈旧判定）
         self._pending: dict[str, dict] = {}        # req_id → {kind, ts, rid[, ref, seq]} 在途
         self._fleet_codes: set[str] | None = None  # 上次 fleet.snapshot 席位码（移出 diff 源）
         self._fleet_rows_cache: list[tuple] = []   # 上次快照表行（brief 回填 last_seen 后重绘源）
@@ -1509,6 +1655,31 @@ class App:
             self.tickets_cols[name] = txt
             self.tickets_col_vars[name] = var
 
+        # ---- 席位舰页签（TK-003：fleet 卡片墙——事件驱动刷新、租约倒计时、
+        #      stale 高亮阈值可配、降级标记透出）----
+        ship_tab = ttk.Frame(self.nb, padding=6)
+        self.nb.add(ship_tab, text=" 席位舰 ")
+        self.fleet_ship_note_var = tk.StringVar(
+            value="（PM 订阅受理后自动拉全量）")
+        ttk.Label(ship_tab, textvariable=self.fleet_ship_note_var,
+                  foreground="#555").pack(anchor="w")
+        ship_bar = ttk.Frame(ship_tab)
+        ship_bar.pack(fill="x")
+        self.fleet_ship_snap_var = tk.StringVar(value="舰快照 —")
+        ttk.Label(ship_bar, textvariable=self.fleet_ship_snap_var,
+                  foreground="#555").pack(side="left")
+        ttk.Label(ship_bar, text="  stale阈值(s)",
+                  foreground="#8a8a8a").pack(side="left")
+        self.fleet_ship_stale_var = tk.StringVar(value=str(FLEET_VERIFY_STALE_S))
+        ttk.Spinbox(ship_bar, from_=10, to=86400, width=7,
+                    textvariable=self.fleet_ship_stale_var).pack(
+            side="left", padx=(4, 0))
+        self.fleet_ship_stale_var.trace_add(
+            "write", lambda *_: self._render_fleet_ship())
+        self.fleet_ship_text = scrolledtext.ScrolledText(
+            ship_tab, font=("monospace 9"), state="disabled", wrap="none")
+        self.fleet_ship_text.pack(fill="both", expand=True, pady=(4, 0))
+
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._draw_spectrum(np.zeros(BARS))
         self._tick()
@@ -1590,6 +1761,7 @@ class App:
                     st_write(self.orch_log, f"[观测错误] {detail_error_line(f)}")
             elif t == "fleet.snapshot":
                 self._render_fleet(f)
+                self._on_fleet_ship_frame(f)
             elif t == "fleet.cleanup.result":
                 self._pending_pop(f.get("req_id"))
                 line = cleanup_result_line(f)
@@ -1630,6 +1802,8 @@ class App:
                 st_write(self.pm_log, pm_event_line(f))
                 if f.get("kind") == "tickets":
                     self._on_tickets_event(f)
+                elif f.get("kind") == "fleet":
+                    self._on_fleet_ship_event(f)
             elif "_send_failed" in f:
                 # req 泵发送失败（连接已断）：受影响 req_id 回填提示，不静默丢
                 entry = self._pending_pop(f.get("_send_failed"))
@@ -2221,6 +2395,10 @@ class App:
                 self._pm_degrade(code, msg)
             if entry is not None:
                 self._pending_fill(entry, f"PM 请求失败：{code} {msg}".rstrip())
+                if entry.get("kind") == "pm.fleet":
+                    # 席位舰页签内的降级透出（死服/断流时 tab 不静默）
+                    self.fleet_ship_note_var.set(
+                        f"⚠ 降级 {code} {str(msg)[:60]}")
         else:
             data = frame.get("data")
             if isinstance(data, dict) and isinstance(data.get("tickets"), list):
@@ -2231,6 +2409,15 @@ class App:
                 st_write(self.pm_log,
                          f"✓ pm.res[{frame.get('id')}] "
                          f"票板全量 {data.get('count', '?')} 票")
+                return
+            if isinstance(data, dict) and isinstance(data.get("seats"), list):
+                # op=fleet 全量回包：席位舰数据面（台面即显示，不再泼流水）
+                self._on_fleet_ship_snapshot(data)
+                if entry is not None:
+                    self._pending_fill(entry, "席位舰全量已更新")
+                st_write(self.pm_log,
+                         f"✓ pm.res[{frame.get('id')}] "
+                         f"席位舰全量 {data.get('count', '?')} 席")
                 return
             if isinstance(data, dict) and "subscribed" in data \
                     and "was_subscribed" not in data:
@@ -2255,6 +2442,10 @@ class App:
                 and "tickets" in [str(k) for k in subscribed]):
             self._tickets_fetch_job = self.root.after(
                 TICKETS_REFETCH_DEBOUNCE_MS, self._tickets_fetch)
+        if (self._fleet_ship_fetch_job is None
+                and "fleet" in [str(k) for k in subscribed]):
+            self._fleet_ship_fetch_job = self.root.after(
+                FLEET_REFETCH_DEBOUNCE_MS, self._fleet_ship_fetch)
 
     # ---- 票板（TK-002：失效通知 → 防抖全量重拉 → 纯函数重绘） ----
 
@@ -2305,13 +2496,76 @@ class App:
             st_set(widget, "\n".join(view.get(name, [])))
             self.tickets_col_vars[name].set(f"{name} {counts.get(name, 0)}")
 
+    # ---- 席位舰（TK-003：fleet 事件/尾随快照 → 卡片墙纯函数重绘） ----
+
+    def _on_fleet_ship_frame(self, frame: dict):
+        """尾随 fleet.snapshot（fleet.json 全文，带租约/准入字段）→ 舰页
+        state 替换重绘（增量面第一源：touch fleet.json 即达）。"""
+        self._pm_fleet_cards = fleet_ship_cards_doc(frame.get("fleet"))
+        self._fleet_ship_snap_ts = time.time()
+        self._render_fleet_ship()
+
+    def _on_fleet_ship_event(self, frame: dict):
+        """fleet 事件（失效通知，无载荷）→ 防抖合并一次 op=fleet 全量重拉。"""
+        if self._fleet_ship_fetch_job is None:
+            self._fleet_ship_fetch_job = self.root.after(
+                FLEET_REFETCH_DEBOUNCE_MS, self._fleet_ship_fetch)
+
+    def _fleet_ship_fetch(self):
+        """全量重拉 op=fleet（观测链路在才拉；离线期事件丢弃）。"""
+        self._fleet_ship_fetch_job = None
+        if not (self.obs_link and self.obs_link._thread
+                and self.obs_link._thread.is_alive()):
+            return
+        self._fleet_ship_seq += 1
+        self._pending_send(
+            {"t": "pm.req", "op": "fleet", "params": {},
+             "id": f"pmf-{int(time.time() * 1000)}-{self._fleet_ship_seq}"},
+            "pm.fleet")
+
+    def _on_fleet_ship_snapshot(self, data: dict):
+        """op=fleet 全量回包 → 投影 seats 共一卡模替换 + 状态行（降级透出：
+        degraded 标记与 sessionJoined 失败的「纯 fleet 视图」注记）。"""
+        self._pm_fleet_cards = fleet_ship_cards_seats(data.get("seats"))
+        self._fleet_ship_snap_ts = time.time()
+        self._render_fleet_ship()
+        degraded = "⚠ " if data.get("degraded") else ""
+        self.fleet_ship_note_var.set(
+            f"{degraded}席位舰 {data.get('count', len(self._pm_fleet_cards))} 席 · "
+            f"全量 {time.strftime('%H:%M:%S')}"
+            + ("" if data.get("sessionJoined") else " · 纯 fleet 视图"))
+
+    def _render_fleet_ship(self, now: float | None = None):
+        """舰页重绘：state→view 纯函数覆写；stale 阈值即时读页签可配值。"""
+        try:
+            stale_s = float(self.fleet_ship_stale_var.get())
+        except (TypeError, ValueError):
+            stale_s = FLEET_VERIFY_STALE_S
+        now = time.time() if now is None else now
+        st_set(self.fleet_ship_text, "\n".join(
+            fleet_ship_view(self._pm_fleet_cards, now, stale_s)))
+
+    def _fleet_ship_stale_label(self, now: float | None = None) -> str:
+        """舰页顶部快照标签；距收帧超 FLEET_STALE_S 追加「（断流陈旧）」
+        ——断流时页签内的降级指示。"""
+        if self._fleet_ship_snap_ts is None:
+            return "舰快照 —"
+        if now is None:
+            now = time.time()
+        when = time.strftime("%H:%M:%S",
+                             time.localtime(self._fleet_ship_snap_ts))
+        if now - self._fleet_ship_snap_ts > FLEET_STALE_S:
+            return f"舰快照 {when}（断流陈旧）"
+        return f"舰快照 {when}"
+
     def _selftest_probe(self):
         """selftest 冒烟（无显示环境 CI）：假帧走真实渲染路径——回放批入表、
         notify 相记 ref、单条 push 入表+灰行、body.item 回填缓存；席位快照
         入表、bridge 行入编排页、tickets 覆写、清理回包摘要行、简报摘要+
         逐行；对接解绑/历史翻页 eof/取消回包各走一条；PM 订阅受理→横幅
         恢复、事件流水两行、pm_down→降级横幅；票板全量入 kanban（含
-        未知态兜底列）、tickets 事件进侧栏。不触网。"""
+        未知态兜底列）、tickets 事件进侧栏；席位舰全文卡（租约/准入/换代
+        瞬态）、投影 seats 卡、fleet 事件防抖。不触网。"""
         now = time.time()
         self.obs_q.put({"t": "body.push", "items": [
             {"ref": "vh-self1", "no": 1, "status": "done", "title": "回放标题",
@@ -2382,6 +2636,35 @@ class App:
         self.obs_q.put({"t": "pm.event", "seq": 3, "msgid": "tickets:ledger.db:self",
                         "source": "ledger", "kind": "tickets",
                         "path": "maestro/ledger.db", "replay": False})
+        # 席位舰（TK-003）：全文卡（租约/准入/换代瞬态）+ 投影 seats 卡
+        # + fleet 事件（防抖重拉；selftest 无观测链路，拉取静默跳过）
+        now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+        fut_iso = (datetime.now().astimezone()
+                   + timedelta(minutes=5)).isoformat(timespec="seconds")
+        self.obs_q.put({"t": "fleet.snapshot", "fleet": {
+            "0699": {"sessionId": "s-0699", "role": "worker", "node": "gw-002",
+                     "preset": "maestro", "spawnedAt": now_iso,
+                     "status": "active", "owner": "<orchestrator>",
+                     "leaseExpiresAt": fut_iso},
+            "t9ab": {"kind": "orca-terminal", "handle": "t-42",
+                     "status": "probing", "alias": "dev",
+                     "lastSeenAt": now_iso},
+            "t0cd": {"kind": "orca-terminal", "handle": "t-7",
+                     "status": "verified", "alias": "orch",
+                     "lastSeenAt": now_iso, "retiring": True}}})
+        self.obs_q.put({"t": "pm.res", "id": "self-pmf-1", "data": {
+            "op": "fleet", "count": 1, "degraded": False,
+            "sessionJoined": False, "note": "",
+            "seats": [{"code": "0699", "sessionId": "s-0699",
+                       "role": "worker", "node": "gw-002",
+                       "preset": "maestro", "spawnedAt": now_iso,
+                       "status": "active",
+                       "session": {"running": True, "blank": False,
+                                   "agentPreset": "maestro", "cwd": "/tmp",
+                                   "title": "t"}}]}})
+        self.obs_q.put({"t": "pm.event", "seq": 4, "msgid": "fleet:touch:self",
+                        "source": "fleet", "kind": "fleet",
+                        "path": "maestro/fleet.json", "replay": False})
 
     def end_session(self):
         """优雅收尾需要一帧 session.end——经由 tx 旁路不便，此处仅断链。
@@ -2534,6 +2817,9 @@ class App:
             # 席位快照陈旧判定（now 可注入，测试用；缺省墙钟）
             self.fleet_snap_var.set(
                 self._fleet_stale_label(time.time() if now is None else now))
+            self.fleet_ship_snap_var.set(
+                self._fleet_ship_stale_label(
+                    time.time() if now is None else now))
         except Exception as e:  # noqa: BLE001 — 单帧渲染失败只丢一帧，不杀 UI 泵
             try:
                 self.log_write(f"[UI] 渲染异常已跳过: {type(e).__name__}: {e}")
@@ -2593,6 +2879,12 @@ class App:
             except Exception:  # noqa: BLE001 — 定时器已失效
                 pass
             self._tickets_fetch_job = None
+        if self._fleet_ship_fetch_job is not None:
+            try:
+                self.root.after_cancel(self._fleet_ship_fetch_job)
+            except Exception:  # noqa: BLE001 — 定时器已失效
+                pass
+            self._fleet_ship_fetch_job = None
         self._cancel_vad_tail()
         if self._wb_push_job is not None:
             try:

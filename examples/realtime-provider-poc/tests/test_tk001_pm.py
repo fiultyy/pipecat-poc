@@ -62,19 +62,39 @@ class FakePMSSE:
                  "outcome": "已收口", "updated_at": "2026-08-29T09:00:00+00:00"},
             ],
         }
+        self.fleet_payload: dict = {
+            "op": "fleet", "count": 2, "degraded": False,
+            "sessionJoined": False, "note": "",
+            "seats": [
+                {"code": "0699", "sessionId": "s-0699", "role": "worker",
+                 "node": "gw-002", "preset": "maestro",
+                 "spawnedAt": "2026-08-28T17:05:11+00:00",
+                 "status": "active", "session": None},
+                {"code": "b9be", "sessionId": "s-b9be", "role": "worker",
+                 "node": "pm-007", "preset": "maestro",
+                 "spawnedAt": "2026-08-28T16:41:02+00:00",
+                 "status": "active", "session": None},
+            ],
+        }
 
     def app(self) -> web.Application:
         app = web.Application()
         app.router.add_get("/subscribe", self.handle)
         app.router.add_get("/health", self.handle_health)
-        # 票板全量（TK-002）：双路由——现行网关透传 GET /tickets，真服
-        # v0.7.0 实际在 /op/tickets（映射 Ask dae894c2 待收口），都备好
+        # 票板全量（TK-002）+ 席位舰全量（TK-003）：双路由——现行网关透传
+        # GET /{op}，真服 v0.7.0 实际在 /op/*（G3 映射后统一走 /op/*），
+        # 都备好
         app.router.add_get("/tickets", self.handle_tickets)
         app.router.add_get("/op/tickets", self.handle_tickets)
+        app.router.add_get("/fleet", self.handle_fleet)
+        app.router.add_get("/op/fleet", self.handle_fleet)
         return app
 
     async def handle_tickets(self, _request: web.Request) -> web.Response:
         return web.json_response(self.tickets_payload)
+
+    async def handle_fleet(self, _request: web.Request) -> web.Response:
+        return web.json_response(self.fleet_payload)
 
     def publish(self, kind: str, msgid: str, replay: bool = False) -> dict:
         ev = {"kind": kind, "msgid": msgid, "path": "/fake", "replay": replay}
