@@ -20,6 +20,9 @@ stdlib tkinter（Notebook 页签）+ sounddevice 原生采集 + numpy FFT + aioh
   回合页 notify 相（📣）+ 同 ref body.push 追加灰行「└已入详情」
 - 语音页 head 选择行（PR8）：观测开启即 head.list 拉配置表渲染单选钮；
   切换发 head.switch——激活单例，活会话不拆，下一次语音连接生效
+- 白板页（协作交互输入面）：可编辑文本区 + 「同步到白板」按钮，内容
+  经 whiteboard.set 存进网关全局白板；语音侧让 head 调 read_whiteboard
+  工具读取（长文输入走眼不走嘴，回包一行同步结果）
 
 两连接同 token 计入网关并发上限 ≤2（即本客户端独占单 token 配额）。
 帧协议与 rt_gateway.py §1 逐字对齐。
@@ -687,6 +690,22 @@ def head_names_from_list(frame: dict) -> tuple[list[tuple[str, str]], str, bool]
     return rows, str(frame.get("active", "")), bool(frame.get("file_backed"))
 
 
+def whiteboard_set_request(text, req_id: str) -> dict:
+    """白板写入控制帧（whiteboard.set）：把本页文本整段存进网关全局白板
+    （单例、跨会话存活、65536 字上限），req_id 关联回包
+    whiteboard.set.result。"""
+    return {"t": "whiteboard.set", "text": str(text), "req_id": req_id}
+
+
+def whiteboard_set_line(result) -> str:
+    """whiteboard.set.result 回包 → 单行结果（同步字数 / 失败原因）。"""
+    if not isinstance(result, dict) or "ok" not in result:
+        return "⚠ 白板回包不可读"
+    if result["ok"]:
+        return f"✓ 白板已同步（{result.get('chars', '?')} 字）"
+    return f"⚠ 白板同步失败：{result.get('reason', '未知原因')}"
+
+
 class PushToTalk:
     """按住说话状态机：press/release → start/stop 动作。
 
@@ -740,6 +759,7 @@ class App:
         self._cleanup_seq = 0                      # fleet.cleanup req_id 序号
         self._brief_seq = 0                        # fleet.brief req_id 序号
         self._head_seq = 0                         # head.switch req_id 序号
+        self._wb_seq = 0                           # whiteboard.set req_id 序号
         self.stream: sd.InputStream | None = None
 
         root.title("rt-voice · ONE 桌面客户端（语音+观测）")
@@ -869,6 +889,24 @@ class App:
         ttk.Label(fleet_tab, textvariable=self.fleet_note_var,
                   foreground="#555").pack(anchor="w", pady=(4, 0))
 
+        # ---- 白板页签（协作交互输入面）：可编辑文本 → 同步进网关全局白板 ----
+        # 用户在此手打/粘贴长文（文档、日志、参考资料），语音侧让 head 调
+        # read_whiteboard 读取——长输入走眼不走嘴。
+        wb_tab = ttk.Frame(self.nb, padding=6)
+        self.nb.add(wb_tab, text=" 白板 ")
+        wb_bar = ttk.Frame(wb_tab)
+        wb_bar.pack(fill="x")
+        self.wb_sync_btn = ttk.Button(
+            wb_bar, text="同步到白板 ⤴", command=self._whiteboard_sync)
+        self.wb_sync_btn.pack(side="left")
+        self.whiteboard_note_var = tk.StringVar(
+            value="在此输入文本，「同步到白板」后语音侧可读（说：看一下白板）")
+        ttk.Label(wb_bar, textvariable=self.whiteboard_note_var,
+                  foreground="#555").pack(side="left", padx=10)
+        self.wb_text = scrolledtext.ScrolledText(wb_tab, font=("monospace 10"),
+                                                 wrap="word")
+        self.wb_text.pack(fill="both", expand=True)
+
         # ---- 任务页签（详情整合 + tickets 全文）：上下 PanedWindow ----
         # 上=台账表（body.push 按 ref 去重）+右只读正文（body.get 拉全文，
         # KG 14 §2.4 原详情页全部内容，水平 Paned 沿用）；
@@ -983,6 +1021,8 @@ class App:
                 self._render_fleet_brief(f)
             elif t == "head.list.result":
                 self._render_heads(f)
+            elif t == "whiteboard.set.result":
+                self.whiteboard_note_var.set(whiteboard_set_line(f))
             elif t == "head.switch.result":
                 line = head_switch_line(f)
                 self.head_note_var.set(line)
@@ -1071,6 +1111,22 @@ class App:
             self.fleet_note_var.set("席位简报回包不可读")
         for line in fleet_brief_lines(frame):
             st_write(self.fleet_brief_log, line)
+
+    # ---- 白板（协作交互输入面，经观测连接出站）----
+
+    def _whiteboard_sync(self):
+        """把白板页文本整段同步进网关全局白板：只写白板不动别的，
+        无确认门，存活检查同简报面；回包 whiteboard.set.result 渲染
+        一行结果（空文本也同步——等于清空白板）。"""
+        if not (self.obs_link and self.obs_link._thread
+                and self.obs_link._thread.is_alive()):
+            self.whiteboard_note_var.set("观测连接未开——开启「观测」后可同步白板")
+            return
+        text = self.wb_text.get("1.0", "end-1c")
+        self._wb_seq += 1
+        req_id = f"wb-{int(time.time() * 1000)}-{self._wb_seq}"
+        self.obs_link.send_request(whiteboard_set_request(text, req_id))
+        self.whiteboard_note_var.set(f"已发同步请求（{len(text)} 字）…")
 
     # ---- head 配置面（head.list/head.switch，经观测连接出站）----
 

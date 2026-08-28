@@ -295,6 +295,8 @@ class WsSession:
             await self._on_fleet_cleanup(data)
         elif t == "fleet.brief":
             await self._on_fleet_brief(data)
+        elif t == "whiteboard.set":
+            await self._on_whiteboard_set(data)
         elif t == "head.list":
             await self._on_head_list(data)
         elif t == "head.switch":
@@ -526,6 +528,33 @@ class WsSession:
             "t": "fleet.brief.result",
             "req_id": data.get("req_id"),
             **payload,
+        })
+
+    async def _on_whiteboard_set(self, data: dict) -> None:
+        """whiteboard.set{text} → whiteboard.set.result（PR10）.
+
+        客户端白板页签的整体同步：整段覆写全局白板（单用户单板，跨会话
+        存活）。超上限拒绝并报差额——用户改短后重发即可；head 侧读取面
+        是 :func:`_whiteboard_get`（app_resources 注入，read_whiteboard
+        工具消费）。
+        """
+        text = data.get("text")
+        if not isinstance(text, str):
+            await self._send_error("bad_request", "whiteboard.set needs a string text")
+            return
+        if len(text) > _WHITEBOARD_MAX_CHARS:
+            await self._reply({
+                "t": "whiteboard.set.result", "req_id": data.get("req_id"),
+                "ok": False,
+                "reason": (f"内容超过 {_WHITEBOARD_MAX_CHARS} 字符上限"
+                           f"（当前 {len(text)}）"),
+            })
+            return
+        _WHITEBOARD["text"] = text
+        _WHITEBOARD["ts"] = time.time()
+        await self._reply({
+            "t": "whiteboard.set.result", "req_id": data.get("req_id"),
+            "ok": True, "chars": len(text),
         })
 
     # ---- control: head 配置面（PR8：多 head 配置，激活单例）----
@@ -1108,6 +1137,23 @@ def _workspace_root() -> str:
     if env:
         return env
     return str(Path(__file__).resolve().parents[2])
+
+
+# ---- 白板（PR10：客户端文本输入区 ↔ head 读取工具的中转）----
+
+_WHITEBOARD_MAX_CHARS = 65536
+_WHITEBOARD: dict = {"text": "", "ts": 0.0}
+
+
+def _whiteboard_get() -> dict:
+    """head 工具读取面：当前白板内容 + 更新时间（app_resources 注入）。"""
+    return {"text": _WHITEBOARD["text"], "ts": _WHITEBOARD["ts"]}
+
+
+def _whiteboard_reset() -> None:
+    """单测隔离：清空全局白板。"""
+    _WHITEBOARD["text"] = ""
+    _WHITEBOARD["ts"] = 0.0
 
 
 # ---- head 配置注册表（PR8：多 head 配置，激活单例）----
@@ -1846,7 +1892,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         observers=[observer],
         app_resources={"dsh_backend": backend, "voice_store": _get_store(),
                        "workspace_root": _workspace_root(),
-                       "fleet_brief": _fleet_brief_payload},
+                       "fleet_brief": _fleet_brief_payload,
+                       "whiteboard": _whiteboard_get},
     )
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)

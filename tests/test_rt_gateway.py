@@ -745,9 +745,12 @@ async def test_final_inject_serializes_concurrent_finals():
 
 @pytest.fixture(autouse=True)
 def _isolate_store_singleton():
-    """台账单例测试隔离：前置清空、后置关闭并复位（绝不触达真实库）。"""
+    """台账单例测试隔离：前置清空、后置关闭并复位（绝不触达真实库）；
+    全局白板同套前置/后置复位（跨会话单例，防串测）。"""
     rt_gateway._store = None
+    rt_gateway._whiteboard_reset()
     yield
+    rt_gateway._whiteboard_reset()
     if rt_gateway._store is not None:
         try:
             rt_gateway._store.close()
@@ -2179,3 +2182,92 @@ async def test_realtime_head_wires_fleet_brief_resource(tmp_path, monkeypatch):
     res = wired["app_resources"]
     assert callable(res["fleet_brief"])
     assert res["fleet_brief"] is rt_gateway._fleet_brief_payload
+
+
+# ---- M4. 白板（PR10）：whiteboard.set → 全局单例 → read_whiteboard 注入面 ----
+
+
+async def _wb_set(ws, text, req_id="wb-1") -> dict:
+    await ws.send_str(json.dumps({"t": "whiteboard.set",
+                                  "text": text, "req_id": req_id}))
+    return await recv_until(ws, lambda d: d.get("t") == "whiteboard.set.result")
+
+
+@pytest.mark.asyncio
+async def test_whiteboard_set_roundtrip_and_survives_session(tmp_path, monkeypatch):
+    """set → {t,req_id,ok,chars}；文本落全局单例且跨连接存活（第二连接
+    仍读到）；空文本也是合法同步（清板语义）。"""
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await observe_handshake(ws)
+        got = await _wb_set(ws, "白板正文第一版", req_id="wb-a")
+        assert set(got) == {"t", "req_id", "ok", "chars"}
+        assert got["ok"] is True and got["chars"] == 7 and got["req_id"] == "wb-a"
+        assert rt_gateway._whiteboard_get()["text"] == "白板正文第一版"
+        assert rt_gateway._whiteboard_get()["ts"] > 0
+        await close_ws(ws)
+        # 连接已关：单例仍在（跨会话存活性）
+        assert rt_gateway._whiteboard_get()["text"] == "白板正文第一版"
+        ws2 = await fx.ws()
+        await observe_handshake(ws2)
+        got2 = await _wb_set(ws2, "", req_id="wb-empty")
+        assert got2["ok"] is True and got2["chars"] == 0
+        assert rt_gateway._whiteboard_get()["text"] == ""
+        await close_ws(ws2)
+
+
+@pytest.mark.asyncio
+async def test_whiteboard_set_over_cap_rejected_keeps_old(tmp_path, monkeypatch):
+    """超 65536 字上限：ok=False + reason 带差额；旧内容不被动。"""
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await observe_handshake(ws)
+        await _wb_set(ws, "旧内容", req_id="wb-old")
+        got = await _wb_set(ws, "x" * (rt_gateway._WHITEBOARD_MAX_CHARS + 1),
+                            req_id="wb-big")
+        assert got["ok"] is False
+        assert "上限" in got["reason"] and str(len("x" * 65537)) in got["reason"]
+        assert rt_gateway._whiteboard_get()["text"] == "旧内容"
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_whiteboard_set_non_string_is_bad_request(tmp_path, monkeypatch):
+    """text 缺席/非字符串 → bad_request 错误帧（非静默、不落板）。"""
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await observe_handshake(ws)
+        for bad in ({"t": "whiteboard.set", "req_id": "m"},
+                    {"t": "whiteboard.set", "text": 123, "req_id": "n"},
+                    {"t": "whiteboard.set", "text": None, "req_id": "p"}):
+            await ws.send_str(json.dumps(bad))
+            err = await recv_json(ws)
+            assert err["t"] == "error" and err["code"] == "bad_request"
+        assert rt_gateway._whiteboard_get()["text"] == ""
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_realtime_head_wires_whiteboard_resource(tmp_path, monkeypatch):
+    """build_realtime_head 的 app_resources 携带 whiteboard getter
+    （=模块级 _whiteboard_get；read_whiteboard 工具的注入面）。"""
+    import types
+
+    wired: dict = {}
+    _fake_head_build_module(monkeypatch, wired)
+    monkeypatch.setenv("VOICE_HEAD_PROFILES", str(tmp_path / "no-heads.json"))
+    rt_gateway._reset_head_registry()
+
+    async def _noop(*a, **k):
+        pass
+
+    session = types.SimpleNamespace(conv_id="s-wb", send_audio=_noop,
+                                    drop_pending_audio=_noop)
+    backend = types.SimpleNamespace(liaison_session="")
+    adapter = await rt_gateway.build_realtime_head(session, EventBus(), backend)
+    await adapter.stop()
+    rt_gateway._reset_head_registry()
+
+    res = wired["app_resources"]
+    assert res["whiteboard"] is rt_gateway._whiteboard_get
+    assert rt_gateway._whiteboard_get() == {"text": "", "ts": 0.0}

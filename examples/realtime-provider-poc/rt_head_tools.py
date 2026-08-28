@@ -4,7 +4,7 @@
 
 """Head tool surface over DshBackend (WS1 W1.4; docs/kg/01-ws1-head-dsh.md §5).
 
-Thirteen tools, docstring-as-schema (same convention as rt_orchestrator):
+Fourteen tools, docstring-as-schema (same convention as rt_orchestrator):
 
 - ``dispatch_intent(raw_intent)`` — phase-1 receipt now; the phase-2
   final arrives later as a context re-injection carrying the
@@ -26,6 +26,9 @@ Thirteen tools, docstring-as-schema (same convention as rt_orchestrator):
 - ``fleet_brief()`` — seat-status briefing: one line per seat from
   fleet.json joined with live dsh session state, via the gateway-injected
   ``app_resources["fleet_brief"]`` callable.
+- ``read_whiteboard(max_chars=None, from_tail=False)`` — the user-typed
+  client whiteboard (协作交互输入面), read-only via the gateway-injected
+  ``app_resources["whiteboard"]`` callable.
 
 All handlers resolve the backend from ``params.app_resources["dsh_backend"]``
 and the session store from ``params.app_resources["voice_store"]`` so the
@@ -66,6 +69,7 @@ DSH_TOOLS_DOCTRINE = """# Persona and Role
 - edit_file：改文件中的一处文字——old_string 必须与文件现有内容完全一致；多处相同且确要全改才用 replace_all，否则换更长的 old_string 精确定位。
 - write_file：整文件新建或整体重写，仅在用户明确要求时用。
 - fleet_brief：用户问席位/在坐代理的状态时调用，返回各席位一行状态（在不在、跑没跑、在干什么）。
+- read_whiteboard：用户让你看白板（"看一下白板/读白板/白板上写了什么"）时调用，读取用户在客户端白板手动输入的整段文本（长文档、日志、参考资料）。内容只进你的上下文：超长用 max_chars 分段、from_tail 取尾，与 read_body 同一套分段方式。
 - cancel_run：取消一个编排任务，参数用回执里的 ref（vh-…）。用户说"取消刚才那个/第一个调研"时，由你从上下文里的回执解析出 ref，不让用户念编号。
 - remain_silent：当最好的回应是不说话时调用（如控制消息后的确认），无用户可见效果。
 - 闲聊、问候、一句话可答的常识直接回答。
@@ -76,6 +80,7 @@ DSH_TOOLS_DOCTRINE = """# Persona and Role
 - 连续工具调用（如 list_bodies 后再 read_body）：中间步骤不出声；全部取到所需信息后一次性作答。
 - 文件工具（find_files/grep_files/read_file/edit_file/write_file）：读取类是中间步骤不出声，取到后按用户所问一句话作答；edit_file/write_file 完成只回一个状态（如"改好了"，可带一句改了什么），失败只说原因（如"没找到这处"），不念文件内容、不倒 diff。找不到就说没找到，不编造。
 - fleet_brief：一句话报总量与在跑的（如3个席位1个在跑，db05在跑封装统一client），不逐条念长表，简报不可用就说暂不可用。
+- read_whiteboard：读取是中间步骤不出声；读到后按用户的诉求处理白板内容（用户让你做什么就做什么，需要转述时先讲结构与要点，长文按需分段取）。空白板就说白板是空的，白板不可用就说暂不可用，不编造内容。
 - query_status/read_body/list_bodies：状态问句先一句 counts（如"2个完成，1个在跑"）；read_body/list_bodies 结果按用户所问讲，不整段倒正文，长文先讲结构与要点，用户要哪段再用 max_chars/from_tail 分段取、逐段展开。查无（miss）就说目前没有这条任务，台账不可用（error/note）就说详情暂不可用，不编造内容。
 - 编号协议：单任务时不念编号；多任务并存或用户要核对时，用「任务N」（N 是回执/通报/台账里的编号）区分。工具调用一律使用你上下文里的完整 ref，与念法无关。
 - 不添加执行层没有的事实；转述终稿正文要忠实，长文先讲结构与要点，用户要求再逐段展开。
@@ -617,11 +622,45 @@ async def fleet_brief_tool(params):
     await params.result_callback(payload)
 
 
+async def read_whiteboard_tool(params, max_chars=None, from_tail=False):
+    """读取用户在客户端「白板」输入的文本（协作交互输入面；只读）。
+
+    用户提到白板（"看一下白板/读白板"）时调用。白板是用户手动输入/
+    粘贴的整段文本（如长文档、报错日志、参考资料），内容只进你的
+    上下文、不出声；超长用 max_chars 分段、from_tail 取尾。
+    Args:
+        max_chars: 可选。最多返回的字数；超长时截断并标记 truncated
+            与 returned_chars，其余部分需要时再分段取。
+        from_tail: 可选。True 时返回尾部 max_chars 字。
+    """
+    getter = params.app_resources.get("whiteboard")
+    if not callable(getter):
+        await params.result_callback({"status": "error", "reason": "白板不可用"})
+        return
+    try:
+        payload = getter()
+        body = payload.get("text") or "" if isinstance(payload, dict) else ""
+    except Exception as e:  # noqa: BLE001 — C 降级：读不到就说读不到，不炸
+        await params.result_callback({"status": "error", "reason": f"白板读取失败：{e}"})
+        return
+    out = {"status": "ok", "chars": len(body), "body": body}
+    if max_chars is not None:
+        try:  # live drift: the model may pass "500"/None-ish strings
+            n = max(int(max_chars), 0)
+        except (TypeError, ValueError):
+            n = None
+        if n is not None and len(body) > n:
+            out["body"] = body[len(body) - n:] if from_tail else body[:n]
+            out["truncated"] = True
+            out["returned_chars"] = n
+    await params.result_callback(out)
+
+
 def dsh_head_tools() -> list:
-    """The thirteen tool functions, ready for LLMContext(tools=...)."""
+    """The fourteen tool functions, ready for LLMContext(tools=...)."""
     return [dispatch_intent_tool, dispatch_plan_tool, query_status_tool,
             read_body_tool, list_bodies_tool, cancel_run_tool,
             remain_silent_tool,
             find_files_tool, grep_files_tool, read_file_tool,
             edit_file_tool, write_file_tool,
-            fleet_brief_tool]
+            fleet_brief_tool, read_whiteboard_tool]

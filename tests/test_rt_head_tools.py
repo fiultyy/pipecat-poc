@@ -33,6 +33,7 @@ from rt_head_tools import (  # noqa: E402
     query_status_tool,
     read_body_tool,
     read_file_tool,
+    read_whiteboard_tool,
     remain_silent_tool,
     write_file_tool,
 )
@@ -383,16 +384,16 @@ def test_dsh_head_tools_registry():
         "read_body_tool", "list_bodies_tool", "cancel_run_tool",
         "remain_silent_tool", "find_files_tool", "grep_files_tool",
         "read_file_tool", "edit_file_tool", "write_file_tool",
-        "fleet_brief_tool",
+        "fleet_brief_tool", "read_whiteboard_tool",
     }
-    assert len(dsh_head_tools()) == 13
+    assert len(dsh_head_tools()) == 14
 
 
 def test_doctrine_covers_all_tools_and_two_phase_rule():
     for name in ("dispatch_intent", "dispatch_plan", "query_status",
                  "read_body", "list_bodies", "cancel_run", "remain_silent",
                  "find_files", "grep_files", "read_file", "edit_file",
-                 "write_file", "fleet_brief"):
+                 "write_file", "fleet_brief", "read_whiteboard"):
         assert name in DSH_TOOLS_DOCTRINE
 
 
@@ -671,3 +672,95 @@ def test_doctrine_fleet_brief_clauses():
     brief_idx = next(i for i, ln in enumerate(after_lines)
                      if ln.startswith("- fleet_brief"))
     assert brief_idx == file_idx + 1
+
+
+# ---- 白板（PR10）：gateway 经 app_resources 注入的 whiteboard getter ----
+
+
+@pytest.mark.asyncio
+async def test_read_whiteboard_tool_degrades_without_callable():
+    for resources in ({}, {"whiteboard": None}, {"whiteboard": "not-callable"}):
+        params = FakeParams(app_resources=resources)
+        await read_whiteboard_tool(params)
+        assert params.results[0] == {"status": "error", "reason": "白板不可用"}
+
+
+@pytest.mark.asyncio
+async def test_read_whiteboard_tool_returns_text_and_chars():
+    params = FakeParams(
+        app_resources={"whiteboard": lambda: {"text": "需求文档全文", "ts": 1.0}})
+    await read_whiteboard_tool(params)
+    assert params.results[0] == {"status": "ok", "chars": 6, "body": "需求文档全文"}
+
+
+@pytest.mark.asyncio
+async def test_read_whiteboard_tool_empty_board_is_ok_zero_chars():
+    params = FakeParams(app_resources={"whiteboard": lambda: {"text": "", "ts": 0.0}})
+    await read_whiteboard_tool(params)
+    assert params.results[0] == {"status": "ok", "chars": 0, "body": ""}
+
+
+@pytest.mark.asyncio
+async def test_read_whiteboard_tool_wraps_getter_exception():
+    def boom():
+        raise RuntimeError("holder gone")
+
+    params = FakeParams(app_resources={"whiteboard": boom})
+    await read_whiteboard_tool(params)
+    assert params.results[0] == {"status": "error",
+                                 "reason": "白板读取失败：holder gone"}
+
+
+@pytest.mark.asyncio
+async def test_read_whiteboard_tool_max_chars_truncates_from_head():
+    params = FakeParams(app_resources={"whiteboard": lambda: {"text": "x" * 300}})
+    await read_whiteboard_tool(params, max_chars=100)
+    out = params.results[0]
+    assert out["truncated"] is True and out["returned_chars"] == 100
+    assert out["chars"] == 300 and out["body"] == "x" * 100
+
+
+@pytest.mark.asyncio
+async def test_read_whiteboard_tool_from_tail_takes_last_chars():
+    params = FakeParams(app_resources={"whiteboard": lambda: {"text": "abcdef"}})
+    await read_whiteboard_tool(params, max_chars=3, from_tail=True)
+    out = params.results[0]
+    assert out["body"] == "def" and out["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_read_whiteboard_tool_max_chars_live_drift_tolerated():
+    """模型把 max_chars 念成 "500"/None 文本：容忍数字串，垃圾值降级不截断。"""
+    params = FakeParams(app_resources={"whiteboard": lambda: {"text": "abcde"}})
+    await read_whiteboard_tool(params, max_chars="3")
+    assert params.results[0]["body"] == "abc" and params.results[0]["truncated"] is True
+    await read_whiteboard_tool(params, max_chars="很大")
+    assert params.results[-1] == {"status": "ok", "chars": 5, "body": "abcde"}
+
+
+@pytest.mark.asyncio
+async def test_read_whiteboard_tool_non_dict_payload_degrades_to_empty():
+    params = FakeParams(app_resources={"whiteboard": lambda: "just a string"})
+    await read_whiteboard_tool(params)
+    assert params.results[0] == {"status": "ok", "chars": 0, "body": ""}
+
+
+def test_doctrine_read_whiteboard_clauses():
+    """白板两条款：Tools 面说何时调 + 分段方式；After 面不出声、空板口径。"""
+    tools = DSH_TOOLS_DOCTRINE.split("# Tools")[1].split("# After Tool Calls")[0]
+    tool_clause = next(ln for ln in tools.splitlines()
+                       if ln.startswith("- read_whiteboard"))
+    assert "白板" in tool_clause and "read_whiteboard" in tool_clause
+    assert "max_chars" in tool_clause and "from_tail" in tool_clause
+    assert "read_body" in tool_clause  # 分段方式与 read_body 同套
+    after_lines = DSH_TOOLS_DOCTRINE.split("# After Tool Calls")[1].splitlines()
+    clause = next(ln for ln in after_lines if ln.startswith("- read_whiteboard"))
+    assert "中间步骤不出声" in clause
+    assert "空白板" in clause and "空" in clause  # 空白板就说白板是空的
+    assert "不编造" in clause
+    # 排在 fleet_brief 条款之后（与注册序一致）
+    brief_idx = next(i for i, ln in enumerate(after_lines)
+                     if ln.startswith("- fleet_brief"))
+    wb_idx = next(i for i, ln in enumerate(after_lines)
+                  if ln.startswith("- read_whiteboard"))
+    assert wb_idx == brief_idx + 1

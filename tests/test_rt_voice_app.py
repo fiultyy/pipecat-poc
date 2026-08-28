@@ -54,6 +54,8 @@ from rt_voice_app import (  # noqa: E402
     tickets_text,
     turn_label_with_notify,
     turn_line,
+    whiteboard_set_line,
+    whiteboard_set_request,
 )
 
 
@@ -525,9 +527,9 @@ def test_task_fleet_tabs_assembly_smoke():
         app = App(root, "ws://127.0.0.1:8765/ws", "", False)
         root.update()
 
-        # 页签序：语音/编排/回合/席位/任务（消息/票板、详情页已整合）
+        # 页签序：语音/编排/回合/席位/白板/任务（消息/票板、详情页已整合）
         assert [app.nb.tab(t, "text").strip() for t in app.nb.tabs()] == \
-            ["语音", "编排", "回合", "席位", "任务"]
+            ["语音", "编排", "回合", "席位", "白板", "任务"]
 
         # bridge.msg → 编排页底部独立小面板（ScrolledText 内嵌一层 plain
         # Frame，取 master.master 判真实挂载页）
@@ -815,6 +817,87 @@ def test_fleet_brief_tab_assembly_smoke():
         root.update()
         assert app.fleet_note_var.get() == "席位简报回包不可读"
         assert "⚠ 简报回包不可读" in app.fleet_brief_log.get("1.0", "end")
+    finally:
+        if app is not None and getattr(app, "ptt_listener", None):
+            app.ptt_listener.stop()
+        root.destroy()
+
+
+# ---- 白板（PR10：协作交互输入面纯函数 + 白板页签装配）----
+
+
+def test_whiteboard_set_request_frame():
+    assert whiteboard_set_request("正文", "r-1") == \
+        {"t": "whiteboard.set", "text": "正文", "req_id": "r-1"}
+    # 非 str 强转（与网关 str 校验对齐：UI 只发 str，这里兜底）
+    assert whiteboard_set_request(123, "r-2")["text"] == "123"
+    assert whiteboard_set_request("", "r-3")["text"] == ""
+
+
+def test_whiteboard_set_line():
+    ok = {"t": "whiteboard.set.result", "req_id": "r-1", "ok": True, "chars": 42}
+    assert whiteboard_set_line(ok) == "✓ 白板已同步（42 字）"
+    over = {"t": "whiteboard.set.result", "req_id": "r-2", "ok": False,
+            "reason": "内容超过 65536 字符上限（当前 65537）"}
+    assert whiteboard_set_line(over) == "⚠ 白板同步失败：内容超过 65536 字符上限（当前 65537）"
+    assert whiteboard_set_line({"ok": False}) == "⚠ 白板同步失败：未知原因"
+    assert whiteboard_set_line({}) == "⚠ 白板回包不可读"
+    assert whiteboard_set_line(None) == "⚠ 白板回包不可读"
+
+
+def test_whiteboard_tab_assembly_smoke():
+    """白板页装配冒烟（真 tkinter、无网络、无 mainloop）：可编辑文本区+
+    同步按钮；观测未开提示早退；stub 连接下出站帧带整段文本、req_id
+    唯一；whiteboard.set.result 入 obs_q 后 _drain_obs 渲染结果行。
+    无显示环境跳过。"""
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+    except Exception as e:  # noqa: BLE001 — headless 环境
+        pytest.skip(f"no display for tkinter: {e}")
+    root.withdraw()
+    app = None
+    try:
+        app = App(root, "ws://127.0.0.1:8765/ws", "", False)
+        root.update()
+
+        # 可编辑文本区（默认 normal）+ 同步按钮已装配
+        assert app.wb_sync_btn.winfo_exists()
+        assert str(app.wb_text.cget("state")) == "normal"
+        app.wb_text.insert("1.0", "白板正文\n第二行")
+        assert app.wb_text.get("1.0", "end-1c") == "白板正文\n第二行"
+
+        # 观测未开 → 提示早退（不触网）
+        app._whiteboard_sync()
+        assert "观测连接未开" in app.whiteboard_note_var.get()
+
+        # stub 连接：出站 whiteboard.set 帧（整段文本）+ req_id 唯一
+        app.obs_link = _StubObsLink()
+        app._whiteboard_sync()
+        app.wb_text.delete("1.0", "end")
+        app.wb_text.insert("1.0", "第二版")
+        app._whiteboard_sync()
+        reqs = [r for r in app.obs_link.sent if r.get("t") == "whiteboard.set"]
+        assert [r["text"] for r in reqs] == ["白板正文\n第二行", "第二版"]
+        assert all(set(r.keys()) == {"t", "text", "req_id"} for r in reqs)
+        assert reqs[0]["req_id"] != reqs[1]["req_id"]
+        assert app.whiteboard_note_var.get() == "已发同步请求（3 字）…"
+
+        # 回包入 obs_q → _drain_obs：结果行
+        app.obs_q.put({"t": "whiteboard.set.result", "req_id": reqs[1]["req_id"],
+                       "ok": True, "chars": 3})
+        app._drain_obs()
+        root.update()
+        assert app.whiteboard_note_var.get() == "✓ 白板已同步（3 字）"
+
+        # 失败回包 → 原因行
+        app.obs_q.put({"t": "whiteboard.set.result", "req_id": "r-x",
+                       "ok": False, "reason": "内容超过 65536 字符上限（当前 70000）"})
+        app._drain_obs()
+        root.update()
+        assert app.whiteboard_note_var.get() == \
+            "⚠ 白板同步失败：内容超过 65536 字符上限（当前 70000）"
     finally:
         if app is not None and getattr(app, "ptt_listener", None):
             app.ptt_listener.stop()
