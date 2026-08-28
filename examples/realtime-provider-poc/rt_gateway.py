@@ -52,6 +52,13 @@ Additional control frames (W3):
 - ``run.cancel{req_id, ref}`` → ``run.cancel.result{req_id, ref, ok,
   state?, error?}`` — 复用 ``backend.cancel`` 内部路径；未知 ref 报
   ``unknown-ref``，重复取消幂等返回 ``state:"cancelled"``
+- PM 路由（GW-001，<internal-repo> spec-gateway §GW-001）— ``pm.req{id, op,
+  params}`` 纯透传 pm-host-service（ADR-004 零业务：op 机械映射
+  ``GET /<op>?params``，ADR-002 只读 GET）→ ``pm.res{id, data|error}``；
+  发现=``~/.dsh/maestro/pm.port`` 的 ``port`` 字段（签名缓存，服务重启换
+  端口自动失效），传输失败以 ``GET /health`` 探活分级；超时/上游失败回
+  ``pm.res{error}`` 结构化（不崩连接）；``(client, id)`` 去重窗=内存有界窗
+  （60s TTL、≤512 条），窗内同 id 重放不再转发——同 id 只回一次 res
 
 帧协议（§1）：JSON 文本帧（control/event）+ 二进制帧（raw PCM16LE/16k/mono，
 推荐 20ms=640B）。握手序：``auth`` → ``auth.ok{session_id}`` →
@@ -69,15 +76,18 @@ import inspect
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlencode
 
 from aiohttp import WSMsgType, web
 
@@ -153,6 +163,16 @@ DEFAULT_TOPIC_SOURCES: dict[str, dict] = {
 }
 RESUME_TTL_S = 600.0
 WEB_DIR = Path(__file__).parent / "web"
+
+# ---- PM 路由常量（GW-001，<internal-repo> spec-gateway §GW-001）----
+# ADR-004 幂等枢纽零业务：pm.req 只做机械路由（op→路径、params→query），
+# 不带任何 op 语义；pm-host-service 只读（ADR-002），GET 一个动词走到底。
+PM_OP_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")  # op→URL 路径段的合法字符集
+PM_REQ_TIMEOUT_S = 8.0                # 单次透传调用总预算
+PM_PROBE_TIMEOUT_S = 2.0              # GET /health 探活预算
+# (client, id) 去重窗：沿用现有内存窗范式（有界 OrderedDict + TTL，无持久化）
+PM_DEDUP_TTL_S = 60.0
+PM_DEDUP_MAX = 512
 
 # head pipeline 需要的鸭子面（fake 见 tests；realtime 见 build_realtime_head）:
 #   transcript: TranscriptState      — take_tail()/seed() 供断线重连重播种
@@ -262,6 +282,9 @@ class WsSession:
         self._audio_pending: deque[bytes] = deque()
         self._audio_wake = asyncio.Event()
         self._media_window: deque[tuple[float, int]] = deque()
+        # pm.req (client, id) 去重窗（GW-001）：id→首见 monotonic 时刻，
+        # 有界内存窗，无持久化
+        self._pm_seen: OrderedDict[str, float] = OrderedDict()
         self._no_session_warned = False
         self.stats = {
             "audio_in_chunks": 0,
@@ -332,6 +355,8 @@ class WsSession:
             await self._on_head_list(data)
         elif t == "head.switch":
             await self._on_head_switch(data)
+        elif t == "pm.req":
+            await self._on_pm_req(data)
         else:
             await self._send_error("bad_type", f"unknown t={t!r}",
                                    req_id=data.get("req_id"))
@@ -871,6 +896,88 @@ class WsSession:
             "t": "head.switch.result", "req_id": data.get("req_id"),
             "ok": True, "active": name, "note": "下一次语音连接生效",
         })
+
+    # ---- control: PM 路由（GW-001：pm.req 纯透传 pm-host-service）----
+
+    def _pm_dedup_first(self, key: str) -> bool:
+        """``(client, id)`` 去重窗：True=首次（放行并记窗）、False=窗内重放。
+
+        有界内存窗（:data:`PM_DEDUP_TTL_S`/:data:`PM_DEDUP_MAX`），无持久化；
+        条目记首见时刻，重放不续期——窗过期后同 id 视为新请求。
+        """
+        now = time.monotonic()
+        seen = self._pm_seen
+        for stale in [k for k, ts in seen.items() if now - ts > PM_DEDUP_TTL_S]:
+            del seen[stale]
+        if key in seen:
+            return False
+        seen[key] = now
+        while len(seen) > PM_DEDUP_MAX:
+            seen.popitem(last=False)
+        return True
+
+    async def _on_pm_req(self, data: dict) -> None:
+        """pm.req{id, op, params} → 透传 pm-host-service → pm.res（GW-001）.
+
+        帧内 ``id``（客户端生成）是幂等键：去重窗 ``(client, id)`` 命中即静默
+        丢弃——同 id 重放只回一次 res。HTTP 往返放独立任务跑，接收循环不被
+        上游拖住（媒体帧照常流动）。上游超时/失败一律结构化成
+        ``pm.res{error}``，绝不关连接。
+        """
+        pm_id = data.get("id")
+        if (isinstance(pm_id, bool) or not isinstance(pm_id, (str, int))
+                or (isinstance(pm_id, str) and not pm_id)):
+            await self._send_error("bad_request", "pm.req needs a non-empty id")
+            return
+        if not self._pm_dedup_first(f"{pm_id}"):
+            log.debug("pm.req id=%s in dedup window; dropped", pm_id)
+            return
+        op = data.get("op")
+        if not isinstance(op, str) or not PM_OP_RE.fullmatch(op):
+            await self._pm_reply(pm_id, error={
+                "code": "bad_request",
+                "message": "pm.req.op must match [A-Za-z0-9_-]{1,64}"})
+            return
+        params = data.get("params")
+        if params is None:
+            query = ""
+        elif isinstance(params, dict):
+            # 机械映射：str 原样，其余 JSON 编码（bool/None/嵌套结构无损）
+            query = urlencode({
+                str(k): v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+                for k, v in params.items()
+            })
+        else:
+            await self._pm_reply(pm_id, error={
+                "code": "bad_request", "message": "pm.req.params must be an object"})
+            return
+        task = asyncio.create_task(self._pm_roundtrip(pm_id, op, query))
+        task.add_done_callback(self._tasks.remove)  # 往返完即出册，_tasks 不涨
+        self._tasks.append(task)
+
+    async def _pm_roundtrip(self, pm_id: str | int, op: str, query: str) -> None:
+        """透传往返：成功 ``pm.res{id, data}``；任何失败 ``pm.res{id, error}``。"""
+        try:
+            data = await _pm_call(op, query)
+        except asyncio.CancelledError:
+            raise
+        except PMUpstreamError as e:
+            await self._pm_reply(pm_id, error=e.error)
+        except Exception as e:  # noqa: BLE001 — 结构化兜底：绝不带崩连接
+            await self._pm_reply(pm_id, error={"code": "pm_internal",
+                                               "message": str(e)[:160]})
+        else:
+            await self._pm_reply(pm_id, data=data)
+
+    async def _pm_reply(self, pm_id: str | int, data: Any = None,
+                        error: dict | None = None) -> None:
+        """pm.res 出站封套：``{t:"pm.res", id, data|error}``（ADR-006 帧集）。"""
+        frame: dict = {"t": "pm.res", "id": pm_id}
+        if error is not None:
+            frame["error"] = error
+        else:
+            frame["data"] = data
+        await self._reply(frame)
 
     # ---- media ----
 
@@ -1988,6 +2095,132 @@ async def _fleet_brief_payload() -> dict:
     if note is not None:
         payload["note"] = note
     return payload
+
+
+# ---- pm-host-service 路由面（GW-001，<internal-repo> spec-gateway）----
+# 纯路由零业务（ADR-004）：发现（pm.port 的 port 字段）→ GET /<op>?params →
+# pm.res。pm-host-service 只读（ADR-002），GET 一个动词走到底。
+
+_PM_PORT_CACHE: dict = {"sig": None, "port": None}  # (mtime_ns,size)→port 签名缓存
+
+
+def _reset_pm_port_cache() -> None:
+    """单测隔离：丢弃 pm.port 签名缓存（下次 :func:`_pm_port` 重读文件）。"""
+    _PM_PORT_CACHE.update(sig=None, port=None)
+
+
+def _pm_port_path() -> str:
+    """pm.port 端口文件路径；``PM_HOST_PORT_FILE`` env 覆写（单测指替身）。"""
+    return os.path.expanduser(
+        os.environ.get("PM_HOST_PORT_FILE", str(MAESTRO_DIR / "pm.port")))
+
+
+def _pm_port() -> int | None:
+    """服务发现：pm.port JSON 的 ``port`` 字段；缺席/坏文件/无字段→None.
+
+    签名缓存（mtime_ns+size，FileTailer snapshot 同款）：服务重启换端口必
+    重写 pm.port，签名变化自动失效。服务死时文件残留旧值——那是连接层的
+    事（探活分级兜底），发现层不因文件在而误判服务活。
+    """
+    path = _pm_port_path()
+    try:
+        st = os.stat(path)
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        _PM_PORT_CACHE.update(sig=None, port=None)
+        return None
+    if _PM_PORT_CACHE["sig"] == sig:
+        return _PM_PORT_CACHE["port"]
+    try:
+        with open(path, encoding="utf-8") as fh:
+            port = int(json.load(fh)["port"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    _PM_PORT_CACHE.update(sig=sig, port=port)
+    return port
+
+
+class _PMUnreachable(Exception):
+    """pm-host-service 传输级失败（拒绝/超时/读断）——与非 2xx 分型开。"""
+
+
+def _pm_http_get(port: int, op: str, query: str, timeout: float) -> tuple[int, bytes]:
+    """同步 GET（线程池里跑）：返回 (status, body)；非 2xx 经 HTTPError 把
+    错误体一并读出透传；传输级失败折进 :class:`_PMUnreachable`。"""
+    url = f"http://127.0.0.1:{port}/{op}" + (f"?{query}" if query else "")
+    req = urllib.request.Request(url, headers={"accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        with e:
+            return e.code, e.read()
+    except Exception as e:  # noqa: BLE001 — URLError/socket.timeout 等一律传输失败
+        raise _PMUnreachable(str(e) or e.__class__.__name__) from e
+
+
+class PMUpstreamError(Exception):
+    """pm-host-service 调用失败的结构化载体（``pm.res{error}`` 的 error 值）."""
+
+    def __init__(self, error: dict) -> None:
+        super().__init__(str(error.get("message") or error.get("code") or "pm error"))
+        self.error = error
+
+
+async def _pm_probe(port: int) -> bool:
+    """``GET /health`` 探活（短预算）；任何失败=False。"""
+    try:
+        status, _ = await asyncio.wait_for(
+            asyncio.to_thread(_pm_http_get, port, "health", "", PM_PROBE_TIMEOUT_S),
+            PM_PROBE_TIMEOUT_S + 1.0,
+        )
+    except Exception:  # noqa: BLE001 — 探活只回答活/死
+        return False
+    return status == 200
+
+
+async def _pm_call(op: str, query: str) -> Any:
+    """一次纯透传往返：``GET /<op>?<query>`` → 服务 JSON（GW-001）.
+
+    2xx → 解析后的服务 JSON；非 2xx → ``pm_status``（status+upstream 原样
+    附上）；传输失败 → ``GET /health`` 探活分级 ``pm_down``（探活也死）/
+    ``pm_unreachable``（探活通但目标调用传输失败）；调用总预算
+    :data:`PM_REQ_TIMEOUT_S` 超过 → ``pm_timeout``。全程只抛
+    :class:`PMUpstreamError`（载荷即 pm.res 的 error）。
+    """
+    port = _pm_port()
+    if port is None:
+        raise PMUpstreamError({"code": "pm_unavailable",
+                               "message": f"pm.port unreadable: {_pm_port_path()}"})
+    try:
+        status, raw = await asyncio.wait_for(
+            asyncio.to_thread(_pm_http_get, port, op, query, PM_REQ_TIMEOUT_S),
+            PM_REQ_TIMEOUT_S + 2.0,
+        )
+    except _PMUnreachable as e:
+        healthy = await _pm_probe(port)
+        raise PMUpstreamError({
+            "code": "pm_down" if not healthy else "pm_unreachable",
+            "message": str(e)[:160],
+            "probe": "health-ok" if healthy else "health-failed",
+        }) from e
+    except asyncio.TimeoutError:
+        raise PMUpstreamError({"code": "pm_timeout",
+                               "message": f"upstream no reply within "
+                                          f"{PM_REQ_TIMEOUT_S:.0f}s"}) from None
+    if status != 200:
+        try:
+            upstream = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            upstream = raw.decode("utf-8", errors="replace")[:500]
+        raise PMUpstreamError({"code": "pm_status", "status": status,
+                               "message": f"upstream HTTP {status}",
+                               "upstream": upstream})
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise PMUpstreamError({"code": "pm_bad_payload",
+                               "message": "upstream 200 body is not JSON"}) from None
 
 
 # ---- live 阶段（W4.1 e2e）：真 pipecat 头，惰性导入，单测不触达 ----
