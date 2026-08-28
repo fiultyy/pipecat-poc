@@ -920,3 +920,133 @@ def test_liaison_mode_property(monkeypatch):
     assert DshBackend(lane=lane, bus=EventBus()).liaison_mode is True
     monkeypatch.setenv("VOICE_LIAISON_AUTO_NEW", "0")
     assert DshBackend(lane=lane, bus=EventBus()).liaison_mode is False
+
+
+# ---- P0 交付前归档核验：绑定会话已归档 → 绑定失效，不续投（幽灵 worker） ----
+
+BOUND_ARCH = "session-ARCH0001"
+
+
+def make_archived_backend(tmp_path, monkeypatch, *, items, archived,
+                          auto_new=True, liaison_session=""):
+    """Backend + tmp liaison state（绑定 BOUND_ARCH）+ 分方法 _dsh_api 替身：
+    session.list 回 items、workspace.list 回归档集、session.prompt 记账。"""
+    state = tmp_path / "liaison.json"
+    state.write_text(json.dumps({"code": "arch",
+                                 "sessionId": BOUND_ARCH,
+                                 "spawned_at": 1787889874.6}))
+    monkeypatch.setenv("VOICE_LIAISON_STATE", str(state))
+    prompts: list[dict] = []
+
+    async def fake_dsh_api(method, payload):
+        if method == "session.prompt":
+            prompts.append(payload)
+        if method == "session.list":
+            return {"items": items}
+        if method == "workspace.list":
+            if isinstance(archived, BaseException):
+                raise archived
+            return {"items": [], "archivedSessionIds": archived}
+        return {}
+
+    b = DshBackend(lane=make_lane({"create-run": ["run_<redacted>\n"]}),
+                   bus=EventBus(), liaison_auto_new=auto_new,
+                   liaison_session=liaison_session)
+    b._dsh_api = fake_dsh_api
+    return b, prompts, state
+
+
+@pytest.mark.asyncio
+async def test_liaison_archived_binding_respawns_and_clears_state(
+        tmp_path, monkeypatch):
+    """绑定 sid 在归档集 + AUTO_NEW：清旧 liaison.json → spawn 换新（新绑定
+    落盘）、派发投新 sid（绝不投归档席）。"""
+    b, prompts, state = make_archived_backend(
+        tmp_path, monkeypatch,
+        items=[{"sessionId": BOUND_ARCH, "running": False}],
+        archived=[BOUND_ARCH])
+    spawned: list[str] = []
+
+    async def fake_spawn():
+        spawned.append("spawn")
+        b._liaison_bound_save("new1", "session-NEW1234")
+        return "session-NEW1234"
+
+    b._liaison_spawn = fake_spawn
+    receipt = json.loads(await b.dispatch("调研 X"))
+    assert receipt["status"] == "accepted"
+    assert spawned == ["spawn"], "归档绑定必须触发换新，不得复用"
+    assert prompts and prompts[0]["sessionId"] == "session-NEW1234"
+    after = json.loads(state.read_text(encoding="utf-8"))
+    assert after["code"] == "new1" and after["sessionId"] == "session-NEW1234"
+    for t in b._pending.values():
+        t.cancel()
+
+
+@pytest.mark.asyncio
+async def test_liaison_archived_binding_without_auto_new_errors(
+        tmp_path, monkeypatch):
+    """绑定 sid 在归档集 + 无 AUTO_NEW 且无可用显式目标：派发失败（错误
+    文案注明绑定会话已归档）、不投递、旧绑定文件已被清。"""
+    monkeypatch.delenv("VOICE_LIAISON_AUTO_NEW", raising=False)
+    # 显式目标指向一个不在 session.list 的会话：显式分支不命中，
+    # 归档绑定成为唯一线索 → 明确报错而非唤醒归档席
+    fleet = tmp_path / "fleet.json"
+    fleet.write_text(json.dumps({"fleet": {
+        "bb02": {"sessionId": "session-GONE000", "role": "worker"}}}))
+    monkeypatch.setenv("MAESTRO_FLEET", str(fleet))
+    b, prompts, state = make_archived_backend(
+        tmp_path, monkeypatch,
+        items=[{"sessionId": BOUND_ARCH, "running": False}],
+        archived=[BOUND_ARCH], auto_new=False, liaison_session="bb02")
+    events: list[tuple] = []
+
+    async def fake_emit(kind, payload):
+        events.append((kind, payload))
+
+    b.bus.emit = fake_emit
+    receipt = json.loads(await b.dispatch("调研 X"))
+    assert receipt["status"] == "failed"
+    assert not prompts, "不得向归档席位投递"
+    fails = [p for k, p in events if k == "orch.failed"]
+    assert len(fails) == 1 and "已归档" in fails[0]["reason"]
+    assert not state.exists(), "残留绑定已清（绑定失效口径）"
+    assert not b._pending
+
+
+@pytest.mark.asyncio
+async def test_liaison_archived_check_failure_degrades_to_bound(
+        tmp_path, monkeypatch):
+    """workspace.list 不可达 → 核验降级：绑定照常复用（不 spawn、不报错）。"""
+    b, prompts, state = make_archived_backend(
+        tmp_path, monkeypatch,
+        items=[{"sessionId": BOUND_ARCH, "running": False}],
+        archived=OSError("connection refused"))
+
+    async def fail_spawn():
+        raise AssertionError("degraded check must not spawn")
+
+    b._liaison_spawn = fail_spawn
+    receipt = json.loads(await b.dispatch("调研 X"))
+    assert receipt["status"] == "accepted"
+    assert prompts and prompts[0]["sessionId"] == BOUND_ARCH
+    assert state.exists(), "降级核验不动绑定文件"
+    for t in b._pending.values():
+        t.cancel()
+
+
+@pytest.mark.asyncio
+async def test_liaison_explicit_target_still_wakes_archived_session(
+        tmp_path, monkeypatch):
+    """显式配置路径语义不变：目标在 session.list（即使已归档）→ 照常投递
+    （显式目标 = 运维显式唤醒，刻意设计）。"""
+    explicit = "session-EXPL888"
+    b, prompts, state = make_archived_backend(
+        tmp_path, monkeypatch,
+        items=[{"sessionId": explicit, "running": False}],
+        archived=[explicit], auto_new=False, liaison_session=explicit)
+    receipt = json.loads(await b.dispatch("调研 X"))
+    assert receipt["status"] == "accepted"
+    assert prompts and prompts[0]["sessionId"] == explicit
+    for t in b._pending.values():
+        t.cancel()

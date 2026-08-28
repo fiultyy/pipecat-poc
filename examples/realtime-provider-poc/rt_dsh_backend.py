@@ -292,6 +292,25 @@ class DshBackend:
             print(f"rt_dsh_backend: liaison state save failed: {e}",
                   file=sys.stderr)
 
+    def _liaison_bound_clear(self) -> bool:
+        """Drop a stale liaison binding (bound session archived or removed
+        from the fleet registry — otherwise the next dispatch would keep
+        feeding the archived seat: ghost worker).
+
+        Returns whether a file was actually removed; absent file and
+        failures both return False (the binding is an optimization, and
+        the next delivery's archived check retries the clear).
+        """
+        try:
+            os.unlink(self._liaison_state_path())
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            print(f"rt_dsh_backend: liaison state clear failed: {e}",
+                  file=sys.stderr)
+            return False
+        return True
+
     @staticmethod
     def _liaison_envelope(name: str, version, agents_md: str, mailbox: str) -> str:
         """Byte-shape mirrors a2a-profile-server incubators/real.js
@@ -377,25 +396,75 @@ class DshBackend:
         self._liaison_bound_save(code[:4], session_id)
         return session_id
 
+    async def _archived_session_ids(self) -> set[str] | None:
+        """Archived-session ids from ``workspace.list``.
+
+        Known wire shape is a top-level ``{"items": […],
+        "archivedSessionIds": [sessionId, …]}``; the walk recurses so
+        nesting/shape drift stays tolerated. Unreachable loopback →
+        None: the caller degrades to no verification — an archive-check
+        failure must never block dispatch.
+        """
+        try:
+            value = await self._dsh_api("workspace.list", {})
+        except Exception as e:  # noqa: BLE001 — degrade signal, not fatal
+            print(f"rt_dsh_backend: workspace.list archived check failed: {e}",
+                  file=sys.stderr, flush=True)
+            return None
+        ids: set[str] = set()
+
+        def _walk(node) -> None:
+            if isinstance(node, dict):
+                raw = node.get("archivedSessionIds")
+                if isinstance(raw, list):
+                    ids.update(str(s) for s in raw if isinstance(s, str))
+                for child in node.values():
+                    _walk(child)
+            elif isinstance(node, list):
+                for child in node:
+                    _walk(child)
+
+        if isinstance(value, dict):
+            _walk(value)
+        return ids
+
     async def _liaison_ensure_sid(self, sessions_value: dict) -> str:
-        """Pick the liaison sessionId: alive spawn binding first, then the
-        alive explicit target; else auto-new spawn; else legacy explicit
-        (prompt-the-configured-session, incl. waking archived ones) when
-        auto-new is off."""
+        """Pick the liaison sessionId: an alive AND unarchived spawn
+        binding first, then the alive explicit target; else auto-new
+        spawn; else legacy explicit (prompt-the-configured-session,
+        incl. waking archived ones) when auto-new is off.
+
+        A bound sid that sits in the archived set is a dead binding
+        (archived seats must not take dispatches — ghost workers): the
+        stale state file is cleared and selection continues as if no
+        binding existed. With auto-new off that dead-ends in an error
+        naming the archived binding instead of waking it.
+        """
         items = sessions_value.get("items", [])
         alive = {s.get("sessionId") for s in items}
         bound = self._liaison_bound_load()
+        binding_archived = False
         if bound and bound in alive:
-            return bound
+            archived = await self._archived_session_ids()
+            if archived is not None and bound in archived:
+                self._liaison_bound_clear()
+                binding_archived = True
+            else:
+                return bound  # alive (archive check degraded → unverified)
         if self.liaison_mode:
             try:
                 explicit = self._liaison_sid()
             except (OSError, RuntimeError):
                 explicit = ""
             if explicit and explicit in alive:
+                # Explicit targets deliberately MAY wake archived sessions:
+                # an explicit config is an ops-chosen wake-up.
                 return explicit
         if self._liaison_auto_new():
             return await self._liaison_spawn()
+        if binding_archived:
+            raise RuntimeError(
+                "liaison 绑定会话已归档且 VOICE_LIAISON_AUTO_NEW 换新未开启")
         if self.liaison_mode:
             return self._liaison_sid()  # legacy: wake the configured session
         raise RuntimeError("no liaison session configured and auto-new off")
