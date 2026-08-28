@@ -332,6 +332,12 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
         seeded user message instead of the native ``function_call_output``
         position. Send natively here instead; when a result was sent,
         ``_process_completed_function_calls`` triggers the response itself.
+
+        Without tool results the first frame can also be a replay of an
+        exchange the server conversation already holds (speech stayed
+        server-side and was answered there): seed those items but do not
+        create a response, or the model would answer its own last reply —
+        the doubled first-turn reply.
         """
         if not self._context:
             self._context = context
@@ -341,15 +347,22 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
             )
             await self._process_completed_function_calls(send_new_results=True)
             if not has_tool_results:
-                await self._create_response()
+                messages = context.get_messages()
+                last_role = (
+                    messages[-1].get("role") if isinstance(messages[-1], dict)
+                    else getattr(messages[-1], "role", None))
+                await self._create_response(
+                    respond=bool(messages) and last_role == "user")
             return
         await super()._handle_context(context)
 
-    async def _create_response(self):
+    async def _create_response(self, respond: bool = True):
         # Same as the parent, except the session update (carrying tools) is
         # sent BEFORE seeding conversation items: DashScope only honors
         # tools registered before the items exist (probe-verified 2026-08-22;
         # updates after seeding leave the model text-mimicking the call).
+        # ``respond=False`` performs the setup/seeding only — used when the
+        # context is a replay the server already answered.
         if not self._api_session_ready:
             self._run_llm_when_api_session_ready = True
             return
@@ -380,6 +393,9 @@ class QwenOmniRealtimeLLMService(OpenAIRealtimeLLMService):
                 await self.send_client_event(evt)
 
             self._llm_needs_conversation_setup = False
+
+        if not respond:
+            return
 
         logger.debug("Creating response")
 

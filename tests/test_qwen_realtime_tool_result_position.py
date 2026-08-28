@@ -81,8 +81,8 @@ async def test_first_context_sends_tool_result_natively(monkeypatch):
         # 模拟父类行为：有新结果被发送时会自行触发响应
         return None
 
-    async def _fake_create():
-        calls.append(("create",))
+    async def _fake_create(respond=True):
+        calls.append(("create", respond))
 
     monkeypatch.setattr(svc, "_process_completed_function_calls", _fake_process)
     monkeypatch.setattr(svc, "_create_response", _fake_create)
@@ -98,12 +98,23 @@ async def test_first_context_sends_tool_result_natively(monkeypatch):
     await svc._handle_context(ctx)
     assert calls == [("process", True)]
 
-    # 首帧无 tool 结果（如网关注入终稿）→ 原生发送（无果可发）+ 显式 create
+    # 首帧无 tool 结果、末条是注入文本（终稿）→ 原生发送 + 显式 create
     calls.clear()
     svc._context = None
     ctx2 = _ctx([{"role": "user", "content": "Agent Final Message: 终稿"}])
     await svc._handle_context(ctx2)
-    assert calls == [("process", True), ("create",)]
+    assert calls == [("process", True), ("create", True)]
+
+    # 首帧是已完成回合的重放（末条 assistant——服务端已自动应答过）→
+    # 只补种不 create：create 会让模型对自己的上一句再答一次（首句双答）
+    calls.clear()
+    svc._context = None
+    ctx3 = _ctx([
+        {"role": "user", "content": "哈喽哈喽。"},
+        {"role": "assistant", "content": "你好！有什么可以帮你的吗？"},
+    ])
+    await svc._handle_context(ctx3)
+    assert calls == [("process", True), ("create", False)]
 
 
 @pytest.mark.asyncio
