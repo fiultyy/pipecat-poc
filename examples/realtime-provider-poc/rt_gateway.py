@@ -1404,7 +1404,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
     _arm_compaction(head, conv_log, compactor,
                     session=session, backend=backend, emit=bus.emit)
 
-    if getattr(backend, "liaison_session", ""):
+    if getattr(backend, "liaison_mode", False) or getattr(
+            backend, "liaison_session", ""):
         # Liaison finals come back on the voice-head dais mailbox; re-inject
         # each as a text user turn so the head speaks it (DashScope accepts
         # conversation.item.create with input_text content). Finals can land

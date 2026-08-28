@@ -207,6 +207,12 @@ class DshBackend:
     # step's work, cancel the step on steer so the message drives a fresh
     # turn immediately.
     liaison_cancel_step: bool = True
+    # Liaison auto-new lifecycle: with no usable liaison session (no alive
+    # explicit target, no alive spawn binding), spawn a fresh one via
+    # session-spawn + profile-envelope injection instead of waking an
+    # archived session. None (default) defers to VOICE_LIAISON_AUTO_NEW
+    # (production sets "1"; unset means off); True/False pin outright.
+    liaison_auto_new: bool | None = None
     # Acceptance-receipt shape override (kg/14 #2): None (default) defers
     # to VOICE_RECEIPT_SLIM read at receipt-assembly time ("0" off, else
     # on — per-call read, no restart); True/False pin the shape outright.
@@ -248,6 +254,152 @@ class DshBackend:
             raise RuntimeError(f"liaison {key!r} not in fleet.json")
         return entry["sessionId"]
 
+    # ---- liaison lifecycle: auto-new (no alive target -> fresh spawn) ----
+
+    @property
+    def liaison_mode(self) -> bool:
+        """Liaison delivery armed: explicit target set OR auto-new on."""
+        return bool(self.liaison_session) or self._liaison_auto_new()
+
+    def _liaison_auto_new(self) -> bool:
+        if self.liaison_auto_new is not None:
+            return self.liaison_auto_new
+        # Code default OFF (fanout lanes / unit tests untouched); production
+        # arms it via VOICE_LIAISON_AUTO_NEW=1 in the gateway env.
+        return os.environ.get("VOICE_LIAISON_AUTO_NEW", "0") == "1"
+
+    @staticmethod
+    def _liaison_state_path() -> str:
+        return os.environ.get(
+            "VOICE_LIAISON_STATE",
+            os.path.expanduser("~/.local/state/voice-gateway/liaison.json"))
+
+    def _liaison_bound_load(self) -> str:
+        try:
+            with open(self._liaison_state_path(), encoding="utf-8") as fh:
+                return str(json.load(fh).get("sessionId") or "")
+        except (OSError, ValueError):
+            return ""
+
+    def _liaison_bound_save(self, code: str, session_id: str) -> None:
+        path = self._liaison_state_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"code": code, "sessionId": session_id,
+                           "spawned_at": time.time()}, fh)
+        except OSError as e:  # binding is an optimization, never fatal
+            print(f"rt_dsh_backend: liaison state save failed: {e}",
+                  file=sys.stderr)
+
+    @staticmethod
+    def _liaison_envelope(name: str, version, agents_md: str, mailbox: str) -> str:
+        """Byte-shape mirrors a2a-profile-server incubators/real.js
+        (injectionPrompt + roleDoctrine('liaison')) so a respawned session
+        is indistinguishable from a pool-incubated one."""
+        doctrine = "\n".join([
+            "## Role Doctrine — liaison（对接 agent）",
+            "",
+            "- 语义收敛：上游语义指令 → 稳定指令（自包含、指代全展开、幂等可重放）。",
+            "- 两阶段应答：先回受理回执 {status:\"accepted\", run_id, ref, credentials}；"
+            "终稿以 \"Agent Final Message\": 前缀行起首。",
+            "- 信封纪律：所有对外消息 body 以 [ref:<ref>] 前缀。",
+            "- 凭证回显：【凭证…】逐字回显，不得改写。",
+            f"- 回合首动作：check-messages {mailbox} --timeout-ms "
+            "快照排空邮箱取正文（推唤醒仅触发回合，正文一律走邮箱）。",
+            "",
+        ])
+        return (f"ORCA-CB] PROFILE-INJECT] {name}@v{version}\n"
+                f"{doctrine}\n{agents_md}")
+
+    def _liaison_fetch_profile(self) -> tuple[str, str, str]:
+        """(envelope, name, version) from the a2a profile store; raises on
+        any failure — a respawn without the liaison doctrine would produce
+        garbage finals, so bootstrap failures must be loud."""
+        port = os.environ.get("A2A_PROFILE_PORT", "8790")
+        name = os.environ.get("VOICE_LIAISON_PROFILE", "vh-liaison")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/",
+            data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                             "method": "profiles/get",
+                             "params": {"name": name}}).encode(),
+            headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read()).get("result") or {}
+        if "error" in result:
+            raise RuntimeError(f"profiles/get {name}: {result['error']}")
+        prof = result.get("profile") or result
+        agents_md = str(prof.get("agentsMd") or "")
+        if not agents_md.strip():
+            raise RuntimeError(f"profile {name}: empty agentsMd")
+        mailbox = str((prof.get("profile") or {}).get("mailbox")
+                      or os.environ.get("VOICE_LIAISON_MAILBOX", "agent_liaison"))
+        version = prof.get("version", 1)
+        return (self._liaison_envelope(name, version, agents_md, mailbox),
+                name, version)
+
+    async def _liaison_spawn(self) -> str:
+        """session-spawn a fresh liaison (birth + rename + fleet register),
+        inject the profile envelope, persist the binding. Returns sessionId."""
+        bin_path = os.environ.get(
+            "VOICE_LIAISON_SPAWN_BIN",
+            os.path.expanduser("~/.dsh/maestro/bin/session-spawn"))
+        preset = os.environ.get("VOICE_LIAISON_PRESET", "maestro")
+        node = os.environ.get("VOICE_LIAISON_NODE", "vh-head-liaison")
+        purpose = os.environ.get("VOICE_LIAISON_PURPOSE", "voice-head对接")
+
+        def _run() -> str:
+            import subprocess
+            out = subprocess.run([bin_path, preset, node, purpose],
+                                 capture_output=True, text=True, timeout=60)
+            if out.returncode != 0:
+                raise RuntimeError(
+                    f"session-spawn rc={out.returncode}: "
+                    f"{(out.stderr or out.stdout).strip()[-160:]}")
+            return out.stdout
+
+        stdout = await asyncio.to_thread(_run)
+        code = stdout.strip().splitlines()[-1].strip()
+        if len(code) < 4 or code[:4].lower() != code[:4].lower() or not code[:4]:
+            raise RuntimeError(f"session-spawn produced no code: {code[:120]}")
+        fleet_path = os.path.expanduser(
+            os.environ.get("MAESTRO_FLEET", "~/.dsh/maestro/fleet.json"))
+        with open(fleet_path, encoding="utf-8") as fh:
+            entry = json.load(fh).get("fleet", {}).get(code[:4])
+        if not entry:
+            raise RuntimeError(f"spawned code {code[:4]} missing from fleet.json")
+        session_id = entry["sessionId"]
+        envelope, _name, _ver = await asyncio.to_thread(self._liaison_fetch_profile)
+        await self._dsh_api("session.prompt", {
+            "sessionId": session_id, "mode": "queue",
+            "content": [{"type": "text", "text": envelope}],
+        })
+        self._liaison_bound_save(code[:4], session_id)
+        return session_id
+
+    async def _liaison_ensure_sid(self, sessions_value: dict) -> str:
+        """Pick the liaison sessionId: alive spawn binding first, then the
+        alive explicit target; else auto-new spawn; else legacy explicit
+        (prompt-the-configured-session, incl. waking archived ones) when
+        auto-new is off."""
+        items = sessions_value.get("items", [])
+        alive = {s.get("sessionId") for s in items}
+        bound = self._liaison_bound_load()
+        if bound and bound in alive:
+            return bound
+        if self.liaison_mode:
+            try:
+                explicit = self._liaison_sid()
+            except (OSError, RuntimeError):
+                explicit = ""
+            if explicit and explicit in alive:
+                return explicit
+        if self._liaison_auto_new():
+            return await self._liaison_spawn()
+        if self.liaison_mode:
+            return self._liaison_sid()  # legacy: wake the configured session
+        raise RuntimeError("no liaison session configured and auto-new off")
+
     async def _deliver_liaison(self, ref: str, body: str) -> str:
         """Drop one DSHMSG envelope into the liaison session's turn.
 
@@ -263,8 +415,8 @@ class DshBackend:
         and the agent loop reclassifies the wake-up message as next-turn,
         starting a fresh turn immediately over the full history.
         """
-        sid = self._liaison_sid()
         sessions = await self._dsh_api("session.list", {})
+        sid = await self._liaison_ensure_sid(sessions)
         running = any(s.get("sessionId") == sid and s.get("running")
                       for s in sessions.get("items", []))
         if running and self.liaison_cancel_step:
@@ -313,7 +465,15 @@ class DshBackend:
         dispatch = DshDispatch(run_id=run_id, task_id=None, ref=ref,
                                credentials=[make_credential(ref.upper())])
         self._runs[ref] = dispatch
-        mode = await self._deliver_liaison(ref, body)
+        try:
+            mode = await self._deliver_liaison(ref, body)
+        except Exception as e:  # noqa: BLE001 — spawn/deliver failure is a
+            # terminal, reportable condition: fail the dispatch loudly rather
+            # than arming a phase-2 wait that can never complete
+            await self.bus.emit("orch.failed", {
+                "run_id": run_id, "ref": ref, "reason": f"liaison: {e}"})
+            return json.dumps({"status": "failed", "ref": ref,
+                               "summary": "对接会话不可用"}, ensure_ascii=False)
         if self._receipt_slim():
             receipt = {
                 "status": "accepted", "ref": ref,
@@ -356,7 +516,7 @@ class DshBackend:
         tasks = _parse_dag_subtasks(subtasks_json)
         if not tasks:
             return CLARIFY_NOTE
-        if self.liaison_session:
+        if self.liaison_mode:
             run_id = await self.lane.create_run(f"[voice-head-plan] {objective[:200]}")
             body = (f"PLAN {objective} run={run_id} || "
                     + json.dumps([asdict(t) for t in tasks],
@@ -375,7 +535,7 @@ class DshBackend:
         """
         ref = "vh-" + uuid.uuid4().hex[:8]
         bound = await self._bind_profile(profile)
-        if self.liaison_session:
+        if self.liaison_mode:
             run_id = await self.lane.create_run(f"[voice-head] {raw_intent[:200]}")
             body = f"INTENT {raw_intent} run={run_id}"
             if profile:
@@ -820,7 +980,7 @@ class DshBackend:
         not just that it is."""
         from rt_dsh_lane import DaisLaneError
 
-        if self.liaison_session:
+        if self.liaison_mode:
             body = f"STATUS run={run_id}" if run_id else "STATUS"
             return await self._liaison_roundtrip(body, run_id)
         status = await self.lane.check_status(run_id)
@@ -872,7 +1032,7 @@ class DshBackend:
         task = self._pending.get(ref_or_run) or self._pending.get(run_id)
         if task and not task.done():
             task.cancel()
-        if self.liaison_session:
+        if self.liaison_mode:
             body = f"CANCEL {ref_or_run} run={run_id}"
             return await self._liaison_roundtrip(body, run_id)
         # live DAG dispatches fail individually (best-effort; the pending

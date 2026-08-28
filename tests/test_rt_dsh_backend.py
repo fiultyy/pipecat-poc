@@ -797,3 +797,126 @@ async def test_phase2_lane_errors_until_deadline_emit_orch_failed(captured):
     assert isinstance(fails[0]["ts"], float)
     assert not any(k == "orch.done" for k, _ in captured["events"])
     assert not captured["finals"]
+
+
+# ---- liaison auto-new lifecycle（无可用对接会话 → 新拉，不唤醒归档） ----
+
+
+@pytest.mark.asyncio
+async def test_liaison_auto_new_spawns_when_no_target(monkeypatch, tmp_path):
+    """无显式目标、无绑定：spawn 拉新（信封注入 + 绑定落盘），派发走新 sid。"""
+    state = tmp_path / "liaison.json"
+    monkeypatch.setenv("VOICE_LIAISON_STATE", str(state))
+    prompts: list[dict] = []
+    spawned: list[tuple] = []
+
+    async def fake_spawn():
+        spawned.append((True,))
+        b._liaison_bound_save("new1", "session-NEW1234")
+        return "session-NEW1234"
+
+    async def fake_dsh_api(method, payload):
+        if method == "session.prompt":
+            prompts.append(payload)
+        return {"items": []} if method == "session.list" else {}
+
+    b = DshBackend(lane=make_lane({"create-run": ["run_<redacted>\n"]}), bus=EventBus(),
+                   liaison_auto_new=True)
+    b._dsh_api = fake_dsh_api
+    b._liaison_spawn = fake_spawn
+    receipt = json.loads(await b.dispatch("调研 X"))
+    assert receipt["status"] == "accepted"
+    assert spawned == [(True,)]
+    assert prompts and prompts[0]["sessionId"] == "session-NEW1234"
+    assert json.loads(state.read_text())["sessionId"] == "session-NEW1234"
+
+
+@pytest.mark.asyncio
+async def test_liaison_auto_new_prefers_alive_binding(monkeypatch, tmp_path):
+    """绑定会话仍在 → 直接复用，不重复 spawn。"""
+    state = tmp_path / "liaison.json"
+    state.write_text(json.dumps({"code": "abcd",
+                                 "sessionId": "session-BOUND99"}))
+    monkeypatch.setenv("VOICE_LIAISON_STATE", str(state))
+    prompts: list[dict] = []
+
+    async def fail_spawn():
+        raise AssertionError("should not spawn")
+
+    async def fake_dsh_api(method, payload):
+        if method == "session.prompt":
+            prompts.append(payload)
+        return ({"items": [{"sessionId": "session-BOUND99", "running": False}]}
+                if method == "session.list" else {})
+
+    b = DshBackend(lane=make_lane({"create-run": ["run_<redacted>\n"]}), bus=EventBus(),
+                   liaison_auto_new=True)
+    b._dsh_api = fake_dsh_api
+    b._liaison_spawn = fail_spawn
+    await b.dispatch("调研 X")
+    assert prompts and prompts[0]["sessionId"] == "session-BOUND99"
+
+
+@pytest.mark.asyncio
+async def test_liaison_auto_new_explicit_alive_wins(monkeypatch):
+    """显式目标在跑 → 用显式目标（不 spawn、不看绑定）。"""
+    prompts: list[dict] = []
+
+    async def fail_spawn():
+        raise AssertionError("should not spawn")
+
+    async def fake_dsh_api(method, payload):
+        if method == "session.prompt":
+            prompts.append(payload)
+        return ({"items": [{"sessionId": "session-EXPL777", "running": False}]}
+                if method == "session.list" else {})
+
+    b = DshBackend(lane=make_lane({"create-run": ["run_<redacted>\n"]}), bus=EventBus(),
+                   liaison_session="session-EXPL777", liaison_auto_new=True)
+    b._dsh_api = fake_dsh_api
+    b._liaison_spawn = fail_spawn
+    await b.dispatch("调研 X")
+    assert prompts and prompts[0]["sessionId"] == "session-EXPL777"
+
+
+@pytest.mark.asyncio
+async def test_liaison_spawn_failure_fails_dispatch(monkeypatch):
+    """spawn 失败 → 回 failed 回执 + orch.failed（reason 带 liaison:），
+    不挂 phase-2 等待。"""
+
+    async def fake_spawn():
+        raise RuntimeError("session-spawn rc=1: boom")
+
+    events: list[tuple] = []
+
+    async def fake_emit(kind, payload):
+        events.append((kind, payload))
+
+    async def fake_dsh_api(method, payload):
+        return {"items": []} if method == "session.list" else {}
+
+    b = DshBackend(lane=make_lane({"create-run": ["run_<redacted>\n"]}),
+                   bus=EventBus(), liaison_auto_new=True)
+    b._dsh_api = fake_dsh_api
+    b._liaison_spawn = fake_spawn
+    b.bus.emit = fake_emit
+    receipt = json.loads(await b.dispatch("调研 X"))
+    assert receipt["status"] == "failed" and receipt["ref"].startswith("vh-")
+    fails = [p for k, p in events if k == "orch.failed"]
+    assert len(fails) == 1 and "liaison:" in fails[0]["reason"]
+    assert not b._pending
+
+
+def test_liaison_mode_property(monkeypatch):
+    """liaison_mode = 显式目标 or auto-new；两者皆无 → fanout 路径。"""
+    monkeypatch.delenv("VOICE_LIAISON_AUTO_NEW", raising=False)
+    lane = make_lane({})
+    assert DshBackend(lane=lane, bus=EventBus()).liaison_mode is False
+    assert DshBackend(lane=lane, bus=EventBus(),
+                      liaison_auto_new=True).liaison_mode is True
+    assert DshBackend(lane=lane, bus=EventBus(),
+                      liaison_session="session-x").liaison_mode is True
+    monkeypatch.setenv("VOICE_LIAISON_AUTO_NEW", "1")
+    assert DshBackend(lane=lane, bus=EventBus()).liaison_mode is True
+    monkeypatch.setenv("VOICE_LIAISON_AUTO_NEW", "0")
+    assert DshBackend(lane=lane, bus=EventBus()).liaison_mode is False
