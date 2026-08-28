@@ -1926,3 +1926,256 @@ async def test_head_switch_rejected_when_env_pinned(tmp_path, monkeypatch):
         assert err["code"] == "bad_request" and "pinned" in err["msg"]
         await close_ws(ws)
     rt_gateway._reset_head_registry()
+
+
+# ---- M3. 席位状态简报（PR9）：fleet.brief → _fleet_brief_payload ----
+# 全程零网络：session.list 以 _dsh_api 替身注入（wire 形状 {items:[…]}），
+# fleet.json/liaison.json 指 tmp 路径（复用 _seed_fleet）。
+
+
+def _session_item(session_id, *, running=True, title="", long_task=None,
+                  updated_ms=None) -> dict:
+    """session.list 条目替身（真实 wire 形状；join 面外字段从简）。"""
+    import time
+
+    values: dict = {}
+    if title:
+        values["title"] = title
+    if long_task is not None:
+        values["longTask"] = long_task
+    return {
+        "sessionId": session_id,
+        "updatedAt": (updated_ms if updated_ms is not None
+                      else int(time.time() * 1000)),
+        "running": running,
+        "blank": False,
+        "cwd": "/tmp/x",
+        "agentPreset": "standard",
+        "projections": {"asOfSeq": 7, "values": values},
+    }
+
+
+def _mock_session_list(monkeypatch, items) -> list[tuple]:
+    """替身 loopback session.list：记录 (method, payload)、回 {items}。"""
+    calls: list[tuple] = []
+
+    async def _fake(method: str, payload: dict):
+        calls.append((method, dict(payload)))
+        return {"items": items}
+
+    monkeypatch.setattr(rt_gateway, "_dsh_api", _fake)
+    return calls
+
+
+async def _fleet_brief(ws, req_id="b-1") -> dict:
+    await ws.send_str(json.dumps({"t": "fleet.brief", "req_id": req_id}))
+    return await recv_until(ws, lambda d: d.get("t") == "fleet.brief.result")
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_payload_join_live_seat_fields(tmp_path, monkeypatch):
+    """join 口径：在列席位 live=true，running/title/task/idle_s 取条目；
+    idle_s=(now-updatedAt)/1000（updatedAt 毫秒纪元）下限 0。"""
+    import time
+
+    _seed_fleet(tmp_path, monkeypatch)
+    now_ms = int(time.time() * 1000)
+    items = [
+        _session_item("session-<redacted>",
+                      running=True, title="封装统一client",
+                      long_task={"task": {"phase": "executing"}},
+                      updated_ms=now_ms - 90_000),
+        _session_item("session-<redacted>",
+                      running=False, title="",
+                      long_task={"task": {"phase": "paused"}},
+                      updated_ms=now_ms + 5_000),  # 时钟偏前 → 钳 0
+    ]
+    calls = _mock_session_list(monkeypatch, items)
+    payload = await rt_gateway._fleet_brief_payload()
+    assert calls == [("session.list", {})]
+    assert set(payload) == {"seats"}
+    seats = {s["id"]: s for s in payload["seats"]}
+    aa01 = seats["aa01"]
+    assert set(aa01) == {"id", "node", "role", "status", "live", "running",
+                         "title", "task", "idle_s"}
+    assert aa01["node"] == "node-<redacted>" and aa01["role"] == "worker"
+    assert aa01["status"] == "active" and aa01["live"] is True
+    assert aa01["running"] is True and aa01["title"] == "封装统一client"
+    assert aa01["task"] == "executing"
+    assert 89 <= aa01["idle_s"] <= 91
+    bb02 = seats["bb02"]
+    assert bb02["live"] is True and bb02["running"] is False
+    assert bb02["title"] == "" and bb02["task"] == "paused"
+    assert bb02["idle_s"] == 0
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_payload_dead_session_and_retired_seats(tmp_path, monkeypatch):
+    """不在 session.list → live=false、running=false、title/task 空、
+    idle_s=null；fleet status 已 inactive/released 的退役条目照常列出。"""
+    import copy
+
+    seed = copy.deepcopy(FLEET_SEED)
+    seed["fleet"]["dd04"] = {
+        "sessionId": "session-<redacted>",
+        "role": "worker", "node": "vh-old", "status": "released",
+        "spawnedAt": "2026-08-20T09:00:00.000000+00:00",
+    }
+    _seed_fleet(tmp_path, monkeypatch, seed)
+    _mock_session_list(monkeypatch, [])  # dsh 无任何活会话
+    payload = await rt_gateway._fleet_brief_payload()
+    seats = {s["id"]: s for s in payload["seats"]}
+    assert set(seats) == {"aa01", "bb02", "cc03", "dd04"}
+    for code, entry in seed["fleet"].items():
+        assert seats[code] == {
+            "id": code, "node": entry["node"], "role": entry["role"],
+            "status": entry["status"], "live": False, "running": False,
+            "title": "", "task": "", "idle_s": None,
+        }
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_payload_degrades_without_dsh(tmp_path, monkeypatch):
+    """loopback 失败 → 降级 {seats:[纯席位字段], note}（席位键集恰四）。"""
+    _seed_fleet(tmp_path, monkeypatch)
+
+    async def _boom(method, payload):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(rt_gateway, "_dsh_api", _boom)
+    payload = await rt_gateway._fleet_brief_payload()
+    assert set(payload) == {"seats", "note"}
+    assert payload["note"] == "dsh 状态不可达，仅席位表"
+    assert payload["seats"] == [
+        {"id": "aa01", "node": "node-<redacted>", "role": "worker",
+         "status": "active"},
+        {"id": "bb02", "node": "vh-head-liaison", "role": "worker",
+         "status": "active"},
+        {"id": "cc03", "node": "vh-m5-closeout-supervisor-000501",
+         "role": "supervisor", "status": "active"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_payload_degrades_on_timeout(tmp_path, monkeypatch):
+    """session.list 挂起 → wait_for 超时同走降级（钳短超时注入）。"""
+    _seed_fleet(tmp_path, monkeypatch)
+    monkeypatch.setattr(rt_gateway, "BRIEF_DSH_TIMEOUT_S", 0.05)
+
+    async def _hang(method, payload):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(rt_gateway, "_dsh_api", _hang)
+    payload = await rt_gateway._fleet_brief_payload()
+    assert payload["note"] == "dsh 状态不可达，仅席位表"
+    assert {s["id"] for s in payload["seats"]} == {"aa01", "bb02", "cc03"}
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_payload_empty_fleet_table(tmp_path, monkeypatch):
+    """空席位表 → {"seats": []}（loopback 照调，join 不短路）。"""
+    _seed_fleet(tmp_path, monkeypatch, {"port": 3080, "fleet": {}})
+    calls = _mock_session_list(monkeypatch, [])
+    assert await rt_gateway._fleet_brief_payload() == {"seats": []}
+    assert calls == [("session.list", {})]
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_payload_unreadable_fleet_raises(tmp_path, monkeypatch):
+    """fleet.json 缺席/坏 JSON/无 fleet 表 → 抛（调用方回 internal 错误帧）。"""
+    _mock_session_list(monkeypatch, [])
+    monkeypatch.setenv("MAESTRO_FLEET", str(tmp_path / "nope" / "fleet.json"))
+    with pytest.raises(OSError):
+        await rt_gateway._fleet_brief_payload()
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("MAESTRO_FLEET", str(bad))
+    with pytest.raises(ValueError):
+        await rt_gateway._fleet_brief_payload()
+    notable = tmp_path / "notable.json"
+    notable.write_text(json.dumps({"port": 3080}), encoding="utf-8")
+    monkeypatch.setenv("MAESTRO_FLEET", str(notable))
+    with pytest.raises(ValueError):
+        await rt_gateway._fleet_brief_payload()
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_control_frame_roundtrip(tmp_path, monkeypatch):
+    """fleet.brief 全链路（observe 连接）：回包键集 {t,req_id,seats}、
+    req_id 回显、席位字段原样；在跑/死会话同帧可见。"""
+    _seed_fleet(tmp_path, monkeypatch)
+    item = _session_item("session-<redacted>",
+                         running=True, title="db05 在跑封装统一client",
+                         long_task={"task": {"phase": "executing"}})
+    _mock_session_list(monkeypatch, [item])
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await observe_handshake(ws)  # 席位控制走 observe 连接（同 cleanup）
+        got = await _fleet_brief(ws, req_id="brief-1")
+        assert set(got) == {"t", "req_id", "seats"}
+        assert got["req_id"] == "brief-1"
+        seats = {s["id"]: s for s in got["seats"]}
+        assert seats["aa01"]["live"] is True and seats["aa01"]["running"] is True
+        assert seats["aa01"]["title"] == "db05 在跑封装统一client"
+        assert seats["aa01"]["task"] == "executing"
+        assert seats["bb02"]["live"] is False and seats["bb02"]["idle_s"] is None
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_degraded_note_over_ws(tmp_path, monkeypatch):
+    """loopback 不可达 → 回包带 note、席位纯四字段（降级形态上链路）。"""
+    _seed_fleet(tmp_path, monkeypatch)
+
+    async def _boom(method, payload):
+        raise RuntimeError("session.list: down")
+
+    monkeypatch.setattr(rt_gateway, "_dsh_api", _boom)
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await observe_handshake(ws)
+        got = await _fleet_brief(ws, req_id="brief-2")
+        assert set(got) == {"t", "req_id", "seats", "note"}
+        assert got["note"] == "dsh 状态不可达，仅席位表"
+        assert set(got["seats"][0]) == {"id", "node", "role", "status"}
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_unreadable_fleet_internal_error_frame(tmp_path, monkeypatch):
+    """fleet.json 读不了 → error internal 帧（非静默断流）。"""
+    monkeypatch.setenv("MAESTRO_FLEET", str(tmp_path / "nope" / "fleet.json"))
+    _mock_session_list(monkeypatch, [])
+    async with GatewayFixture() as fx:
+        ws = await fx.ws()
+        await handshake(ws)
+        await ws.send_str(json.dumps({"t": "fleet.brief", "req_id": "x"}))
+        err = await recv_json(ws)
+        assert err["t"] == "error" and err["code"] == "internal"
+        await close_ws(ws)
+
+
+@pytest.mark.asyncio
+async def test_realtime_head_wires_fleet_brief_resource(tmp_path, monkeypatch):
+    """build_realtime_head 的 app_resources 携带 fleet_brief callable
+    （=模块级 _fleet_brief_payload，与 workspace_root 同形注入）。"""
+    import types
+
+    wired: dict = {}
+    _fake_head_build_module(monkeypatch, wired)
+    monkeypatch.setenv("VOICE_HEAD_PROFILES", str(tmp_path / "no-heads.json"))
+    rt_gateway._reset_head_registry()
+
+    async def _noop(*a, **k):
+        pass
+
+    session = types.SimpleNamespace(conv_id="s-brief", send_audio=_noop,
+                                    drop_pending_audio=_noop)
+    backend = types.SimpleNamespace(liaison_session="")
+    adapter = await rt_gateway.build_realtime_head(session, EventBus(), backend)
+    await adapter.stop()
+    rt_gateway._reset_head_registry()
+
+    res = wired["app_resources"]
+    assert callable(res["fleet_brief"])
+    assert res["fleet_brief"] is rt_gateway._fleet_brief_payload

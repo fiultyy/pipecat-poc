@@ -4,7 +4,7 @@
 
 """Head tool surface over DshBackend (WS1 W1.4; docs/kg/01-ws1-head-dsh.md §5).
 
-Twelve tools, docstring-as-schema (same convention as rt_orchestrator):
+Thirteen tools, docstring-as-schema (same convention as rt_orchestrator):
 
 - ``dispatch_intent(raw_intent)`` — phase-1 receipt now; the phase-2
   final arrives later as a context re-injection carrying the
@@ -23,6 +23,9 @@ Twelve tools, docstring-as-schema (same convention as rt_orchestrator):
   (glob / regex content search / windowed file read).
 - ``edit_file/write_file`` — literal text edits and whole-file writes,
   confined to the workspace root.
+- ``fleet_brief()`` — seat-status briefing: one line per seat from
+  fleet.json joined with live dsh session state, via the gateway-injected
+  ``app_resources["fleet_brief"]`` callable.
 
 All handlers resolve the backend from ``params.app_resources["dsh_backend"]``
 and the session store from ``params.app_resources["voice_store"]`` so the
@@ -62,6 +65,7 @@ DSH_TOOLS_DOCTRINE = """# Persona and Role
 - read_file：读某个文件的一段内容；超长文件用 offset/limit 分段，先看结构再定位到段。
 - edit_file：改文件中的一处文字——old_string 必须与文件现有内容完全一致；多处相同且确要全改才用 replace_all，否则换更长的 old_string 精确定位。
 - write_file：整文件新建或整体重写，仅在用户明确要求时用。
+- fleet_brief：用户问席位/在坐代理的状态时调用，返回各席位一行状态（在不在、跑没跑、在干什么）。
 - cancel_run：取消一个编排任务，参数用回执里的 ref（vh-…）。用户说"取消刚才那个/第一个调研"时，由你从上下文里的回执解析出 ref，不让用户念编号。
 - remain_silent：当最好的回应是不说话时调用（如控制消息后的确认），无用户可见效果。
 - 闲聊、问候、一句话可答的常识直接回答。
@@ -71,6 +75,7 @@ DSH_TOOLS_DOCTRINE = """# Persona and Role
 - 终稿与完成通报：无论以 "Agent Final Message" 开头的全文注入、还是以 [编排通报] 开头的 JSON 消息到达，都只回一个状态，如"任务2完成了"、"完成了"或"任务2失败了"。不播报正文、不讲要点；用户追问时再讲。
 - 连续工具调用（如 list_bodies 后再 read_body）：中间步骤不出声；全部取到所需信息后一次性作答。
 - 文件工具（find_files/grep_files/read_file/edit_file/write_file）：读取类是中间步骤不出声，取到后按用户所问一句话作答；edit_file/write_file 完成只回一个状态（如"改好了"，可带一句改了什么），失败只说原因（如"没找到这处"），不念文件内容、不倒 diff。找不到就说没找到，不编造。
+- fleet_brief：一句话报总量与在跑的（如3个席位1个在跑，db05在跑封装统一client），不逐条念长表，简报不可用就说暂不可用。
 - query_status/read_body/list_bodies：状态问句先一句 counts（如"2个完成，1个在跑"）；read_body/list_bodies 结果按用户所问讲，不整段倒正文，长文先讲结构与要点，用户要哪段再用 max_chars/from_tail 分段取、逐段展开。查无（miss）就说目前没有这条任务，台账不可用（error/note）就说详情暂不可用，不编造内容。
 - 编号协议：单任务时不念编号；多任务并存或用户要核对时，用「任务N」（N 是回执/通报/台账里的编号）区分。工具调用一律使用你上下文里的完整 ref，与念法无关。
 - 不添加执行层没有的事实；转述终稿正文要忠实，长文先讲结构与要点，用户要求再逐段展开。
@@ -589,10 +594,34 @@ async def write_file_tool(params, path: str, content: str):
     await params.result_callback(await asyncio.to_thread(run))
 
 
+# ---- 席位状态简报（PR9；gateway 注入的 callable，head 不自连 dsh）----
+
+
+async def fleet_brief_tool(params):
+    """查询席位状态简报：各席位一行状态（在不在、跑没跑、在干什么）。
+
+    返回 gateway 注入的 ``fleet_brief`` callable 的 payload 原样（形如
+    {"seats":[…]}，席位形如 {"id","node","role","status","live",
+    "running","title","task","idle_s"}；dsh 状态不可达时附 note 降级）。
+    """
+    brief = params.app_resources.get("fleet_brief")
+    if not callable(brief):
+        await params.result_callback({"status": "error", "reason": "席位简报不可用"})
+        return
+    try:
+        payload = await brief()
+    except Exception as e:  # noqa: BLE001 — C 降级：简报失败就说失败，不炸
+        await params.result_callback(
+            {"status": "error", "reason": f"席位简报失败：{e}"})
+        return
+    await params.result_callback(payload)
+
+
 def dsh_head_tools() -> list:
-    """The twelve tool functions, ready for LLMContext(tools=...)."""
+    """The thirteen tool functions, ready for LLMContext(tools=...)."""
     return [dispatch_intent_tool, dispatch_plan_tool, query_status_tool,
             read_body_tool, list_bodies_tool, cancel_run_tool,
             remain_silent_tool,
             find_files_tool, grep_files_tool, read_file_tool,
-            edit_file_tool, write_file_tool]
+            edit_file_tool, write_file_tool,
+            fleet_brief_tool]

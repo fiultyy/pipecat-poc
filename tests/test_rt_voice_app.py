@@ -11,9 +11,11 @@
 - Pure render helpers: fleet_rows / orch_tree_lines / turn_line plus the
   detail-tab helpers (rows from push, ref-dedup merge, notice lines, notify
   label, ack gray line, error line) and the tab-consolidation helpers
-  (cleanup_request frame, cleanup_result_line summary, tickets_text).
+  (cleanup_request frame, cleanup_result_line summary, tickets_text), plus
+  the fleet brief helpers (request frame, per-seat status lines).
 - Tab assembly smoke (real tkinter widgets, no network, no mainloop):
-  detail/task tab and the fleet cleanup control face.
+  detail/task tab and the fleet cleanup control face, plus the fleet brief
+  face (button, read-only panel, result rendering).
 """
 
 import asyncio
@@ -38,6 +40,8 @@ from rt_voice_app import (  # noqa: E402
     detail_ack_line,
     detail_error_line,
     detail_rows_from_push,
+    fleet_brief_lines,
+    fleet_brief_request,
     fleet_rows,
     head_list_request,
     head_names_from_list,
@@ -658,3 +662,160 @@ def test_fleet_rows_real_tailer_payload_shape():
     # 畸形不抛
     assert fleet_rows({}) == [] and fleet_rows({"fleet": "corrupt"}) == []
     assert fleet_rows({"fleet": {"fleet": "corrupt"}}) == []
+
+
+# ---- 席位简报（fleet.brief 纯函数 + 席位页签装配）----
+
+
+def test_fleet_brief_request_frame():
+    assert fleet_brief_request("r-1") == {"t": "fleet.brief", "req_id": "r-1"}
+
+
+def test_fleet_brief_lines_seats_and_idle_buckets():
+    """一行一席：在跑/没跑、title 空省段、live=false 尾注会话已死且无
+    闲置段、idle 分钟/小时/天三档（含档位边界）。"""
+    result = {"t": "fleet.brief.result", "req_id": "r-1", "seats": [
+        {"id": "db05", "node": "vh-head-liaison", "role": "worker",
+         "status": "active", "live": True, "running": True,
+         "title": "封装统一client", "task": "running", "idle_s": 300},
+        {"id": "3103", "node": "node-<redacted>", "role": "worker",
+         "status": "active", "live": True, "running": False,
+         "title": "", "task": "", "idle_s": 7200},
+        {"id": "20d0", "node": "voice-head", "role": "orchestrator",
+         "status": "released", "live": False, "running": False,
+         "title": "", "task": "", "idle_s": None},
+    ]}
+    assert fleet_brief_lines(result) == [
+        "db05 · vh-head-liaison · 在跑 · 封装统一client · 5分钟前动过",
+        "3103 · node-<redacted> · 没跑 · 2小时前",
+        "20d0 · voice-head · 没跑 (会话已死)",
+    ]
+    # idle 三档边界：分钟含 0 与 59:59；小时 1h/23:59:59；天 1d/3d
+    edges = {"seats": [
+        {"id": "x1", "node": "n", "live": True, "running": True, "idle_s": 0},
+        {"id": "x2", "node": "n", "live": True, "running": True, "idle_s": 3599},
+        {"id": "x3", "node": "n", "live": True, "running": True, "idle_s": 3600},
+        {"id": "x4", "node": "n", "live": True, "running": True, "idle_s": 86399},
+        {"id": "x5", "node": "n", "live": True, "running": True, "idle_s": 86400},
+        {"id": "x6", "node": "n", "live": True, "running": True, "idle_s": 3 * 86400},
+    ]}
+    assert fleet_brief_lines(edges) == [
+        "x1 · n · 在跑 · 0分钟前动过",
+        "x2 · n · 在跑 · 59分钟前动过",
+        "x3 · n · 在跑 · 1小时前",
+        "x4 · n · 在跑 · 23小时前",
+        "x5 · n · 在跑 · 1天前",
+        "x6 · n · 在跑 · 3天前",
+    ]
+
+
+def test_fleet_brief_lines_note_and_malformed():
+    # note（loopback 降级仅席位表）首行前插 ⚠
+    degraded = {"seats": [
+        {"id": "db05", "node": "n", "live": True, "running": True,
+         "title": "t", "task": "", "idle_s": 30}],
+        "note": "dsh 状态不可达，仅席位表"}
+    assert fleet_brief_lines(degraded) == [
+        "⚠ dsh 状态不可达，仅席位表",
+        "db05 · n · 在跑 · t · 0分钟前动过",
+    ]
+    # 空席位表合法；非 dict 条目与不可读 idle 值防御性跳过
+    assert fleet_brief_lines({"seats": []}) == []
+    assert fleet_brief_lines({"seats": [], "note": "x"}) == ["⚠ x"]
+    assert fleet_brief_lines({"seats": ["x", None]}) == []
+    assert fleet_brief_lines({"seats": [
+        {"id": "x", "node": "n", "live": True, "running": True,
+         "idle_s": "corrupt"}]}) == ["x · n · 在跑"]
+    # 畸形回包 → 一行占位，不抛
+    assert fleet_brief_lines({}) == ["⚠ 简报回包不可读"]
+    assert fleet_brief_lines({"seats": "corrupt"}) == ["⚠ 简报回包不可读"]
+    assert fleet_brief_lines(None) == ["⚠ 简报回包不可读"]
+
+
+class _StubObsLink:
+    """观测连接替身：存活检查恒真、send_request 只记录出站帧（不触网）。"""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+        self._thread = self            # 存活检查走 obs_link._thread.is_alive()
+
+    def is_alive(self):
+        return True
+
+    def send_request(self, req: dict):
+        self.sent.append(req)
+
+
+def test_fleet_brief_tab_assembly_smoke():
+    """席位简报面装配冒烟（真 tkinter、无网络、无 mainloop）：简报按钮+
+    只读小面板挂在席位页；观测未开提示早退；stub 连接下出站帧形状与
+    req_id 唯一；fleet.brief.result 入 obs_q 后 _drain_obs 渲染摘要行与
+    逐行。无显示环境跳过。"""
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+    except Exception as e:  # noqa: BLE001 — headless 环境
+        pytest.skip(f"no display for tkinter: {e}")
+    root.withdraw()
+    app = None
+    try:
+        app = App(root, "ws://127.0.0.1:8765/ws", "", False)
+        root.update()
+
+        # 简报按钮在清理条上；只读小面板挂席位页（内嵌一层 plain Frame）
+        assert app.fleet_brief_btn.winfo_exists()
+        assert str(app.fleet_brief_btn.cget("text")) == "简报"
+        assert app.fleet_brief_log.master.master is app.fleet_tab
+        assert str(app.fleet_brief_log.cget("state")) == "disabled"
+        assert int(app.fleet_brief_log.cget("height")) == 6
+
+        # 观测未开 → 提示早退（不触网）
+        app._fleet_brief()
+        assert "观测连接未开" in app.fleet_note_var.get()
+
+        # stub 连接：出站 fleet.brief 帧 + req_id 唯一（seq 递增）
+        app.obs_link = _StubObsLink()
+        app._fleet_brief()
+        app._fleet_brief()
+        reqs = [r for r in app.obs_link.sent if r.get("t") == "fleet.brief"]
+        assert len(reqs) == 2
+        assert all(set(r.keys()) == {"t", "req_id"} for r in reqs)
+        assert reqs[0]["req_id"] != reqs[1]["req_id"]
+        assert app.fleet_note_var.get() == "已请求席位简报…"
+
+        # 回包入 obs_q → _drain_obs：摘要行 + 面板逐行
+        app.obs_q.put({"t": "fleet.brief.result", "req_id": reqs[1]["req_id"],
+                       "seats": [
+                           {"id": "db05", "node": "vh-head-liaison",
+                            "role": "worker", "status": "active", "live": True,
+                            "running": True, "title": "封装统一client",
+                            "task": "running", "idle_s": 300},
+                           {"id": "3103", "node": "node-<redacted>",
+                            "role": "worker", "status": "active", "live": True,
+                            "running": False, "title": "", "task": "",
+                            "idle_s": 7200},
+                           {"id": "20d0", "node": "voice-head",
+                            "role": "orchestrator", "status": "released",
+                            "live": False, "running": False, "title": "",
+                            "task": "", "idle_s": None},
+                       ]})
+        app._drain_obs()
+        root.update()
+        assert app.fleet_note_var.get() == "3 席位 · 1 在跑"
+        panel = app.fleet_brief_log.get("1.0", "end")
+        assert "db05 · vh-head-liaison · 在跑 · 封装统一client · 5分钟前动过" in panel
+        assert "3103 · node-<redacted> · 没跑 · 2小时前" in panel
+        assert "20d0 · voice-head · 没跑 (会话已死)" in panel
+
+        # 畸形回包 → 摘要行降级文案 + 面板占位行
+        app.obs_q.put({"t": "fleet.brief.result", "req_id": "r-x",
+                       "seats": "corrupt"})
+        app._drain_obs()
+        root.update()
+        assert app.fleet_note_var.get() == "席位简报回包不可读"
+        assert "⚠ 简报回包不可读" in app.fleet_brief_log.get("1.0", "end")
+    finally:
+        if app is not None and getattr(app, "ptt_listener", None):
+            app.ptt_listener.stop()
+        root.destroy()

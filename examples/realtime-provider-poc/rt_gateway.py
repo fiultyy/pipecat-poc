@@ -30,6 +30,10 @@
   先经 dsh loopback 真死会话（已死容忍），再 fleet.json 原子摘条目；
   mode=release 只摘条目。回包 ``fleet.cleanup.result{req_id,results}``，
   当前 liaison 绑定席位附 ``note:active-liaison``（不阻断）
+- 席位状态简报（PR9）— ``fleet.brief``：fleet.json 席位表 join dsh
+  ``session.list`` 活性（live/running/title/task/idle_s）；loopback 不可达
+  降级纯席位表附 note，回包 ``fleet.brief.result{req_id,seats[,note]}``；
+  并以 ``fleet_brief`` app resource 暴露给 head 工具
 
 帧协议（§1）：JSON 文本帧（control/event）+ 二进制帧（raw PCM16LE/16k/mono，
 推荐 20ms=640B）。握手序：``auth`` → ``auth.ok{session_id}`` →
@@ -289,6 +293,8 @@ class WsSession:
             await self._on_body_get(data)
         elif t == "fleet.cleanup":
             await self._on_fleet_cleanup(data)
+        elif t == "fleet.brief":
+            await self._on_fleet_brief(data)
         elif t == "head.list":
             await self._on_head_list(data)
         elif t == "head.switch":
@@ -502,6 +508,24 @@ class WsSession:
             "t": "fleet.cleanup.result",
             "req_id": data.get("req_id"),
             "results": results,
+        })
+
+    async def _on_fleet_brief(self, data: dict) -> None:
+        """fleet.brief → ``fleet.brief.result{req_id, seats[, note]}``（PR9）.
+
+        payload 组装在模块级 :func:`_fleet_brief_payload`（与 head 工具的
+        ``fleet_brief`` app resource 同一实现）；fleet.json 读不了由其抛出，
+        此处回 internal 错误帧。
+        """
+        try:
+            payload = await _fleet_brief_payload()
+        except (OSError, ValueError) as e:
+            await self._send_error("internal", f"fleet.json unreadable: {e}"[:160])
+            return
+        await self._reply({
+            "t": "fleet.brief.result",
+            "req_id": data.get("req_id"),
+            **payload,
         })
 
     # ---- control: head 配置面（PR8：多 head 配置，激活单例）----
@@ -1340,6 +1364,93 @@ def _liaison_bound_code() -> str:
         return ""
 
 
+# ---- 席位状态简报（PR9）：fleet.json join session.list 活性 ----
+
+SESSION_LIST_METHOD = "session.list"
+# session.list loopback 预算：_dsh_api 自身 urlopen 30s 兜底太宽，简报是
+# 交互面（用户在等回话），超时即降级纯席位表
+BRIEF_DSH_TIMEOUT_S = 8.0
+BRIEF_DSH_NOTE = "dsh 状态不可达，仅席位表"
+
+
+def _brief_task_status(long_task: Any) -> str:
+    """longTask 投影里的任务状态字段（实测形态 ``{"task": {"phase": …},
+    "roundsStarted": …}``，无长任务会话为 ``null``）。
+
+    防御式取值：顶层与嵌套 ``task`` 各依 status/phase/state 序取首个非空
+    串，取不到空串，绝不抛。
+    """
+    if not isinstance(long_task, dict):
+        return ""
+    for scope in (long_task, long_task.get("task")):
+        if not isinstance(scope, dict):
+            continue
+        for key in ("status", "phase", "state"):
+            value = scope.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+async def _fleet_brief_payload() -> dict:
+    """席位状态简报 payload（PR9）：fleet.json 席位表 join dsh session.list.
+
+    join 口径：sessionId 出现在 session.list 条目 → live=true、running/title/
+    task/idle_s 取该条目（title=projections.values.title 缺则空串、task=
+    longTask 投影状态、idle_s=(now-updatedAt)/1000 下限 0，updatedAt 为
+    毫秒纪元）；不在列表（含 fleet status 已 inactive/released/verified 的
+    退役条目）→ live=false、running=false、title/task 空、idle_s=null。
+    loopback 失败/超时（wait_for 8s）→ 降级 ``{seats:[纯席位字段], note}``；
+    fleet.json 读不了 → 抛（调用方回 internal 错误帧）。
+    """
+    path = _fleet_path()
+    with open(path, encoding="utf-8") as fh:
+        fleet = json.load(fh)
+    entries = fleet.get("fleet") if isinstance(fleet, dict) else None
+    if not isinstance(entries, dict):
+        raise ValueError("fleet.json has no fleet table")
+
+    def _seat(code: str, entry: dict) -> dict:
+        return {"id": code, "node": str(entry.get("node") or ""),
+                "role": str(entry.get("role") or ""),
+                "status": str(entry.get("status") or "")}
+
+    codes = [code for code, entry in entries.items() if isinstance(entry, dict)]
+    try:
+        value = await asyncio.wait_for(
+            _dsh_api(SESSION_LIST_METHOD, {}), timeout=BRIEF_DSH_TIMEOUT_S)
+        items = value.get("items") if isinstance(value, dict) else None
+        by_sid = {str(it.get("sessionId")): it for it in (items or [])
+                  if isinstance(it, dict) and it.get("sessionId")}
+    except Exception as e:  # noqa: BLE001 — loopback 不可达 → 纯席位表降级
+        log.warning("fleet.brief session.list failed: %s", e)
+        return {"seats": [_seat(c, entries[c]) for c in codes],
+                "note": BRIEF_DSH_NOTE}
+
+    now_ms = time.time() * 1000
+    seats: list[dict] = []
+    for code in codes:
+        entry = entries[code]
+        sid = str(entry.get("sessionId") or "")
+        item = by_sid.get(sid) if sid else None
+        seat = _seat(code, entry)
+        if item is None:
+            seat.update(live=False, running=False, title="", task="", idle_s=None)
+        else:
+            projections = item.get("projections")
+            values = projections.get("values") if isinstance(projections, dict) else None
+            values = values if isinstance(values, dict) else {}
+            updated = item.get("updatedAt")
+            idle_s = (max(0.0, (now_ms - updated) / 1000)
+                      if isinstance(updated, (int, float)) else None)
+            seat.update(live=True, running=bool(item.get("running")),
+                        title=str(values.get("title") or ""),
+                        task=_brief_task_status(values.get("longTask")),
+                        idle_s=idle_s)
+        seats.append(seat)
+    return {"seats": seats}
+
+
 # ---- live 阶段（W4.1 e2e）：真 pipecat 头，惰性导入，单测不触达 ----
 
 
@@ -1734,7 +1845,8 @@ async def build_realtime_head(session: "WsSession", bus: EventBus, backend: Any)
         cancel_on_idle_timeout=False,
         observers=[observer],
         app_resources={"dsh_backend": backend, "voice_store": _get_store(),
-                       "workspace_root": _workspace_root()},
+                       "workspace_root": _workspace_root(),
+                       "fleet_brief": _fleet_brief_payload},
     )
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)

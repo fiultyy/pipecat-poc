@@ -27,6 +27,7 @@ from rt_head_tools import (  # noqa: E402
     dispatch_plan_tool,
     edit_file_tool,
     find_files_tool,
+    fleet_brief_tool,
     grep_files_tool,
     list_bodies_tool,
     query_status_tool,
@@ -382,15 +383,16 @@ def test_dsh_head_tools_registry():
         "read_body_tool", "list_bodies_tool", "cancel_run_tool",
         "remain_silent_tool", "find_files_tool", "grep_files_tool",
         "read_file_tool", "edit_file_tool", "write_file_tool",
+        "fleet_brief_tool",
     }
-    assert len(dsh_head_tools()) == 12
+    assert len(dsh_head_tools()) == 13
 
 
 def test_doctrine_covers_all_tools_and_two_phase_rule():
     for name in ("dispatch_intent", "dispatch_plan", "query_status",
                  "read_body", "list_bodies", "cancel_run", "remain_silent",
                  "find_files", "grep_files", "read_file", "edit_file",
-                 "write_file"):
+                 "write_file", "fleet_brief"):
         assert name in DSH_TOOLS_DOCTRINE
 
 
@@ -613,3 +615,59 @@ async def test_write_file_create_overwrite_cap(ws):
     await write_file_tool(params, "big.txt", "x" * 65537)  # 超上限拒绝
     assert params.results[-1]["status"] == "error" and "上限" in params.results[-1]["reason"]
     assert not (ws / "big.txt").exists()
+
+
+# ---- 席位简报（PR9）：gateway 经 app_resources 注入的 fleet_brief callable ----
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_tool_degrades_without_callable():
+    for resources in ({}, {"fleet_brief": None}, {"fleet_brief": "not-callable"}):
+        params = FakeParams(app_resources=resources)
+        await fleet_brief_tool(params)
+        assert params.results[0] == {"status": "error", "reason": "席位简报不可用"}
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_tool_passes_payload_through():
+    payload = {"seats": [{"id": "db05", "node": "node-1", "role": "worker",
+                          "status": "active", "live": True, "running": True,
+                          "title": "封装统一client", "task": "running",
+                          "idle_s": 12.0}]}
+
+    async def brief():
+        return payload
+
+    params = FakeParams(app_resources={"fleet_brief": brief})
+    await fleet_brief_tool(params)
+    assert params.results[0] == payload  # payload 原样回传，不包壳
+
+
+@pytest.mark.asyncio
+async def test_fleet_brief_tool_wraps_callable_exception():
+    async def boom():
+        raise RuntimeError("loopback down")
+
+    params = FakeParams(app_resources={"fleet_brief": boom})
+    await fleet_brief_tool(params)
+    assert params.results[0] == {"status": "error",
+                                 "reason": "席位简报失败：loopback down"}
+
+
+def test_doctrine_fleet_brief_clauses():
+    """席位简报两条款：Tools 面说何时调；After 面一句话口径、不逐条念长表。"""
+    tools = DSH_TOOLS_DOCTRINE.split("# Tools")[1].split("# After Tool Calls")[0]
+    tool_clause = next(ln for ln in tools.splitlines()
+                       if ln.startswith("- fleet_brief"))
+    assert "席位" in tool_clause and "在坐代理" in tool_clause
+    assert "一行状态" in tool_clause and "在干什么" in tool_clause
+    after_lines = DSH_TOOLS_DOCTRINE.split("# After Tool Calls")[1].splitlines()
+    clause = next(ln for ln in after_lines if ln.startswith("- fleet_brief"))
+    assert "一句话" in clause and "在跑" in clause
+    assert "不逐条念长表" in clause and "暂不可用" in clause
+    # 排在文件工具条款之后（与注册序一致）
+    file_idx = next(i for i, ln in enumerate(after_lines)
+                    if "find_files/grep_files" in ln)
+    brief_idx = next(i for i, ln in enumerate(after_lines)
+                     if ln.startswith("- fleet_brief"))
+    assert brief_idx == file_idx + 1

@@ -13,9 +13,9 @@ stdlib tkinter（Notebook 页签）+ sounddevice 原生采集 + numpy FFT + aioh
 - 观测连接（KG 11 §3 observe:true）：独立 WS，缺省订阅全部 topic——
   编排页（orch.* 任务树+时间线+bridge.msg 原始行面板）、回合页
   （head.turn）、席位页（fleet.snapshot 表+清理控制面：多选释放/结束
-  → fleet.cleanup，回包一行结果摘要）、任务页（body.push 台账：左表
-  右正文，body.get{ref} 拉全文，KG 14 §2.4；下半 tickets.snapshot 全文
-  面板）
+  → fleet.cleanup，回包一行结果摘要；「简报」拉 fleet.brief 席位一行
+  一状态小面板）、任务页（body.push 台账：左表右正文，body.get{ref}
+  拉全文，KG 14 §2.4；下半 tickets.snapshot 全文面板）
 - 语音页迷你通知行：body.push 到达一行（no/status/summary/chars 量级）；
   回合页 notify 相（📣）+ 同 ref body.push 追加灰行「└已入详情」
 - 语音页 head 选择行（PR8）：观测开启即 head.list 拉配置表渲染单选钮；
@@ -605,6 +605,56 @@ def cleanup_result_line(result: dict) -> str:
     return "；".join(parts)
 
 
+def fleet_brief_request(req_id: str) -> dict:
+    """席位状态简报控制帧（fleet.brief）：网关 join fleet.json 与
+    session.list 产出各席位一行状态，回包 fleet.brief.result。"""
+    return {"t": "fleet.brief", "req_id": req_id}
+
+
+def _brief_idle_label(idle_s) -> str:
+    """idle 秒数 → 相对时间短语：分钟/小时/天三档；空/非数返 ""。"""
+    try:
+        s = float(idle_s)
+    except (TypeError, ValueError):
+        return ""
+    s = max(0.0, s)
+    if s < 3600:
+        return f"{int(s // 60)}分钟前动过"
+    if s < 86400:
+        return f"{int(s // 3600)}小时前"
+    return f"{int(s // 86400)}天前"
+
+
+def fleet_brief_lines(result) -> list[str]:
+    """fleet.brief.result 回包 → 席位简报文本行（一行一席）。
+
+    行形「id · node · 在跑/没跑 · title · 闲置时长」：title 空省段；
+    live=false（session.list 已无此会话）无闲置段、行尾标注会话已死；
+    回包带 note（loopback 降级仅席位表）时首行前插 ⚠ 行；畸形回包
+    一行占位不抛。
+    """
+    if not isinstance(result, dict) or not isinstance(result.get("seats"), list):
+        return ["⚠ 简报回包不可读"]
+    lines: list[str] = []
+    if result.get("note"):
+        lines.append(f"⚠ {result['note']}")
+    for seat in result["seats"]:
+        if not isinstance(seat, dict):
+            continue
+        parts = [str(seat.get("id", "?")), str(seat.get("node", "") or ""),
+                 "在跑" if seat.get("running") else "没跑"]
+        if seat.get("title"):
+            parts.append(str(seat["title"]))
+        idle = _brief_idle_label(seat.get("idle_s"))
+        if idle:
+            parts.append(idle)
+        line = " · ".join(parts)
+        if not seat.get("live"):
+            line += " (会话已死)"
+        lines.append(line)
+    return lines
+
+
 def head_list_request(req_id: str) -> dict:
     """head 配置查询控制帧：回包 head.list.result（配置表+当前激活）。"""
     return {"t": "head.list", "req_id": req_id}
@@ -688,6 +738,7 @@ class App:
         self._detail_pending: str | None = None    # 在途 body.get 的 ref
         self._notify_refs: set[str] = set()        # 回合页已见 notify 相的 ref
         self._cleanup_seq = 0                      # fleet.cleanup req_id 序号
+        self._brief_seq = 0                        # fleet.brief req_id 序号
         self._head_seq = 0                         # head.switch req_id 序号
         self.stream: sd.InputStream | None = None
 
@@ -787,6 +838,7 @@ class App:
         self.turn_log.tag_configure("dim", foreground="#8a8a8a")  # 「└已入详情」灰行
 
         fleet_tab = ttk.Frame(self.nb, padding=6)
+        self.fleet_tab = fleet_tab
         self.nb.add(fleet_tab, text=" 席位 ")
         cols = ("code", "alias", "node", "role", "status")
         # 多选（extended）：清理动作按批处理所选席位
@@ -805,6 +857,14 @@ class App:
         self.fleet_end_btn = ttk.Button(
             fleet_bar, text="结束选中", command=lambda: self._fleet_cleanup("end"))
         self.fleet_end_btn.pack(side="left", padx=(8, 0))
+        # 简报按钮：只读拉席位状态（fleet.brief），无确认门
+        self.fleet_brief_btn = ttk.Button(
+            fleet_bar, text="简报", command=self._fleet_brief)
+        self.fleet_brief_btn.pack(side="left", padx=(8, 0))
+        # 席位简报面板：fleet.brief.result 逐行渲染（一行一席，追加式）
+        self.fleet_brief_log = scrolledtext.ScrolledText(
+            fleet_tab, font=("monospace 8"), state="disabled", wrap="none", height=6)
+        self.fleet_brief_log.pack(fill="x")
         self.fleet_note_var = tk.StringVar(value="")
         ttk.Label(fleet_tab, textvariable=self.fleet_note_var,
                   foreground="#555").pack(anchor="w", pady=(4, 0))
@@ -919,6 +979,8 @@ class App:
                 self._render_fleet(f)
             elif t == "fleet.cleanup.result":
                 self.fleet_note_var.set(cleanup_result_line(f))
+            elif t == "fleet.brief.result":
+                self._render_fleet_brief(f)
             elif t == "head.list.result":
                 self._render_heads(f)
             elif t == "head.switch.result":
@@ -949,7 +1011,7 @@ class App:
         for row in rows:
             self.fleet_tree.insert("", "end", values=row)
 
-    # ---- 席位清理控制面（fleet.cleanup，经观测连接出站） ----
+    # ---- 席位控制面（fleet.cleanup 清理 / fleet.brief 简报，经观测连接出站） ----
 
     def _fleet_cleanup(self, mode: str):
         """释放/结束所选席位：确认门 → observe send_request 发 fleet.cleanup。
@@ -985,6 +1047,30 @@ class App:
         req_id = f"clean-{int(time.time() * 1000)}-{self._cleanup_seq}"
         self.fleet_note_var.set(f"已发清理请求（{mode} · {len(ids)} 个席位）…")
         self.obs_link.send_request(cleanup_request(ids, mode, req_id))
+
+    def _fleet_brief(self):
+        """拉席位状态简报（fleet.brief）：只读动作无确认门，存活检查同
+        清理面；回包 fleet.brief.result 渲染摘要行 + 简报面板逐行。"""
+        if not (self.obs_link and self.obs_link._thread
+                and self.obs_link._thread.is_alive()):
+            self.fleet_note_var.set("观测连接未开——开启「观测」后可拉取席位简报")
+            return
+        self._brief_seq += 1
+        self.obs_link.send_request(
+            fleet_brief_request(f"brief-{int(time.time() * 1000)}-{self._brief_seq}"))
+        self.fleet_note_var.set("已请求席位简报…")
+
+    def _render_fleet_brief(self, frame: dict):
+        """fleet.brief.result → 摘要行（总量/在跑数）+ 简报面板逐行追加。"""
+        seats = frame.get("seats") if isinstance(frame, dict) else None
+        if isinstance(seats, list):
+            rows = [s for s in seats if isinstance(s, dict)]
+            running = sum(1 for s in rows if s.get("running"))
+            self.fleet_note_var.set(f"{len(rows)} 席位 · {running} 在跑")
+        else:
+            self.fleet_note_var.set("席位简报回包不可读")
+        for line in fleet_brief_lines(frame):
+            st_write(self.fleet_brief_log, line)
 
     # ---- head 配置面（head.list/head.switch，经观测连接出站）----
 
@@ -1088,7 +1174,8 @@ class App:
     def _selftest_probe(self):
         """selftest 冒烟（无显示环境 CI）：假帧走真实渲染路径——回放批入表、
         notify 相记 ref、单条 push 入表+灰行、body.item 回填缓存；席位快照
-        入表、bridge 行入编排页、tickets 覆写、清理回包摘要行。不触网。"""
+        入表、bridge 行入编排页、tickets 覆写、清理回包摘要行、简报摘要+
+        逐行。不触网。"""
         now = time.time()
         self.obs_q.put({"t": "body.push", "items": [
             {"ref": "vh-self1", "no": 1, "status": "done", "title": "回放标题",
@@ -1110,6 +1197,18 @@ class App:
         self.obs_q.put({"t": "fleet.cleanup.result", "req_id": "self-clean-1",
                         "results": [{"id": "20d0", "ok": True,
                                      "note": "active-liaison"}]})
+        self.obs_q.put({"t": "fleet.brief.result", "req_id": "self-brief-1",
+                        "seats": [
+                            {"id": "20d0", "node": "voice-head",
+                             "role": "orchestrator", "status": "active",
+                             "live": True, "running": True,
+                             "title": "selftest 标题", "task": "running",
+                             "idle_s": 65},
+                            {"id": "9b95", "node": "voice-head", "role": "liaison",
+                             "status": "released", "live": False,
+                             "running": False, "title": "", "task": "",
+                             "idle_s": None},
+                        ]})
 
     def end_session(self):
         """优雅收尾需要一帧 session.end——经由 tx 旁路不便，此处仅断链。
