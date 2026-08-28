@@ -976,3 +976,73 @@ def test_send_vad_tail_pacing_and_cancel_on_press():
             if getattr(app, "ptt_listener", None):
                 app.ptt_listener.stop()
         root.destroy()
+
+
+def test_render_heads_does_not_kill_tick():
+    """回归：head.list.result 渲染曾用 __init__ 局部名 ttk → NameError 在
+    _tick 内抛出，_tick 不再重排，频谱/电平/事件流全体死掉（观测一开就
+    触发）。渲染必须成功且 _tick 存活。"""
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+    except Exception as e:  # noqa: BLE001 — headless 环境
+        pytest.skip(f"no display for tkinter: {e}")
+    root.withdraw()
+    app = None
+    try:
+        app = App(root, "ws://127.0.0.1:8765/ws", "", False)
+        app.obs_q.put({"t": "head.list.result", "active": "nova", "file_backed": True,
+                       "profiles": [{"name": "nova", "label": "Nova·任务助手", "active": True},
+                                    {"name": "echo", "label": "Echo·副本", "active": False}]})
+        app._drain_obs()                          # 修复前：NameError: ttk
+        assert set(app.head_buttons) == {"nova", "echo"}
+        assert app.head_var.get() == "nova"
+        assert app.head_note_var.get() == "切换对下一次语音连接生效"
+        # _tick 泵继续活着：异常路径也不该断（模拟一帧坏数据后再跑一拍）
+        app.obs_q.put({"t": "head.list.result", "boom": object()})  # type: ignore[dict-item]
+        app._tick()                               # 不抛即存活
+        root.update()
+    finally:
+        if app is not None and getattr(app, "ptt_listener", None):
+            app.ptt_listener.stop()
+        root.destroy()
+
+
+def test_spectrum_draws_from_latest_block():
+    """频谱契约：_on_audio 置 latest → _tick 画 24 根柱；响亮信号出高柱、
+    静音回 2px 基线。经 Canvas 项内省判定，不依赖像素截屏。"""
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+    except Exception as e:  # noqa: BLE001 — headless 环境
+        pytest.skip(f"no display for tkinter: {e}")
+    root.withdraw()
+    import numpy as np
+
+    app = None
+    try:
+        app = App(root, "ws://127.0.0.1:8765/ws", "", False)
+        app.canvas.config(width=600, height=240)
+        root.update()
+
+        def bar_heights():
+            app._tick()
+            root.update()
+            return [round(app.canvas.coords(i)[3] - app.canvas.coords(i)[1])
+                    for i in app.canvas.find_all()]
+
+        t = np.arange(800) / 16000
+        app.latest = (np.sin(2 * np.pi * 440 * t) * 20000).astype(np.int16)
+        loud = bar_heights()
+        assert len(loud) == 24
+        assert max(loud) > 20, f"loud tone must raise bars, got {loud}"
+
+        app.latest = np.zeros(800, dtype=np.int16)
+        silent = bar_heights()
+        assert set(silent) == {2}, f"silence must fall to baseline, got {silent}"
+    finally:
+        if app is not None and getattr(app, "ptt_listener", None):
+            app.ptt_listener.stop()
+        root.destroy()

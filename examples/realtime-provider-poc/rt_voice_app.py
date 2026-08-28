@@ -1172,8 +1172,9 @@ class App:
             self.head_var.set(active)
             return
         for name, label in rows:
-            rb = ttk.Radiobutton(self.head_row, value=name, variable=self.head_var,
-                                 text=label, command=lambda n=name: self._head_switch(n))
+            rb = self.ttk.Radiobutton(self.head_row, value=name,
+                                      variable=self.head_var,
+                                      text=label, command=lambda n=name: self._head_switch(n))
             rb.pack(side="left", padx=(6, 0))
             self.head_buttons[name] = rb
         self.head_var.set(active)
@@ -1378,6 +1379,7 @@ class App:
                 self.tx.get_nowait()
             except queue.Empty:
                 break
+        self.latest = np.zeros(BLOCK, dtype=np.int16)   # 频谱回基线，不留末帧残影
 
     def _send_vad_tail(self):
         """松键后按 vad_tail_plan 步进补尾静音：服务端 VAD 判句尾需 >700ms
@@ -1419,24 +1421,30 @@ class App:
     # ---- UI 泵 ----
 
     def _tick(self):
-        spec = self._spectrum(self.latest)
-        self._draw_spectrum(spec)
-        rms = float(np.sqrt(np.mean((self.latest.astype(np.float32) / 32768) ** 2)))
-        db = 20 * math.log10(rms + 1e-9)
-        frac = max(0.0, min(1.0, (db - DB_FLOOR) / -DB_FLOOR))
-        self.level_var.set(f"电平 {'█' * int(frac * 18):<18} {db:5.1f} dBFS")
-        self.sent_bytes += 0
-        self.stat_var.set(
-            f"会话 {self.link.session_id or '-'} · 事件 {self.events} · "
-            f"在采 {'是' if self.stream else '否'}")
-        while True:
+        try:
+            spec = self._spectrum(self.latest)
+            self._draw_spectrum(spec)
+            rms = float(np.sqrt(np.mean((self.latest.astype(np.float32) / 32768) ** 2)))
+            db = 20 * math.log10(rms + 1e-9)
+            frac = max(0.0, min(1.0, (db - DB_FLOOR) / -DB_FLOOR))
+            self.level_var.set(f"电平 {'█' * int(frac * 18):<18} {db:5.1f} dBFS")
+            self.sent_bytes += 0
+            self.stat_var.set(
+                f"会话 {self.link.session_id or '-'} · 事件 {self.events} · "
+                f"在采 {'是' if self.stream else '否'}")
+            while True:
+                try:
+                    line = self.rx.get_nowait()
+                except queue.Empty:
+                    break
+                self.events += 1
+                self.log_write(line)
+            self._drain_obs()
+        except Exception as e:  # noqa: BLE001 — 单帧渲染失败只丢一帧，不杀 UI 泵
             try:
-                line = self.rx.get_nowait()
-            except queue.Empty:
-                break
-            self.events += 1
-            self.log_write(line)
-        self._drain_obs()
+                self.log_write(f"[UI] 渲染异常已跳过: {type(e).__name__}: {e}")
+            except Exception:
+                pass
         self.root.after(33, self._tick)
 
     @staticmethod
