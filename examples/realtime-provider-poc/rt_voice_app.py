@@ -59,6 +59,8 @@ BLOCK = RATE * BLOCK_MS // 1000          # 800 samples per callback
 BARS = 24
 DB_FLOOR = -60.0
 WB_SYNC_DEBOUNCE_MS = 600              # 白板改动 → 自动同步的防抖窗口
+VAD_TAIL_MS = 1500                     # 松键尾静音总长：服务端 VAD 判句尾阈值实测 >700ms
+VAD_TAIL_STEP_MS = 50                  # 步进投递：50ms/块=32KB/s，低于网关 64KB/s 限速
 
 LOG_SHORT = {
     "orch.dispatch": "派发", "orch.progress": "进展", "orch.done": "终稿",
@@ -707,6 +709,20 @@ def whiteboard_set_line(result) -> str:
     return f"⚠ 白板同步失败：{result.get('reason', '未知原因')}"
 
 
+def vad_tail_plan(total_ms: int = VAD_TAIL_MS,
+                  step_ms: int = VAD_TAIL_STEP_MS) -> list[tuple[int, int]]:
+    """尾静音投递表：``[(距松键毫秒, 块字节数), …]``。
+
+    服务端 VAD 按「收到的静音样本量」判句尾，但网关限制上行媒体
+    ≤64KB/s（1s 滑窗）——大帧倾倒会撞限速断链，故按真实码率（32KB/s）
+    步进投递。
+    """
+    if total_ms <= 0 or step_ms <= 0:
+        return []
+    return [(step_ms * (k + 1), 2 * RATE * step_ms // 1000)
+            for k in range(total_ms // step_ms)]
+
+
 class PushToTalk:
     """按住说话状态机：press/release → start/stop 动作。
 
@@ -816,6 +832,7 @@ class App:
         mid = ttk.Frame(voice_tab, padding=(8, 4))
         mid.pack(fill="x")
         self.ptt = PushToTalk()
+        self._tail_after: str | None = None   # 尾静音步进定时器（再按/关窗取消）
         self.lock_var = tk.BooleanVar(value=False)
         self.mic_var = tk.StringVar(value=f"🎤 按住说话（热键 {ptt_key.upper()}）")
         self.mic_btn = tk.Button(mid, textvariable=self.mic_var,
@@ -1291,6 +1308,7 @@ class App:
     # ---- 采集（按住说话默认；锁定=连续采集，静音语义：WS 保持） ----
 
     def _ptt_press(self):
+        self._cancel_vad_tail()       # 再按：新语音前不垫剩余尾静音
         if self.ptt.press() == "start":
             self._mic_start()
 
@@ -1362,15 +1380,34 @@ class App:
                 break
 
     def _send_vad_tail(self):
-        """松键后补 0.7s 静音：服务端 VAD 需尾随静音判定句尾并自动提交
-        （PTT 下采集骤停不给尾巴，VAD 永远等不到句尾——18:54 无回应根因）。"""
+        """松键后按 vad_tail_plan 步进补尾静音：服务端 VAD 判句尾需 >700ms
+        静音（实测 700ms 不判、1000ms 判），且一次性倾倒大帧会撞网关
+        64KB/s 限速断链——按真实码率投递两头都安全。"""
         if self.state_var.get() != "open":
             return
-        for _ in range(14):             # 14 × 50ms
+        self._cancel_vad_tail()
+        plan = iter(vad_tail_plan())
+
+        def _step():
+            item = next(plan, None)
+            if item is None:
+                self._tail_after = None
+                return
             try:
-                self.tx.put_nowait(b"\x00\x00" * 800)
+                self.tx.put_nowait(b"\x00" * item[1])
             except queue.Full:
-                break
+                pass
+            self._tail_after = self.root.after(VAD_TAIL_STEP_MS, _step)
+
+        self._tail_after = self.root.after(VAD_TAIL_STEP_MS, _step)
+
+    def _cancel_vad_tail(self):
+        if self._tail_after is not None:
+            try:
+                self.root.after_cancel(self._tail_after)
+            except Exception:  # noqa: BLE001 — 定时器已失效
+                pass
+            self._tail_after = None
 
     def _on_audio(self, data, frames, time_info, status):
         self.latest = data.copy()
@@ -1447,6 +1484,7 @@ class App:
         self.state_var.set(s)
 
     def on_close(self):
+        self._cancel_vad_tail()
         if self._wb_push_job is not None:
             try:
                 self.root.after_cancel(self._wb_push_job)

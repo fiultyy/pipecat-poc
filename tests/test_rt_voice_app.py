@@ -54,6 +54,7 @@ from rt_voice_app import (  # noqa: E402
     tickets_text,
     turn_label_with_notify,
     turn_line,
+    vad_tail_plan,
     whiteboard_set_line,
     whiteboard_set_request,
 )
@@ -917,4 +918,61 @@ def test_whiteboard_tab_assembly_smoke(monkeypatch):
     finally:
         if app is not None and getattr(app, "ptt_listener", None):
             app.ptt_listener.stop()
+        root.destroy()
+
+
+def test_vad_tail_plan_constraints():
+    """尾静音计划的两条硬约束：总长 ≥1000ms（服务端 VAD 句尾阈值实测
+    >700ms）；任意 1s 滑窗 ≤64KB（网关限速，步进 50ms=32KB/s）。"""
+    plan = vad_tail_plan()
+    assert [d for d, _ in plan] == [50 * (k + 1) for k in range(30)]
+    assert all(n == 1600 for _, n in plan)          # 50ms @16k s16le
+    total_ms = sum(n for _, n in plan) * 1000 // (2 * 16000)
+    assert total_ms >= 1000
+    # 1s 滑窗内最大字节数（步进投递的码率上界）
+    events = sorted((d, n) for d, n in plan)
+    worst = max(
+        sum(n for d, n in events if win <= d < win + 1000)
+        for win, _ in events
+    )
+    assert worst <= 65536
+    assert vad_tail_plan(0) == []
+    assert vad_tail_plan(700, 0) == []
+
+
+def test_send_vad_tail_pacing_and_cancel_on_press():
+    """松键 → 步进定时器投 50ms 静音块；再按下 → 取消剩余尾巴。"""
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+    except Exception as e:  # noqa: BLE001 — headless 环境
+        pytest.skip(f"no display for tkinter: {e}")
+    root.withdraw()
+    app = None
+    try:
+        app = App(root, "ws://127.0.0.1:8765/ws", "", False)
+        app.state_var.set("open")
+        app._send_vad_tail()
+        assert app._tail_after is not None
+        assert app.tx.qsize() == 0                    # 首块 50ms 后才投
+        for _ in range(15):                           # ~150ms → 2-3 步
+            root.update()
+            time.sleep(0.01)
+        n_paced = app.tx.qsize()
+        assert 1 <= n_paced <= 3
+        assert all(len(chunk) == 1600 for chunk in app.tx.queue)
+
+        app.ptt.held = True                           # 预持有：press 不开真实麦克风
+        app._ptt_press()
+        assert app._tail_after is None                # 尾巴已取消
+        for _ in range(10):                           # 100ms 内不再有新块
+            root.update()
+            time.sleep(0.01)
+        assert app.tx.qsize() == n_paced
+    finally:
+        if app is not None:
+            app._cancel_vad_tail()
+            if getattr(app, "ptt_listener", None):
+                app.ptt_listener.stop()
         root.destroy()
