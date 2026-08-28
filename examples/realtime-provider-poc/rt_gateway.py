@@ -54,7 +54,8 @@ Additional control frames (W3):
   ``unknown-ref``，重复取消幂等返回 ``state:"cancelled"``
 - PM 路由（GW-001，<internal-repo> spec-gateway §GW-001）— ``pm.req{id, op,
   params}`` 纯透传 pm-host-service（ADR-004 零业务：op 机械映射
-  ``GET /<op>?params``，ADR-002 只读 GET）→ ``pm.res{id, data|error}``；
+  ``GET /op/<op>?params``（``health`` 除外，见 ``_pm_op_path``），
+  ADR-002 只读 GET）→ ``pm.res{id, data|error}``；
   发现=``~/.dsh/maestro/pm.port`` 的 ``port`` 字段（签名缓存，服务重启换
   端口自动失效），传输失败以 ``GET /health`` 探活分级；超时/上游失败回
   ``pm.res{error}`` 结构化（不崩连接）；``(client, id)`` 去重窗=内存有界窗
@@ -2324,10 +2325,18 @@ class _PMUnreachable(Exception):
     """pm-host-service 传输级失败（拒绝/超时/读断）——与非 2xx 分型开。"""
 
 
+def _pm_op_path(op: str) -> str:
+    """op → 上游路径：业务读一律 ``op/<op>`` 前缀，``health`` 除外（根下）.
+
+    G3 热修（编排裁决 dae894c2）：真服 v0.7.0 业务端点全在 ``/op/`` 下，
+    仅 ``/health`` 在根——纯机械前缀规则，ADR-004 零业务。"""
+    return op if op == "health" else f"op/{op}"
+
+
 def _pm_http_get(port: int, op: str, query: str, timeout: float) -> tuple[int, bytes]:
     """同步 GET（线程池里跑）：返回 (status, body)；非 2xx 经 HTTPError 把
     错误体一并读出透传；传输级失败折进 :class:`_PMUnreachable`。"""
-    url = f"http://127.0.0.1:{port}/{op}" + (f"?{query}" if query else "")
+    url = f"http://127.0.0.1:{port}/{_pm_op_path(op)}" + (f"?{query}" if query else "")
     req = urllib.request.Request(url, headers={"accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:

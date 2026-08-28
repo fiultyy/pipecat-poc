@@ -49,12 +49,32 @@ class FakePMSSE:
         self.snapshot: list[dict] = []
         self.subscribers: list[asyncio.Queue] = []
         self.active = 0
+        self.tickets_payload: dict = {
+            "op": "tickets", "count": 2, "cache": "miss", "degraded": False,
+            "note": "", "signature": "fake-sig-1",
+            "tickets": [
+                {"ticket_id": "T-A", "title": "进行中票", "state": "running",
+                 "deps": "[\"T-B\"]", "lease_owner": "w-1",
+                 "refs": "{\"evidence\": \"docs/a.md\"}", "outcome": None,
+                 "updated_at": "2026-08-29T10:00:00+00:00"},
+                {"ticket_id": "T-B", "title": "已合并票", "state": "merged",
+                 "deps": "[]", "lease_owner": None, "refs": "{}",
+                 "outcome": "已收口", "updated_at": "2026-08-29T09:00:00+00:00"},
+            ],
+        }
 
     def app(self) -> web.Application:
         app = web.Application()
         app.router.add_get("/subscribe", self.handle)
         app.router.add_get("/health", self.handle_health)
+        # 票板全量（TK-002）：双路由——现行网关透传 GET /tickets，真服
+        # v0.7.0 实际在 /op/tickets（映射 Ask dae894c2 待收口），都备好
+        app.router.add_get("/tickets", self.handle_tickets)
+        app.router.add_get("/op/tickets", self.handle_tickets)
         return app
+
+    async def handle_tickets(self, _request: web.Request) -> web.Response:
+        return web.json_response(self.tickets_payload)
 
     def publish(self, kind: str, msgid: str, replay: bool = False) -> dict:
         ev = {"kind": kind, "msgid": msgid, "path": "/fake", "replay": replay}

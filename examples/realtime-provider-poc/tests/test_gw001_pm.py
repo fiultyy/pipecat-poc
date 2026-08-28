@@ -50,7 +50,7 @@ def _make_fake_pm(health_ok: bool = True):
 
     app = web.Application()
     app.router.add_get("/health", health)
-    app.router.add_get("/tickets", tickets)
+    app.router.add_get("/op/tickets", tickets)
     return app
 
 
@@ -266,7 +266,7 @@ class GW001PMTest(unittest.IsolatedAsyncioTestCase):
             return web.json_response({"q": dict(request.query)})
 
         app = web.Application()
-        app.router.add_get("/trace", echo)
+        app.router.add_get("/op/trace", echo)
         runner = await self._start_fake_pm(app)
         self.addAsyncCleanup(runner.cleanup)
         self._write_port_file(runner.addresses[0][1])

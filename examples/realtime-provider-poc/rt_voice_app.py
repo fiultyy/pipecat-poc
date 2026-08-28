@@ -32,6 +32,10 @@ stdlib tkinter（Notebook 页签）+ sounddevice 原生采集 + numpy FFT + aioh
   （op/params 原样交网关机械路由，ADR-004 客户端零业务）+ pm.res/
   pm.event 流水面板；断线重连指数退避 2s→30s；会话配置 JSON 只记
   网关地址（可丢）
+- 票板页签（TK-002）：kanban by state（五列+未知态兜底列），卡片含
+  deps 边/refs chips/lease_owner/outcome；数据面=pm.event(kind=tickets
+  失效通知，无载荷) 防抖合并 → op=tickets 全量重拉 → state 整体替换 →
+  渲染纯函数（state→view）覆写重绘 + ticket_events 侧栏
 
 两连接同 token 计入网关并发上限 ≤2（即本客户端独占单 token 配额）。
 帧协议与 rt_gateway.py §1 逐字对齐。
@@ -51,6 +55,7 @@ import queue
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -80,6 +85,8 @@ RECONNECT_MAX_S = 30.0                 # 退避封顶：2,4,8,16,30,30…
 PM_SUB_KINDS = ("fleet", "tickets")    # 就绪自动订阅的 PM 事件 kind（冒烟实证词汇）
 PM_RESUB_DELAY_S = 10.0                # 上游事件流断（pm_sub_failed/ended）后的重订间隔
 PM_BANNER_OFF = "PM 未接入（开启「观测」后自动订阅）"
+TICKET_STATES = ("dispatched", "running", "blocked", "done", "merged")
+TICKETS_REFETCH_DEBOUNCE_MS = 400      # tickets 事件→全量重拉的合并窗（事件只作失效通知）
 
 LOG_SHORT = {
     "orch.dispatch": "派发", "orch.progress": "进展", "orch.done": "终稿",
@@ -100,6 +107,7 @@ PENDING_KINDS = {
     "liaison.bind": "对接绑定",
     "run.cancel": "任务取消",
     "pm.req": "PM 请求",
+    "pm.tickets": "票板拉取",
 }
 
 
@@ -1034,6 +1042,108 @@ def save_session_config(url: str, path: Path | None = None) -> None:
         pass
 
 
+# ---- TK-002 票板（渲染纯函数：state → view；事件驱动重绘的幂等键） ----
+
+def tickets_normalize(raw) -> dict[str, dict]:
+    """op=tickets 全量列表 → ``{ticket_id: 规范票卡}``。
+
+    deps/refs 服务侧是 JSON 编码串（容错解包：坏串退化为分隔列表/空
+    dict）；无 ticket_id 或非 dict 条目跳过。字段缺省不抛——畸形票保
+    位渲染（零业务，只整形）。
+    """
+    out: dict[str, dict] = {}
+    if not isinstance(raw, list):
+        return out
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        tid = str(e.get("ticket_id") or "").strip()
+        if not tid:
+            continue
+        deps = e.get("deps")
+        if isinstance(deps, str):
+            try:
+                deps = json.loads(deps)
+            except ValueError:
+                deps = [d.strip() for d in deps.split(",") if d.strip()]
+        if not isinstance(deps, list):
+            deps = []
+        refs = e.get("refs")
+        if isinstance(refs, str):
+            try:
+                refs = json.loads(refs)
+            except ValueError:
+                refs = {}
+        if not isinstance(refs, dict):
+            refs = {}
+        out[tid] = {
+            "id": tid,
+            "title": str(e.get("title") or "").replace("\n", " "),
+            "state": str(e.get("state") or "").strip(),
+            "deps": [str(d) for d in deps],
+            "lease_owner": e.get("lease_owner") or None,
+            "refs": {str(k): str(v) for k, v in refs.items()},
+            "outcome": e.get("outcome") or None,
+            "updated_at": str(e.get("updated_at") or ""),
+        }
+    return out
+
+
+def tickets_column_of(t: dict) -> str:
+    """票卡 → kanban 列名：五态之外（含空）落「其他」兜底列。"""
+    state = t.get("state", "")
+    return state if state in TICKET_STATES else "其他"
+
+
+def ticket_time_label(v: str) -> str:
+    """ISO updated_at → 本地 ``MM-DD HH:MM``；解析失败原样截断 11 字。"""
+    try:
+        return datetime.fromisoformat(str(v)).astimezone().strftime("%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return str(v)[:11]
+
+
+def tickets_card_lines(t: dict) -> list[str]:
+    """单票 → 卡片行块：id·时刻 / 标题 / ⛓deps 边 / 🏷refs chips /
+    👤lease_owner / ✅outcome（空段省略）。"""
+    lines = [f"{t['id']} · {ticket_time_label(t['updated_at'])}"]
+    if t["title"]:
+        lines.append(f"  {t['title'][:48]}")
+    if t["deps"]:
+        lines.append(f"  ⛓ {'，'.join(t['deps'])}"[:80])
+    if t["refs"]:
+        chips = " ".join(sorted(t["refs"]))[:60]
+        lines.append(f"  🏷 {chips}")
+    if t["lease_owner"]:
+        lines.append(f"  👤 {t['lease_owner']}")
+    if t["outcome"]:
+        lines.append(f"  ✅ {str(t['outcome'])[:40]}")
+    return lines
+
+
+def tickets_kanban_view(state: dict[str, dict]) -> dict[str, list[str]]:
+    """票卡 state → kanban 视图（纯函数，视图=state 的确定映射）：五列
+    （加「其他」兜底列，仅非空时出现），列内 updated_at 降序、卡间空行。
+    全量重放同 state 必得同视图（验证门②的幂等键）。"""
+    by_col: dict[str, list[dict]] = {name: [] for name in TICKET_STATES}
+    for t in state.values():
+        by_col.setdefault(tickets_column_of(t), []).append(t)
+    view: dict[str, list[str]] = {}
+    for name, ts in by_col.items():
+        cards = [tickets_card_lines(t)
+                 for t in sorted(ts, key=lambda t: t["updated_at"],
+                                 reverse=True)]
+        block: list[str] = []
+        for i, card in enumerate(cards):
+            if i:
+                block.append("")
+            block.extend(card)
+        if name == "其他" and not block:
+            continue
+        view[name] = block
+    return view
+
+
 def vad_tail_plan(total_ms: int = VAD_TAIL_MS,
                   step_ms: int = VAD_TAIL_STEP_MS) -> list[tuple[int, int]]:
     """尾静音投递表：``[(距松键毫秒, 块字节数), …]``。
@@ -1107,6 +1217,11 @@ class App:
         self._cancel_seq = 0                       # run.cancel req_id 序号
         self._liaison_seq = 0                      # liaison.* req_id 序号
         self._pm_seq = 0                           # pm.req 控制台 id 序号（TK-001）
+        self._pm_tickets: dict[str, dict] = {}     # 票板 state（id→规范票卡，TK-002）
+        self._pm_tickets_sig = None                # 最近全量 signature（重放门参照）
+        self._ticket_events: list[str] = []        # tickets 事件侧栏行（最新在尾）
+        self._tickets_fetch_job: str | None = None  # 防抖全量重拉定时器
+        self._tickets_seq = 0                      # 票板拉取 id 序号
         self._pending: dict[str, dict] = {}        # req_id → {kind, ts, rid[, ref, seq]} 在途
         self._fleet_codes: set[str] | None = None  # 上次 fleet.snapshot 席位码（移出 diff 源）
         self._fleet_rows_cache: list[tuple] = []   # 上次快照表行（brief 回填 last_seen 后重绘源）
@@ -1363,6 +1478,37 @@ class App:
                                                 state="disabled", wrap="word")
         self.pm_log.pack(fill="both", expand=True)
 
+        # ---- 票板页签（TK-002：kanban by state——纯函数渲染、事件驱动重绘）----
+        board_tab = ttk.Frame(self.nb, padding=6)
+        self.nb.add(board_tab, text=" 票板 ")
+        self.tickets_note_var = tk.StringVar(value="（PM 订阅受理后自动拉全量）")
+        ttk.Label(board_tab, textvariable=self.tickets_note_var,
+                  foreground="#555").pack(anchor="w")
+        board_pane = ttk.Frame(board_tab)
+        board_pane.pack(fill="both", expand=True)
+        # 事件侧栏（右）：tickets 失效通知流水（无载荷，重拉由防抖合并）
+        side = ttk.Frame(board_pane)
+        side.pack(side="right", fill="y", padx=(6, 0))
+        ttk.Label(side, text="票事件（最近 30 条）",
+                  foreground="#8a8a8a").pack(anchor="w")
+        self.ticket_event_log = scrolledtext.ScrolledText(
+            side, font=("monospace 8"), state="disabled", wrap="none", width=34)
+        self.ticket_event_log.pack(fill="both", expand=True)
+        # kanban 列（左）：五态 + 「其他」兜底列（未知/空态不丢卡）
+        self.tickets_cols: dict[str, scrolledtext.ScrolledText] = {}
+        self.tickets_col_vars: dict[str, tk.StringVar] = {}
+        for name in (*TICKET_STATES, "其他"):
+            col = ttk.Frame(board_pane)
+            col.pack(side="left", fill="both", expand=True, padx=(0, 4))
+            var = tk.StringVar(value=f"{name} 0")
+            ttk.Label(col, textvariable=var, foreground="#555").pack(anchor="w")
+            txt = scrolledtext.ScrolledText(col, font=("monospace 8"),
+                                            state="disabled", wrap="none",
+                                            width=24)
+            txt.pack(fill="both", expand=True)
+            self.tickets_cols[name] = txt
+            self.tickets_col_vars[name] = var
+
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._draw_spectrum(np.zeros(BARS))
         self._tick()
@@ -1482,6 +1628,8 @@ class App:
                 self._on_pm_res(f)
             elif t == "pm.event":
                 st_write(self.pm_log, pm_event_line(f))
+                if f.get("kind") == "tickets":
+                    self._on_tickets_event(f)
             elif "_send_failed" in f:
                 # req 泵发送失败（连接已断）：受影响 req_id 回填提示，不静默丢
                 entry = self._pending_pop(f.get("_send_failed"))
@@ -1619,7 +1767,8 @@ class App:
                "whiteboard.set": self.whiteboard_note_var,
                "body.list_more": self.task_note_var,
                "run.cancel": self.task_note_var,
-               "pm.req": self.pm_note_var}.get(kind)
+               "pm.req": self.pm_note_var,
+               "pm.tickets": self.pm_note_var}.get(kind)
         if var is not None:
             var.set(line)
         if kind in ("fleet.cleanup", "fleet.brief", "liaison.unbind", "liaison.bind"):
@@ -2074,6 +2223,15 @@ class App:
                 self._pending_fill(entry, f"PM 请求失败：{code} {msg}".rstrip())
         else:
             data = frame.get("data")
+            if isinstance(data, dict) and isinstance(data.get("tickets"), list):
+                # op=tickets 全量回包：票板数据面（台面即显示，不再泼流水）
+                self._on_tickets_snapshot(data)
+                if entry is not None:
+                    self._pending_fill(entry, "票板全量已更新")
+                st_write(self.pm_log,
+                         f"✓ pm.res[{frame.get('id')}] "
+                         f"票板全量 {data.get('count', '?')} 票")
+                return
             if isinstance(data, dict) and "subscribed" in data \
                     and "was_subscribed" not in data:
                 self._pm_restore(data["subscribed"])    # pm.sub 受理
@@ -2089,16 +2247,71 @@ class App:
         st_write(self.pm_log, f"[降级] {code} {msg}".rstrip())
 
     def _pm_restore(self, subscribed):
-        """订阅受理 → 横幅恢复常态。"""
+        """订阅受理 → 横幅恢复常态；含 tickets kind 时播种一次票板全量
+        （首订播种/重订补拉共用，防抖定时器幂等）。"""
         self.pm_banner_var.set(pm_banner_ok_line(subscribed))
         self.pm_banner.config(bg="#1f6f43", fg="white")
+        if (self._tickets_fetch_job is None
+                and "tickets" in [str(k) for k in subscribed]):
+            self._tickets_fetch_job = self.root.after(
+                TICKETS_REFETCH_DEBOUNCE_MS, self._tickets_fetch)
+
+    # ---- 票板（TK-002：失效通知 → 防抖全量重拉 → 纯函数重绘） ----
+
+    def _on_tickets_event(self, frame: dict):
+        """tickets 事件（服务侧只发作失效通知，无载荷）→ 侧栏一行 +
+        防抖合并一次全量重拉（窗内连发只花一次 RTT）。"""
+        self._ticket_events.append(pm_event_line(frame))
+        if len(self._ticket_events) > 50:
+            self._ticket_events = self._ticket_events[-50:]
+        st_set(self.ticket_event_log, "\n".join(self._ticket_events[-30:]))
+        if self._tickets_fetch_job is None:
+            self._tickets_fetch_job = self.root.after(
+                TICKETS_REFETCH_DEBOUNCE_MS, self._tickets_fetch)
+
+    def _tickets_fetch(self):
+        """全量重拉 op=tickets（观测链路在才拉；离线期事件丢弃——后续
+        事件/重订自会再补）。"""
+        self._tickets_fetch_job = None
+        if not (self.obs_link and self.obs_link._thread
+                and self.obs_link._thread.is_alive()):
+            return
+        self._tickets_seq += 1
+        self._pending_send(
+            {"t": "pm.req", "op": "tickets", "params": {},
+             "id": f"pmt-{int(time.time() * 1000)}-{self._tickets_seq}"},
+            "pm.tickets")
+
+    def _on_tickets_snapshot(self, data: dict):
+        """全量回包 → state 整体替换 + signature 留档（重放一致门参照）
+        → 重绘 + 状态行。"""
+        self._pm_tickets = tickets_normalize(data.get("tickets"))
+        self._pm_tickets_sig = data.get("signature")
+        self._render_tickets()
+        degraded = "⚠ " if data.get("degraded") else ""
+        self.tickets_note_var.set(
+            f"{degraded}票板 {data.get('count', len(self._pm_tickets))} 票 · "
+            f"全量 {data.get('cache') or '拉取'} · "
+            f"{time.strftime('%H:%M:%S')}")
+
+    def _render_tickets(self):
+        """票板重绘：state → view 纯函数，逐列覆写 + 列头计数。"""
+        view = tickets_kanban_view(self._pm_tickets)
+        counts: dict[str, int] = {}
+        for t in self._pm_tickets.values():
+            col = tickets_column_of(t)
+            counts[col] = counts.get(col, 0) + 1
+        for name, widget in self.tickets_cols.items():
+            st_set(widget, "\n".join(view.get(name, [])))
+            self.tickets_col_vars[name].set(f"{name} {counts.get(name, 0)}")
 
     def _selftest_probe(self):
         """selftest 冒烟（无显示环境 CI）：假帧走真实渲染路径——回放批入表、
         notify 相记 ref、单条 push 入表+灰行、body.item 回填缓存；席位快照
         入表、bridge 行入编排页、tickets 覆写、清理回包摘要行、简报摘要+
         逐行；对接解绑/历史翻页 eof/取消回包各走一条；PM 订阅受理→横幅
-        恢复、事件流水两行、pm_down→降级横幅。不触网。"""
+        恢复、事件流水两行、pm_down→降级横幅；票板全量入 kanban（含
+        未知态兜底列）、tickets 事件进侧栏。不触网。"""
         now = time.time()
         self.obs_q.put({"t": "body.push", "items": [
             {"ref": "vh-self1", "no": 1, "status": "done", "title": "回放标题",
@@ -2150,6 +2363,25 @@ class App:
                         "path": "", "replay": False})
         self.obs_q.put({"t": "pm.res", "id": "self-pmq-1",
                         "error": {"code": "pm_down", "message": "health probe failed"}})
+        # 票板（TK-002）：全量入 kanban（含未知态兜底列）+ 事件进侧栏
+        self.obs_q.put({"t": "pm.res", "id": "self-pmt-1", "data": {
+            "op": "tickets", "count": 3, "cache": "hit", "degraded": False,
+            "signature": "self-sig-1",
+            "tickets": [
+                {"ticket_id": "T-A", "title": "进行中票", "state": "running",
+                 "deps": "[\"T-B\"]", "lease_owner": "w-self",
+                 "refs": "{\"evidence\": \"docs/a.md\"}", "outcome": None,
+                 "updated_at": "2026-08-29T10:00:00+00:00"},
+                {"ticket_id": "T-B", "title": "已合并票", "state": "merged",
+                 "deps": "[]", "lease_owner": None, "refs": "{}",
+                 "outcome": "已收口", "updated_at": "2026-08-29T09:00:00+00:00"},
+                {"ticket_id": "T-C", "title": "怪状态兜底票", "state": "weird",
+                 "deps": "[]", "lease_owner": None, "refs": "{}",
+                 "outcome": None, "updated_at": "2026-08-29T08:00:00+00:00"},
+            ]}})
+        self.obs_q.put({"t": "pm.event", "seq": 3, "msgid": "tickets:ledger.db:self",
+                        "source": "ledger", "kind": "tickets",
+                        "path": "maestro/ledger.db", "replay": False})
 
     def end_session(self):
         """优雅收尾需要一帧 session.end——经由 tx 旁路不便，此处仅断链。
@@ -2355,6 +2587,12 @@ class App:
 
     def on_close(self):
         save_session_config(self.url_var.get().strip())  # 会话配置（可丢，尽力写）
+        if self._tickets_fetch_job is not None:
+            try:
+                self.root.after_cancel(self._tickets_fetch_job)
+            except Exception:  # noqa: BLE001 — 定时器已失效
+                pass
+            self._tickets_fetch_job = None
         self._cancel_vad_tail()
         if self._wb_push_job is not None:
             try:
