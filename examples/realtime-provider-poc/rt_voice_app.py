@@ -2135,7 +2135,10 @@ class App:
                "body.list_more": self.task_note_var,
                "run.cancel": self.task_note_var,
                "pm.req": self.pm_note_var,
-               "pm.tickets": self.pm_note_var}.get(kind)
+               "pm.tickets": self.pm_note_var,
+               "pm.fleet": self.fleet_ship_note_var,
+               "pm.trace": self.trace_note_var,
+               "pm.trace.expand": self.trace_note_var}.get(kind)
         if var is not None:
             var.set(line)
         if kind in ("fleet.cleanup", "fleet.brief", "liaison.unbind", "liaison.bind"):
