@@ -9,8 +9,9 @@
 样本冻结在既有历史上——会话转录随后续写不进窗，膨胀免疫（门复验 B 修）。
 
   perf    锁窗拉全量（服务端 head.compact 折叠到 20k 字符级）→ 实测渲染
-          时长（TK004-RENDER）、20k 字符级文本整扫掠时长（TK004-SCROLL）、
-          实发载荷（TK004-PAYLOAD）。
+          时长（TK004-RENDER）、真实渲染文本（tag 着色轨迹时间线）整文
+          扫掠时长与字符数（TK004-SCROLL / TK004-SCROLLCHARS）、实发
+          载荷（TK004-PAYLOAD）。
   expand  锁窗拉到折叠 → _trace_expand()（被折叠头部续查）→ 展开区非空
           （TK004-EXPAND）。锁定窗整段被折叠（无保留区边界）时按上界
           逐次回退重锁（≤3 次）；应用层空态/失败行按 FAIL 判——不静默。
@@ -96,25 +97,23 @@ def main() -> int:
                 # 服务端实发载荷（head.compact 折叠后）= entries 序列化长度
                 payload = len(json.dumps(entries, ensure_ascii=False,
                                          default=str))
-                # 20k 字符级滚动实测：同规格（20k 字符）文本窗整文扫掠
-                scratch = tk.Text(root, font=("monospace 8"), width=100,
-                                  height=30)
-                filler = json.dumps(entries, ensure_ascii=False,
-                                    default=str)[:20000]
-                scratch.insert("1.0", filler)
+                # 滚动实测走真实渲染路径：主区即 tag 着色轨迹时间线
+                # （_render_trace 渲染产物），整文扫掠它——非代理合成窗
                 root.update_idletasks()
+                scroll_chars = len(app.trace_text.get("1.0", "end-1c"))
                 t0s = time.perf_counter()
                 for i in range(50):
-                    scratch.yview_moveto(i / 49.0)
-                    scratch.update_idletasks()
+                    app.trace_text.yview_moveto(i / 49.0)
+                    app.trace_text.update_idletasks()
                 scroll_ms = (time.perf_counter() - t0s) * 1000.0
-                scratch.destroy()
                 print(f"TK004-RENDER {state['render_ms']:.0f}", flush=True)
                 print(f"TK004-SCROLL {scroll_ms:.0f}", flush=True)
+                print(f"TK004-SCROLLCHARS {scroll_chars}", flush=True)
                 print(f"TK004-PAYLOAD {payload}", flush=True)
                 finish(True, f"mode=perf render_ms={state['render_ms']:.0f} "
-                             f"scroll_ms={scroll_ms:.0f} payload={payload} "
-                             f"lock={state['lock']}")
+                             f"scroll_ms={scroll_ms:.0f} "
+                             f"scroll_chars={scroll_chars} "
+                             f"payload={payload} lock={state['lock']}")
                 return
             if mode == "expand":
                 body = app.trace_text.get("1.0", "end-1c")

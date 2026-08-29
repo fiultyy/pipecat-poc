@@ -12,8 +12,8 @@
 
   ① 20k 字符级 session 滚动不卡顿（阈值实测记录）——真 App xvfb 拉真
     大样本全量轨迹（字符级 log，服务端 head.compact 折叠到 20k
-    字符预算），实测渲染 ≤2000ms、整文本滚动扫掠 ≤1000ms、渲染字符
-    数 ≤21k（20k 字符级实证）。
+    字符预算），实测渲染 ≤2000ms、真实渲染文本（tag 着色时间线）
+    整文扫掠 ≤1000ms、渲染字符数 ≤21k（20k 字符级实证）。
   ② 折叠摘要行可展开——主区出现折叠摘要行 → 展开按钮续查被折叠头部
     → 展开区非空 ≤20s（实测）。
   ③ 过滤器重放同视图——seq_range 取不可变历史窗（200 seq 窄窗）同参
@@ -145,21 +145,24 @@ async def run_driver(mode: str, gw_port: int, sid: str, lock: int
 
 
 async def gate1_perf(gw_port: int, sid: str, lock: int) -> None:
-    """门①：20k 字符级渲染+滚动 实测阈值（真 App 真滚动扫掠，锁窗样本）。"""
+    """门①：20k 字符级渲染+真实渲染路径滚动 实测阈值（真 App，锁窗样本）。"""
     ok_run, tail, lines = await run_driver("perf", gw_port, sid, lock)
     rend = [float(m.group(1)) for x in lines
             if (m := re.match(r"TK004-RENDER ([\d.]+)", x))]
     scrl = [float(m.group(1)) for x in lines
             if (m := re.match(r"TK004-SCROLL ([\d.]+)", x))]
+    schr = [int(m.group(1)) for x in lines
+            if (m := re.match(r"TK004-SCROLLCHARS (\d+)", x))]
     pays = [int(m.group(1)) for x in lines
             if (m := re.match(r"TK004-PAYLOAD (\d+)", x))]
     r = rend[0] if rend else -1.0
     s = scrl[0] if scrl else -1.0
+    c = schr[0] if schr else -1
     p = pays[0] if pays else -1
     gate("①a 折叠后渲染 ≤2000ms（实测）", 0 <= r <= 2000,
          f"实测 {r:.0f}ms 门限2000ms")
-    gate("①b 20k 字符级滚动扫掠 ≤1000ms（实测）", 0 <= s <= 1000,
-         f"实测 {s:.0f}ms 门限1000ms")
+    gate("①b 真实渲染文本滚动扫掠 ≤1000ms（实测）", 0 <= s <= 1000,
+         f"实测 {s:.0f}ms（真实渲染 {c} 字符）门限1000ms")
     gate("①c 实发投影为 20k 字符级（served entries ≤ 21000）",
          0 <= p <= 21000, f"实测 served payload {p} 字符（预算 20000）")
     gate("①d UI 腿全程存活", ok_run, tail[:120])
