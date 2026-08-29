@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -32,7 +33,6 @@ import aiohttp  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 import rt_gateway  # noqa: E402
-
 TOKEN = "t-gw002"
 
 
@@ -50,6 +50,7 @@ class FakePMSSE:
         self.subscribers: list[asyncio.Queue] = []
         self.active = 0
         self.consumers: list[str] = []
+        self.eof = asyncio.Event()  # 置位→活动流干净收尾（EOF；泵侧退场测试钩子）
 
     def app(self) -> web.Application:
         app = web.Application()
@@ -82,6 +83,8 @@ class FakePMSSE:
                 try:
                     ev = await asyncio.wait_for(q.get(), 0.2)
                 except asyncio.TimeoutError:
+                    if self.eof.is_set():
+                        break  # 本流干净收尾 → 订阅方读到 EOF
                     try:
                         await resp.write(b": keepalive\n\n")  # SSE 注释行保活
                         continue
@@ -323,6 +326,112 @@ class GW002PMSubTest(unittest.IsolatedAsyncioTestCase):
         await self._send(ws, {"t": "ping"})
         self.assertEqual([f for f in await self._drain(ws)
                           if f.get("id") == "v4"], [])
+
+
+class HF003DeadPumpSameKindsResubTest(unittest.IsolatedAsyncioTestCase):
+    """HF-003 门：泵死后同 kinds 重订重建泵，推送恢复（死→恢复 ×2）。
+
+    死泵态=订阅在册（``_pm_sub`` 同 kinds）但泵任务已终结（上游连接
+    失败退场）。修复前同 kinds 重订命中 already-subscribed no-op，泵
+    永不重建；修复后重订即重建，快照回放+增量推送恢复。
+    """
+
+    KINDS = ["ticket.changed"]
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.port_file = Path(self._tmp.name) / "pm.port"
+        self._old_env = os.environ.get("PM_HOST_PORT_FILE")
+        os.environ["PM_HOST_PORT_FILE"] = str(self.port_file)
+        # 先指死口（无监听）：首订泵起即败，落进死泵态
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        self.pm_port = sock.getsockname()[1]
+        sock.close()
+        self.port_file.write_text(json.dumps({"service": "fake-pm",
+                                              "port": self.pm_port}))
+        rt_gateway._reset_pm_port_cache()
+        self.fake = FakePMSSE()
+        self._runner: web.AppRunner | None = None
+
+    async def asyncTearDown(self) -> None:
+        if self._runner is not None:
+            await self._runner.cleanup()
+        if self._old_env is None:
+            os.environ.pop("PM_HOST_PORT_FILE", None)
+        else:
+            os.environ["PM_HOST_PORT_FILE"] = self._old_env
+        rt_gateway._reset_pm_port_cache()
+        self._tmp.cleanup()
+
+    async def _fake_up(self) -> None:
+        runner = web.AppRunner(self.fake.app(), handler_cancellation=True)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", self.pm_port)
+        await site.start()
+        self._runner = runner
+
+    async def _recv(self, ws, timeout: float = 5.0) -> dict:
+        msg = await asyncio.wait_for(ws.receive(), timeout)
+        return msg.json()
+
+    async def _sub(self, ws, sub_id: str) -> None:
+        await ws.send_str(json.dumps({"t": "pm.sub", "id": sub_id,
+                                      "kinds": self.KINDS}))
+
+    async def _wait_pump_done(self, sess, deadline: float = 3.0) -> None:
+        end = asyncio.get_event_loop().time() + deadline
+        while asyncio.get_event_loop().time() < end:
+            if sess._pm_sub is not None and sess._pm_sub["pump"].done():
+                return
+            await asyncio.sleep(0.05)
+        self.fail("pump task did not finish (dead-pump state not reached)")
+
+    async def _resub_and_expect_restore(self, gw, ws, sess, n: int,
+                                        expect_snapshot: list[str]) -> None:
+        await self._sub(ws, f"r{n}")
+        res = await self._recv(ws)
+        self.assertEqual(res["data"]["subscribed"], self.KINDS)
+        self.assertNotEqual(res["data"].get("note"), "already-subscribed")
+        for msgid in expect_snapshot:  # 快照回放先行
+            self.assertEqual((await self._recv(ws))["msgid"], msgid)
+        self.fake.publish("ticket.changed", f"live-{n}", {"round": n})
+        self.assertEqual((await self._recv(ws))["msgid"], f"live-{n}")
+
+    async def test_dead_pump_same_kinds_resub_restores_push(self) -> None:
+        gw = rt_gateway.VoiceGateway(port=0, token=TOKEN, head_provider=None,
+                                     topic_sources=None)
+        await gw.start()
+        self.addAsyncCleanup(gw.stop)
+        http = aiohttp.ClientSession()
+        ws = await http.ws_connect(f"ws://127.0.0.1:{gw.port}/ws")
+        await ws.send_str(json.dumps({"t": "auth", "token": TOKEN}))
+        await self._recv(ws)
+        self.addAsyncCleanup(ws.close)
+        self.addAsyncCleanup(http.close)
+        sess = next(iter(gw._active))
+
+        # 周期1 死法：上游死口——订阅受理 → 泵异步连败退场（在册+已终结）
+        await self._sub(ws, "d1")
+        self.assertEqual((await self._recv(ws))["data"]["subscribed"],
+                         self.KINDS)
+        self.assertEqual((await self._recv(ws))["code"], "pm_sub_failed")
+        await self._wait_pump_done(sess)
+
+        # 同 kinds 重订（上游已复活）：重建泵，快照+增量推送恢复
+        await self._fake_up()
+        self.fake.publish("ticket.changed", "snap-1", {"round": 1})
+        await self._resub_and_expect_restore(gw, ws, sess, 1, ["snap-1"])
+
+        # 周期2 死法：活流干净 EOF——泵退场（pm_sub_ended）
+        self.fake.eof.set()
+        self.assertEqual((await self._recv(ws))["code"], "pm_sub_ended")
+        await self._wait_pump_done(sess)
+        self.fake.eof.clear()
+
+        # 同 kinds 重订再次恢复：快照含周期1 全史（snap-1, live-1）
+        await self._resub_and_expect_restore(gw, ws, sess, 2,
+                                             ["snap-1", "live-1"])
 
 
 if __name__ == "__main__":

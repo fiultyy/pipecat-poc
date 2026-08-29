@@ -1018,8 +1018,10 @@ class WsSession:
     async def _on_pm_sub(self, data: dict) -> None:
         """pm.sub{id, kinds} → 订阅建立/替换 → pm.res（GW-002）.
 
-        幂等键=订阅 ``(client, kinds)``：同 kinds 重订是 no-op（泵不动，
-        只回 ok）；kinds 不同则 cancel 旧泵起新泵（替换语义）。帧 id 沿用
+        幂等键=订阅 ``(client, kinds)``：同 kinds 且泵在活时重订是 no-op
+        （泵不动，只回 ok）；kinds 不同则 cancel 旧泵起新泵（替换语义）；
+        同 kinds 但泵已死（上游失败/EOF 退场）时重订重建泵——恢复=重订，
+        无需先 unsub。帧 id 沿用
         GW-001 去重窗——同 id 重放只回一次 res。发现失败同步快失败（该 id
         的唯一一帧 pm.res 即 error）；泵内异步失败走 ``pm_sub_failed``/
         ``pm_sub_ended`` 错误帧（非致命，不占 id、不崩连接）。
@@ -1038,7 +1040,8 @@ class WsSession:
                                                "message": reason})
             return
         fresh = tuple(kinds)
-        if self._pm_sub is not None and self._pm_sub["kinds"] == fresh:
+        if (self._pm_sub is not None and self._pm_sub["kinds"] == fresh
+                and not self._pm_sub["pump"].done()):
             await self._pm_reply(pm_id, data={"subscribed": list(fresh),
                                               "note": "already-subscribed"})
             return
