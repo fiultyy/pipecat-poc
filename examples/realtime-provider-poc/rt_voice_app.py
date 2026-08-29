@@ -1502,12 +1502,11 @@ class App:
         self._pm_tickets_sig = None                # 最近全量 signature（重放门参照）
         self._ticket_events: list[str] = []        # tickets 事件侧栏行（最新在尾）
         self._tickets_fetch_job: str | None = None  # 防抖全量重拉定时器
-        self._tickets_seq = 0                      # 票板拉取 id 序号
         self._pm_fleet_cards: dict[str, dict] = {}  # 席位舰 state（码→卡，TK-003）
         self._fleet_ship_fetch_job: str | None = None  # 防抖全量重拉定时器
-        self._fleet_ship_seq = 0                   # 席位舰拉取 id 序号
+        self._fleet_ship_seq = 0                   # 席位舰拉取 id 序号（pmf- 前缀独立域）
         self._fleet_ship_snap_ts: float | None = None  # 舰页收帧时刻（断流陈旧判定）
-        self._trace_seq = 0                        # 轨迹拉取 id 序号
+        self._pmt_seq = 0                          # pmt- 拉取 id 序号（tickets/trace 共用——同前缀跨流唯一，防同毫秒同序号撞 id 被网关去重窗静默丢帧）
         self._trace_last: dict | None = None       # 最近 op=trace 快照（展开参照）
         self._pending: dict[str, dict] = {}        # req_id → {kind, ts, rid[, ref, seq]} 在途
         self._fleet_codes: set[str] | None = None  # 上次 fleet.snapshot 席位码（移出 diff 源）
@@ -2677,10 +2676,10 @@ class App:
         if not (self.obs_link and self.obs_link._thread
                 and self.obs_link._thread.is_alive()):
             return
-        self._tickets_seq += 1
+        self._pmt_seq += 1
         self._pending_send(
             {"t": "pm.req", "op": "tickets", "params": {},
-             "id": f"pmt-{int(time.time() * 1000)}-{self._tickets_seq}"},
+             "id": f"pmt-{int(time.time() * 1000)}-{self._pmt_seq}"},
             "pm.tickets")
 
     def _on_tickets_snapshot(self, data: dict):
@@ -2785,11 +2784,11 @@ class App:
         if not params.get("sessionId"):
             self.trace_note_var.set("（先填 sessionId）")
             return
-        self._trace_seq += 1
+        self._pmt_seq += 1
         kind = "pm.trace" if target == "main" else "pm.trace.expand"
         self._pending_send(
             {"t": "pm.req", "op": "trace", "params": params,
-             "id": f"pmt-{int(time.time() * 1000)}-{self._trace_seq}"}, kind)
+             "id": f"pmt-{int(time.time() * 1000)}-{self._pmt_seq}"}, kind)
 
     def _trace_jump(self):
         """seq 跳转：seqFrom=seqTo=输入 seq 的窄窗拉取（历史不可变窗）。"""
