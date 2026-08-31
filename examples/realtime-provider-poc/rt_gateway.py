@@ -121,6 +121,10 @@ SEND_QUEUE_LIMIT = 100             # 慢客户端：send queue >100 → 合并 p
 PROGRESS_KIND = "orch.progress"
 AUDIO_QUEUE_MAX = 16               # ~320ms；忙时丢最老块（实时性>完整性）
 MAX_SESSIONS_PER_TOKEN = 2
+# WS 协议帧集版本（WSP-001，spec-ws-protocol-v1.md §0 打版条款）：连接期
+# 协商字段，auth.ok 帧内自证版本。只增不改——客户端容忍缺失=pre-freeze
+# 行为；破坏性变更须 v2 并行期。
+PROTO_VERSION = "v1"
 
 # orch.* 事件全集（KG 04 §3；orch.failed 终点失败面见 KG 14 §2.2；显式订阅
 # 而非 wildcard——EventBus 的无 kinds 订阅会把同一 entry 双挂 "*" 造成双投递，
@@ -404,7 +408,8 @@ class WsSession:
         self._token = token
         self.authenticated = True
         self.session_id = "s-" + uuid.uuid4().hex[:8]
-        await self._reply({"t": "auth.ok", "session_id": self.session_id})
+        await self._reply({"t": "auth.ok", "session_id": self.session_id,
+                           "proto": PROTO_VERSION})
 
     async def _on_start(self, data: dict) -> None:
         if self.started:

@@ -95,6 +95,7 @@ class GW001PMTest(unittest.IsolatedAsyncioTestCase):
         await ws.send_str(json.dumps({"t": "auth", "token": TOKEN}))
         msg = await asyncio.wait_for(ws.receive(), 5)
         self.assertEqual(msg.json()["t"], "auth.ok")
+        self.assertEqual(msg.json().get("proto"), "v1")  # WSP-001: 帧内自证版本
         self.addAsyncCleanup(ws.close)
         self.addAsyncCleanup(http.close)
         return ws
