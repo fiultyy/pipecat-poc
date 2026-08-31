@@ -81,7 +81,7 @@ BLOCK = RATE * BLOCK_MS // 1000          # 800 samples per callback
 BARS = 24
 DB_FLOOR = -60.0
 WB_SYNC_DEBOUNCE_MS = 600              # 白板改动 → 自动同步的防抖窗口
-VAD_TAIL_MS = 1500                     # 松键尾静音总长：服务端 VAD 判句尾阈值实测 >700ms
+VAD_TAIL_MS = 2000                     # 松键尾静音总长：Android 真机标定 head endpointer 需 ≥~1.3s（TK-005 引 <internal-repo> a931c19/AND4-5：600ms 三次未闭句，2s 稳定 ~1.4s 闭句）
 VAD_TAIL_STEP_MS = 50                  # 步进投递：50ms/块=32KB/s，低于网关 64KB/s 限速
 PENDING_TIMEOUT_S = 5.0                # 控制请求在途上限：超时清登记并回填提示
 FLEET_STALE_S = 120                    # 席位快照陈旧阈值：距收帧超时标「可能陈旧」
@@ -139,7 +139,9 @@ class VoiceLink:
     """
 
     def __init__(self, url: str, token: str, tx: "queue.Queue[bytes]",
-                 rx: "queue.Queue[str]", on_state):
+                 rx: "queue.Queue[str]", on_state,
+                 held_fn: "Callable[[], bool] | None" = None,
+                 yield_fn: "Callable[[], None] | None" = None):
         import aiohttp
 
         self.url, self.token, self.tx, self.rx, self.on_state = url, token, tx, rx, on_state
@@ -151,6 +153,10 @@ class VoiceLink:
         self._play_thread: threading.Thread | None = None
         self._attempts = 0  # 连续失败次数（session.started 复位；退避指数源）
         self._mute = False  # 打断后丢弃下行音频，直到新应答开始（worker 线程内读写）
+        # TK-005 按住中让位：worker 借 held_fn 查持有态；yield_fn 把 UI 侧
+        # 动作（停麦/清尾）经 root.after 编组回主线程——worker 不直接触 UI
+        self._held_fn = held_fn or (lambda: False)
+        self._yield_fn = yield_fn or (lambda: None)
 
     # ---- lifecycle (called from tkinter thread) ----
 
@@ -213,8 +219,7 @@ class VoiceLink:
                                         break
                                     continue
                                 if msg.type == aiohttp.WSMsgType.BINARY:
-                                    if not self._mute:
-                                        self._play_q.put(bytes(msg.data))
+                                    self._on_downlink_binary(bytes(msg.data))
                                     continue
                                 if msg.type != aiohttp.WSMsgType.TEXT:
                                     continue
@@ -230,12 +235,7 @@ class VoiceLink:
                                     self._attempts = 0
                                     self.on_state("open")
                                 elif t == "head.turn":
-                                    ph = data.get("phase")
-                                    if ph in ("user_start", "interrupted"):
-                                        self._mute = True  # 残余旧音频也拦下
-                                        self._drop_playback()  # 打断：立刻闭嘴
-                                    elif ph == "assistant_start":
-                                        self._mute = False
+                                    self._on_head_turn(data.get("phase"))
                                     self.rx.put("[回合] "
                                                 + json.dumps(data, ensure_ascii=False)[:200])
                                 elif t == "body.push":
@@ -326,6 +326,37 @@ class VoiceLink:
                 out.close()
             except Exception:
                 pass
+
+    def _on_head_turn(self, ph: str | None) -> None:
+        """回合事件闸门（TK-005 对齐 Android autoYield a931c19）：
+
+        - user_start/interrupted：mute + 丢在播（打断语义，不变）
+        - assistant_start：开静音窗；若仍按住 → 让位（held 已 stale）
+        - user_end：仍按住 → 开静音窗 + 让位（头侧 VAD 已判句尾——继续
+          按住只会把回复憋在静音窗里，Android 真机实测的哑回复根因）
+        """
+        if ph in ("user_start", "interrupted"):
+            self._mute = True  # 残余旧音频也拦下
+            self._drop_playback()  # 打断：立刻闭嘴
+        elif ph == "assistant_start":
+            self._mute = False
+            if self._held_fn():
+                self._yield_fn()
+        elif ph == "user_end":
+            if self._held_fn():
+                self._mute = False
+                self._yield_fn()
+
+    def _on_downlink_binary(self, data: bytes) -> None:
+        """下行帧闸门（TK-005）：按住中收到（首帧）下行即让位——服务端已
+        在播新回复，held 已 stale；让位开静音窗后本帧照常放行（判点照
+        mute 丢帧路径）。未按住且在 mute 窗内 → 丢弃（打断残余语义不变）。
+        """
+        if self._held_fn():
+            self._mute = False
+            self._yield_fn()
+        if not self._mute:
+            self._play_q.put(data)
 
     def _drop_playback(self):
         """打断：先清待播队列，再放哨兵让播放线程断流。
@@ -1479,7 +1510,9 @@ class App:
         self.latest = np.zeros(BLOCK, dtype=np.int16)
         self.sent_bytes = 0
         self.events = 0
-        self.link = VoiceLink(url, token, self.tx, self.rx, self._set_state)
+        self.link = VoiceLink(url, token, self.tx, self.rx, self._set_state,
+                              held_fn=lambda: self.ptt.held,
+                              yield_fn=lambda: self.root.after(0, self._yield_held_mic))
         self.obs_q: "queue.Queue[dict]" = queue.Queue()
         self.obs_link: ObserveLink | None = None
         self.orch_frames: list[dict] = []      # orch.* 帧序（树渲染源）
@@ -2992,6 +3025,21 @@ class App:
         if self.ptt.release() == "stop":
             self._mic_stop()
             self._send_vad_tail()
+
+    def _yield_held_mic(self):
+        """按住中让位（TK-005，对齐 Android autoYield a931c19）：服务端已
+        翻回合（head.turn user_end / assistant_start / 首帧下行），held 已
+        stale——停麦（tx 顺带清空，不回流陈旧采样）、取消待发尾静音、
+        释放持有态。松键先行到达 → 这里 no-op（正常松键路径已停麦排尾，
+        不去取消它）；yield 后迟到的松键 → release() 无持有亦 no-op；
+        再按 → 全新采集轮。必须由 root.after 在主线程执行（worker 只经
+        yield_fn 编组，不直接触 UI）。"""
+        if not self.ptt.held:
+            return
+        self.ptt.held = False
+        self._cancel_vad_tail()
+        self._mic_stop()
+        self.log_write("[让位] 服务端已翻回合，自动让位")
 
     def _on_lock(self):
         if self.lock_var.get():
