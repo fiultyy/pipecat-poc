@@ -6,14 +6,17 @@
 # 凭据链与 rt_env 一致：本单元专属 token 文件 + ~/.dsh/zhipu.env（GLM 键
 # 为裸 KEY=VAL 语法可被 systemd 解析；文件内 export 前缀行被忽略）。
 # token 缺失时 main 退出码 2（即服务起不来是显性的）。
-Description=Voice orchestration WS gateway (rt_gateway, loopback only)
+# 绑定策略（ADR-012，2026-08-30 用户裁决）：去掉 --loopback-only，随
+# rt_gateway 默认 0.0.0.0 绑——内网 IP（当前 <LAN_IP>）可达，供
+# tk/Android 局域网测试；公网 IP 属预留位，后续按 ADR-012 落。
+Description=Voice orchestration WS gateway (rt_gateway, LAN test bind 0.0.0.0)
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=~/workspace-claw-02/pipecat-poc
 # worker 命令（grep src/... 等）以 repo 根为 cwd 解析相对路径
-ExecStart=~/workspace-claw-02/pipecat-poc/.venv/bin/python ~/workspace-claw-02/pipecat-poc/examples/realtime-provider-poc/rt_gateway.py --loopback-only
+ExecStart=~/workspace-claw-02/pipecat-poc/.venv/bin/python ~/workspace-claw-02/pipecat-poc/examples/realtime-provider-poc/rt_gateway.py
 EnvironmentFile=~/.config/voice-gateway/env
 EnvironmentFile=-~/.dsh/zhipu.env
 Restart=on-failure
