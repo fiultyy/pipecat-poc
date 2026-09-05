@@ -53,7 +53,9 @@ async def main():
         print("FAIL  新 API 缺失（_liaison_bound_clear/_archived_session_ids）—— 修复未落地")
         return 2
 
-    sessions_value = await backend._dsh_api("session.list", {})
+    # T0 A1/A4: 新链 Typert 斜杠命名空间 session.list → session/list
+    # (_dsh_api 的 URL 形如 /api/{method}, 斜杠 method 直接命中新路径)。
+    sessions_value = await backend._dsh_api("session/list", {})
     archived = await backend._archived_session_ids() or set()
     check("db05 在归档集(前置)", STALE_SID in archived, f"|archived|={len(archived)}")
 

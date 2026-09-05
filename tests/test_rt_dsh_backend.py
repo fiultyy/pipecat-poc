@@ -1050,3 +1050,310 @@ async def test_liaison_explicit_target_still_wakes_archived_session(
     assert prompts and prompts[0]["sessionId"] == explicit
     for t in b._pending.values():
         t.cancel()
+
+
+# ---- seatB-cut3-2: _dsh_api wire 形态自适配 (T0 A1/A4) --------------------
+
+def _http_404(method: str):
+    import urllib.error
+    return urllib.error.HTTPError(f"/api/{method}", 404, "Not Found",
+                                  None, None)
+
+
+@pytest.mark.asyncio
+async def test_wire_form_dot_host_passthrough(monkeypatch):
+    """OLD 点号宿主: 默认形态直通零翻转; 斜杠传入(fleet_e2e_backend:58
+    形态)归一为点号 — method 名出 wire 前恒为 canonical, 零 cookie。"""
+    import rt_dsh_backend as mod
+    monkeypatch.setattr(mod, "_wire_form", None)
+    calls = []
+
+    def call(self, method, payload, form, cookie):
+        calls.append((method, form, cookie))
+        assert "/" not in method, f"dot host must receive canonical: {method}"
+        assert form == "dot" and cookie is None
+        return {"echo": method}
+
+    monkeypatch.setattr(mod.DshBackend, "_dsh_api_call", call)
+    b = DshBackend(lane=make_lane({}), bus=EventBus())
+    assert await b._dsh_api("session/list", {}) == {"echo": "session.list"}
+    assert await b._dsh_api("workspace.list", {}) == {"echo": "workspace.list"}
+    assert calls == [("session.list", "dot", None),
+                     ("workspace.list", "dot", None)]
+    assert mod._wire_form is None  # 点号默认直通, 无需缓存翻转
+
+
+@pytest.mark.asyncio
+async def test_wire_form_slash_host_failover_and_cache(monkeypatch):
+    """NEW 斜杠宿主: 首调点号 404 → 翻转斜杠重发成功并缓存; 后续调用
+    (含 session.prompt)直接走斜杠、payload 语义原样透传(cookie 由出站层
+    包装, 适配层/调用面始终传业务原形)。"""
+    import rt_dsh_backend as mod
+    monkeypatch.setattr(mod, "_dsh_cookie", None)
+    monkeypatch.setenv("DSH_PORT", "3080")
+    minted = []
+    monkeypatch.setattr(mod, "_mint_dsh_cookie",
+                        lambda port: minted.append(port) or "dsh-auth-t=v1.t.t")
+    calls = []
+
+    def call(self, method, payload, form, cookie):
+        calls.append((method, payload))
+        if "." in method and "/" not in method:
+            raise _http_404(method)  # OLD 路由不存在
+        return {"ok-items": 1}
+
+    monkeypatch.setattr(mod.DshBackend, "_dsh_api_call", call)
+    b = DshBackend(lane=make_lane({}), bus=EventBus())
+    assert await b._dsh_api("session.list", {}) == {"ok-items": 1}
+    assert mod._wire_form == "slash"
+    prompt_payload = {"sessionId": "s1", "mode": "queue",
+                      "content": [{"type": "text", "text": "x"}]}
+    assert await b._dsh_api("session.prompt", prompt_payload) == {"ok-items": 1}
+    assert calls == [
+        ("session.list", {}),        # dot 404 (探测失败)
+        ("session/list", {}),        # slash 翻转成功
+        ("session/prompt", prompt_payload),  # 缓存生效: 直达斜杠, payload 零改动
+    ]
+    assert minted == ["3080"], "slash 出站前自铸 cookie 一次并缓存"
+
+
+@pytest.mark.asyncio
+async def test_wire_form_app_error_never_fails_over(monkeypatch):
+    """应用层 error (result.ok=false) 不触发翻转 — 请求已被处理,
+    session.prompt 类副作用调用不得凭业务拒绝重发 (零双投)。"""
+    import rt_dsh_backend as mod
+    monkeypatch.setattr(mod, "_wire_form", None)
+    calls = []
+
+    def call(self, method, payload, form, cookie):
+        calls.append(method)
+        raise RuntimeError(f"{method}: session/limit-invalid")
+
+    monkeypatch.setattr(mod.DshBackend, "_dsh_api_call", call)
+    b = DshBackend(lane=make_lane({}), bus=EventBus())
+    with pytest.raises(RuntimeError, match="limit-invalid"):
+        await b._dsh_api("session.prompt", {"sessionId": "s1"})
+    assert len(calls) == 1, "业务拒绝只发生一次, 不得翻转重发"
+    assert mod._wire_form is None
+
+
+@pytest.mark.asyncio
+async def test_wire_form_failover_app_error_caches_form(monkeypatch):
+    """翻转态路由已通但业务拒绝: 形态有效照样缓存 — 下次调用不再
+    白付一次 404 探测。"""
+    import rt_dsh_backend as mod
+    monkeypatch.setattr(mod, "_wire_form", None)
+    monkeypatch.setattr(mod, "_dsh_cookie", None)
+    monkeypatch.setattr(mod, "_mint_dsh_cookie", lambda port: "dsh-auth-t=v1.t.t")
+    calls = []
+
+    def call(self, method, payload, form, cookie):
+        calls.append(method)
+        if "." in method and "/" not in method:
+            raise _http_404(method)
+        raise RuntimeError(f"{method}: session/cursor-invalid")
+
+    monkeypatch.setattr(mod.DshBackend, "_dsh_api_call", call)
+    b = DshBackend(lane=make_lane({}), bus=EventBus())
+    with pytest.raises(RuntimeError, match="cursor-invalid"):
+        await b._dsh_api("session.list", {})
+    assert mod._wire_form == "slash", "路由已通即缓存形态"
+    with pytest.raises(RuntimeError, match="cursor-invalid"):
+        await b._dsh_api("session.list", {})
+    assert calls == ["session.list", "session/list", "session/list"], (
+        "缓存后不再付 404 探测成本")
+
+
+# ---- seatB-cut3-4: NEW wire 实测契约对齐 (探针节 2/3/4 + OQ-T5 a) --------
+
+import urllib.request as _urlreq
+
+
+class _FakeResp:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_slash_outbound_envelope_args_and_cookie(monkeypatch):
+    """出站层契约: slash 形态 wire = 斜杠 path + method 同形 + payload 包
+    {args:{request:...}} + cookie 头; dot 形态逐字节 OLD 语义 (零 args/零
+    cookie)。直接驱动真 _dsh_api_call, mock urlopen 断言三要素。"""
+    monkeypatch.setenv("DSH_PORT", "3080")
+    import rt_dsh_backend as mod
+    seen = []
+
+    def fake_urlopen(req, timeout=None):
+        seen.append((req.full_url, dict(req.headers), json.loads(req.data)))
+        return _FakeResp(json.dumps(
+            {"result": {"ok": True, "value": {"items": []}}}).encode())
+
+    monkeypatch.setattr(_urlreq, "urlopen", fake_urlopen)
+    cookie = "dsh-auth-test=v1.body.mac"
+    v = mod.DshBackend._dsh_api_call(
+        "session/prompt", {"sessionId": "s1", "mode": "queue"},
+        mod._WIRE_SLASH, cookie)
+    assert v == {"items": []}
+    url, headers, wire = seen[0]
+    assert url == "http://127.0.0.1:3080/api/session/prompt"
+    assert headers.get("Cookie") == cookie
+    assert wire["method"] == "session/prompt"
+    assert wire["payload"] == {"args": {"request":
+        {"sessionId": "s1", "mode": "queue"}}}
+    assert wire["type"] == "client-request" and wire["rpcId"]
+
+    # dot 形态: 逐字节 OLD 语义 — 裸 payload、无 cookie 头
+    v = mod.DshBackend._dsh_api_call(
+        "session.list", {"limit": 5}, mod._WIRE_DOT, None)
+    assert v == {"items": []}
+    url, headers, wire = seen[1]
+    assert url == "http://127.0.0.1:3080/api/session.list"
+    assert "Cookie" not in headers
+    assert wire["payload"] == {"limit": 5}
+
+
+def test_mint_dsh_cookie_contract(tmp_path, monkeypatch):
+    """cookie 自铸密码学闭环: $DSH_HOME/.credentials.yaml secret →
+    name=dsh-auth-<b64url(sha256(authority))>, value=v1.<b64url(json)>.
+    <b64url(hmac(secret, body))> — 独立重算逐段比对 (上游
+    browser-auth.ts encodeCookie 同款)。"""
+    import base64 as b64
+    import hashlib as hl
+    import hmac as hm
+    import rt_dsh_backend as mod
+    secret = bytes(range(32))
+    sec_b64 = b64.urlsafe_b64encode(secret).rstrip(b"=").decode()
+    cred = tmp_path / ".credentials.yaml"
+    cred.write_text(
+        "version: 1\n"
+        "records:\n"
+        "  client-connection/browser-session:\n"
+        "    kind: grant\n"
+        "    payload:\n"
+        "      version: 1\n"
+        f"      secret: {sec_b64}\n")
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    cookie = mod._mint_dsh_cookie("3080")
+    name, value = cookie.split("=", 1)
+    authority = "127.0.0.1:3080"
+    assert name == "dsh-auth-" + b64.urlsafe_b64encode(
+        hl.sha256(authority.encode()).digest()).rstrip(b"=").decode()
+    ver, body, mac = value.split(".")
+    assert ver == "v1"
+    payload = json.loads(b64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    assert payload["version"] == 1 and payload["authority"] == authority
+    assert payload["expiresAt"] > payload["issuedAt"]
+    expect_mac = b64.urlsafe_b64encode(
+        hm.new(secret, body.encode(), hl.sha256).digest()
+    ).rstrip(b"=").decode()
+    assert mac == expect_mac
+
+
+def test_mint_dsh_cookie_missing_credentials_loud(tmp_path, monkeypatch):
+    """铸不出 → 显式 RuntimeError (凭据缺失), 不静默 (cut3-4 ②)。"""
+    import rt_dsh_backend as mod
+    monkeypatch.setenv("DSH_HOME", str(tmp_path / "nope"))
+    with pytest.raises(RuntimeError, match="unreadable"):
+        mod._mint_dsh_cookie("3080")
+
+
+@pytest.mark.asyncio
+async def test_wire_401_retries_once_then_succeeds(monkeypatch):
+    monkeypatch.setenv("DSH_PORT", "3080")
+    import urllib.error
+    import rt_dsh_backend as mod
+    monkeypatch.setattr(mod, "_wire_form", mod._WIRE_SLASH)
+    monkeypatch.setattr(mod, "_dsh_cookie", "dsh-auth-stale=v1.s.s")
+    minted = []
+    monkeypatch.setattr(mod, "_mint_dsh_cookie",
+                        lambda port: minted.append(port) or "dsh-auth-new=v1.n.n")
+    calls = []
+
+    def call(self, method, payload, form, cookie):
+        calls.append(cookie)
+        if cookie == "dsh-auth-stale=v1.s.s":
+            raise urllib.error.HTTPError(
+                f"/api/{method}", 401, "unauthorized", None, None)
+        return {"fresh": 1}
+
+    monkeypatch.setattr(mod.DshBackend, "_dsh_api_call", call)
+    b = DshBackend(lane=make_lane({}), bus=EventBus())
+    assert await b._dsh_api("session.list", {}) == {"fresh": 1}
+    assert calls == ["dsh-auth-stale=v1.s.s", "dsh-auth-new=v1.n.n"]
+    assert minted == ["3080"] and mod._dsh_cookie == "dsh-auth-new=v1.n.n"
+
+
+@pytest.mark.asyncio
+async def test_wire_401_persists_loud_failure(monkeypatch):
+    """重铸后仍 401 → 响亮 RuntimeError (只允许一次自铸重试, cut3-4 ④)。"""
+    import urllib.error
+    import rt_dsh_backend as mod
+    monkeypatch.setattr(mod, "_wire_form", mod._WIRE_SLASH)
+    monkeypatch.setattr(mod, "_dsh_cookie", None)
+    monkeypatch.setattr(mod, "_mint_dsh_cookie", lambda port: "dsh-auth-x=v1.x.x")
+    calls = []
+
+    def call(self, method, payload, form, cookie):
+        calls.append(method)
+        raise urllib.error.HTTPError(
+            f"/api/{method}", 401, "unauthorized", None, None)
+
+    monkeypatch.setattr(mod.DshBackend, "_dsh_api_call", call)
+    b = DshBackend(lane=make_lane({}), bus=EventBus())
+    with pytest.raises(RuntimeError, match="401 persists"):
+        await b._dsh_api("session.list", {})
+    assert len(calls) == 2, "初发 + 重铸后重发, 恰一次重试"
+
+
+@pytest.mark.asyncio
+async def test_wire_401_dot_form_not_auth_retried(monkeypatch):
+    """dot 形态 401 (OLD 宿主无此态, 防御锚): 不走自铸重试, 原样直抛。"""
+    import urllib.error
+    import rt_dsh_backend as mod
+    monkeypatch.setattr(mod, "_wire_form", mod._WIRE_DOT)
+    monkeypatch.setattr(mod, "_dsh_cookie", None)
+    minted = []
+    monkeypatch.setattr(mod, "_mint_dsh_cookie",
+                        lambda port: minted.append(port) or "x")
+    calls = []
+
+    def call(self, method, payload, form, cookie):
+        calls.append(method)
+        raise urllib.error.HTTPError(
+            f"/api/{method}", 401, "unauthorized", None, None)
+
+    monkeypatch.setattr(mod.DshBackend, "_dsh_api_call", call)
+    b = DshBackend(lane=make_lane({}), bus=EventBus())
+    with pytest.raises(urllib.error.HTTPError):
+        await b._dsh_api("session.list", {})
+    assert len(calls) == 1 and not minted
+
+
+@pytest.mark.asyncio
+async def test_slash_workspace_list_alias(monkeypatch):
+    """workspace.list 替代路径 (cut3-4 ③, 探针节 6): slash 形态出 wire
+    为 session/list (空 request 自然由 args 包装产生); dot 形态保持
+    workspace.list 语义 (例 test_wire_form_dot_host_passthrough 已锚)。"""
+    import rt_dsh_backend as mod
+    monkeypatch.setattr(mod, "_wire_form", mod._WIRE_SLASH)
+    monkeypatch.setattr(mod, "_dsh_cookie", "dsh-auth-t=v1.t.t")
+    calls = []
+
+    def call(self, method, payload, form, cookie):
+        calls.append((method, form))
+        return {"items": []}
+
+    monkeypatch.setattr(mod.DshBackend, "_dsh_api_call", call)
+    b = DshBackend(lane=make_lane({}), bus=EventBus())
+    assert await b._dsh_api("workspace.list", {}) == {"items": []}
+    assert calls == [("session/list", "slash")], (
+        "NEW 无 workspace.list unary — slash 链归档核验降级为 session/list")

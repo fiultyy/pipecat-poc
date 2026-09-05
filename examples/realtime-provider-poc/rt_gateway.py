@@ -101,6 +101,7 @@ from urllib.parse import urlencode
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
+from rt_dsh_backend import dsh_api as _dsh_api  # seatB-cut3-3 镜像同化: 复用 backend 的 wire 形态自适配单点(防两处演化分叉); 原模块内小实现已删
 from rt_dsh_lane import DaisLane, DaisLaneError
 
 from rt_event_bus import EventBus
@@ -1904,24 +1905,12 @@ SESSION_END_METHOD = "workspace.archiveSession"
 _GONE_MARKERS = ("session-not-found", "no such session")
 
 
-async def _dsh_api(method: str, payload: dict) -> Any:
-    """POST 一条 RPC 到 dsh web loopback API（镜像 rt_dsh_backend._dsh_api
-    的小实现——网关不持有 backend 实例，observe 链路也要能发）。"""
-
-    def _call() -> Any:
-        wire = {"type": "client-request", "rpcId": str(uuid.uuid4()),
-                "method": method, "payload": payload}
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{os.environ.get('DSH_PORT', '3080')}/api/{method}",
-            data=json.dumps(wire).encode(),
-            headers={"content-type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read())["result"]
-        if not result.get("ok"):
-            raise RuntimeError(f"{method}: {result.get('error')}")
-        return result["value"]
-
-    return await asyncio.to_thread(_call)
+# seatB-cut3-3 镜像同化: 原 _dsh_api 小实现(镜像 rt_dsh_backend)已删,
+# 改 import 复用 rt_dsh_backend.dsh_api(见 :104 import)——wire 形态
+# 自适配(dot↔slash 懒探测+缓存, T0 A1/A4)单点收敛, 防两处演化分叉。
+# 注意: SESSION_END_METHOD = workspace.archiveSession 不在 A4 映射表,
+# 斜杠化形态 = workspace/archiveSession(T0 A1 同命名空间规则: 首点→斜杠,
+# 驼峰方法名保留, 同 agentPresets/deletePreset 形制)—待 T5 烟测复验。
 
 
 def _session_gone(e: BaseException) -> bool:

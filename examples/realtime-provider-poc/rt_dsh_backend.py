@@ -22,10 +22,14 @@ run; explicit ``cancel()`` does.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -45,6 +49,186 @@ ORCA_AGENT_DEFAULT = "omp"
 ORCA_WORKER_BUDGET_S = 300.0
 ORCA_WAIT_SLICE_MS = 15000
 ORCA_TURN_SETTLE_S = 20.0        # output window before the one interrupt+resend
+
+# ---- T0 A1/A4 + 探针裁决 wire 形态层 (seatB-cut3-2/3-3/3-4) ---------------
+# OLD 宿主: POST /api/<method> 点号 RPC。NEW 宿主 (席A 运行时探针已裁决,
+# T0 "运行时探针 (OQ3 裁决)" 节): 无点号兼容层, 斜杠三要素 —
+#   ① path /api/<ns>/<verb> (method 字段同步斜杠形);
+#   ② payload 包一层 {args:{request:<原payload>}};
+#   ③ browser-session cookie 鉴权 (401 裸 unauthorized, 机器客户端无豁免)。
+# 形态自适配 = 懒探测 + 进程级缓存: 默认点号先行, 路由层 404/405 (请求
+# 未被任何 handler 接受)时翻转形态重发一次, 路由已通即缓存; 宿主换代际
+# 重启后缓存形态同样失效翻转 → OLD/NEW 宿主任意顺序重启均通。应用层
+# error (请求已被处理) 不触发翻转 — session.prompt 重发有副作用, 只有
+# 确证"未处理"(404/405)才安全重试。401 (仅 slash 形态) = cookie 过期/
+# secret 轮转 → 自铸重试一次, 重铸后仍 401 即响亮失败 (cut3-4 ④)。
+_WIRE_DOT = "dot"
+_WIRE_SLASH = "slash"
+_wire_form: str | None = None  # None → 未探测, 点号先行
+_dsh_cookie: str | None = None  # 进程级自铸 cookie 缓存 (401 时弃旧重铸)
+# NEW workspace.list unary 不存在 (探针节 6: /api/workspace.list 与
+# /api/workspace/list 均 404) — slash 形态下归档核验降级为 session/list
+# 空 request (其 value 无 archivedSessionIds 字段 → 调用方递归 walk 得
+# 空集, 核验退化 alive-only); dot 链 workspace.list 语义逐字节保留。
+# 归档会话是否仍列于 session/list 待 T5 活体观察。
+_WIRE_SLASH_ALIASES = {"workspace.list": "session.list"}
+
+
+def _to_wire_method(method: str, form: str) -> str:
+    """canonical 归一 + 形态展开: 首个 '/'→'.' 归一 (scripts/
+    fleet_e2e_backend.py:58 已传斜杠形态), 再按 form 首 '.'→'/'
+    (A4 四映射逐一等价 — 本 helper 调用面仅 session.*/workspace.*
+    单点前缀方法, 不涉 A4 的 agentPresets/subagents 改名项)。"""
+    dot = method.replace("/", ".", 1)
+    if form == _WIRE_DOT:
+        return dot
+    dot = _WIRE_SLASH_ALIASES.get(dot, dot)
+    return dot.replace(".", "/", 1)
+
+
+def _b64url(raw: bytes) -> str:
+    """base64url 无 padding (上游 encodeBase64Url 同款)。"""
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _read_browser_session_secret() -> bytes:
+    """$DSH_HOME/.credentials.yaml → client-connection/browser-session
+    secret (32B)。固定 schema 最小解析 (零 PyYAML 依赖); 任何失败 →
+    RuntimeError 显式报错, 不静默 (cut3-4 ②: 铸不出要响)。凭据只读
+    不外传 — 本函数仅返回解码后的字节用于进程内 HMAC。"""
+    home = os.environ.get("DSH_HOME") or os.path.expanduser("~/.dsh")
+    path = os.path.join(home, ".credentials.yaml")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as e:
+        raise RuntimeError(
+            f"dsh cookie mint: credentials unreadable at {path}: {e}") from e
+    # schema (上游 browser-auth.ts STORED_SECRET_VERSION=1):
+    #   records:
+    #     client-connection/browser-session:
+    #       kind: grant
+    #       payload:
+    #         version: 1
+    #         secret: <base64url 32B>
+    secret = None
+    in_record = False
+    in_payload = False
+    for line in text.splitlines():
+        if line.startswith("  client-connection/browser-session:"):
+            in_record = True
+            in_payload = False
+            continue
+        if in_record and line.startswith("    payload:"):
+            in_payload = True
+            continue
+        if in_record and in_payload and line.lstrip().startswith("secret:"):
+            secret = line.split("secret:", 1)[1].strip().strip("'\"")
+            break
+        if in_record and line and not line.startswith("    ") \
+                and not line.startswith("  "):
+            in_record = False  # 越出 records 条目, 防误读兄弟记录
+    if not secret:
+        raise RuntimeError(
+            "dsh cookie mint: client-connection/browser-session secret "
+            f"not found in {path}")
+    try:
+        raw = base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))
+    except Exception as e:  # noqa: BLE001 — 显式归因
+        raise RuntimeError(f"dsh cookie mint: secret not base64url: {e}") from e
+    if len(raw) != 32:
+        raise RuntimeError(
+            f"dsh cookie mint: secret must decode to 32B, got {len(raw)}")
+    return raw
+
+
+def _mint_dsh_cookie(port: str) -> str:
+    """按 NEW client-connection/browser-auth.ts 实测契约自铸
+    browser-session cookie (探针节 4 / OQ-T5 方案 a):
+      name  = dsh-auth-<b64url(sha256(authority))>
+      value = v1.<b64url(json payload)>.<b64url(hmac_sha256(secret, body))>
+    authority = Host 头原样 = 127.0.0.1:<port>; HMAC 签的是 base64 后的
+    body 串; payload = {version:1, authority, issuedAt, expiresAt} (ms)。
+    TTL 30d 对齐上游 cookieMaxAgeDays 默认 (进程冷启重签, 实际寿命更短)。
+    铸不出 (凭据缺失/格式坏) → RuntimeError, 上层不静默。"""
+    authority = f"127.0.0.1:{port}"
+    secret = _read_browser_session_secret()
+    now_ms = time.time_ns() // 1_000_000
+    payload = {"version": 1, "authority": authority,
+               "issuedAt": now_ms, "expiresAt": now_ms + 30 * 24 * 3600 * 1000}
+    body = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    mac = _b64url(hmac.new(secret, body.encode("ascii"),
+                           hashlib.sha256).digest())
+    name = "dsh-auth-" + _b64url(hashlib.sha256(
+        authority.encode("ascii")).digest())
+    return f"{name}=v1.{body}.{mac}"
+
+
+async def _wire_dsh_api(method: str, payload: dict, call) -> dict:
+    """wire 形态适配层 (dot↔slash 懒探测+缓存) — DshBackend._dsh_api 与
+    模块级公共入口 dsh_api 共用 (seatB-cut3-2 引入, cut3-3 提为模块级
+    单点, cut3-4 对齐 NEW 实测三要素)。``call``:
+    (wire_method, payload, form, cookie) -> value 的同步出站函数。
+    翻转边界: 仅路由层 404/405 (请求未被任何 handler 接受) 翻转重发
+    一次; 应用层 error (请求已处理) 不翻转 — session.prompt 类副作用
+    调用零双投。401 仅 slash 形态: 自铸重试一次。"""
+    global _wire_form, _dsh_cookie
+    form = _wire_form or _WIRE_DOT
+
+    def _cookie_for(f: str) -> str | None:
+        global _dsh_cookie
+        if f != _WIRE_SLASH:
+            return None
+        if not _dsh_cookie:
+            _dsh_cookie = _mint_dsh_cookie(
+                os.environ.get("DSH_PORT", "3080"))
+        return _dsh_cookie
+
+    try:
+        return await asyncio.to_thread(
+            call, _to_wire_method(method, form), payload, form,
+            _cookie_for(form))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401 and form == _WIRE_SLASH:
+            # NEW 鉴权闸 (探针节 4): cookie 过期/secret 轮转的恢复通道。
+            # 弃旧重铸 → 重发一次; 重铸本身失败 (凭据缺失/坏) 由
+            # _mint_dsh_cookie 的 RuntimeError 显式穿透 (不静默)。
+            _dsh_cookie = _mint_dsh_cookie(
+                os.environ.get("DSH_PORT", "3080"))
+            try:
+                value = await asyncio.to_thread(
+                    call, _to_wire_method(method, form), payload, form,
+                    _dsh_cookie)
+            except urllib.error.HTTPError as exc2:
+                if exc2.code == 401:
+                    raise RuntimeError(
+                        "dsh auth: 401 persists after cookie re-mint "
+                        "($DSH_HOME/.credentials.yaml secret stale or "
+                        "authority mismatch)") from exc2
+                raise
+            return value
+        if exc.code not in (404, 405):
+            raise  # 5xx/403 等: 与 wire 形态无关, 原语义直抛
+        alt = _WIRE_SLASH if form == _WIRE_DOT else _WIRE_DOT
+        try:
+            value = await asyncio.to_thread(
+                call, _to_wire_method(method, alt), payload, alt,
+                _cookie_for(alt))
+        except urllib.error.HTTPError:
+            raise exc  # 两形态均路由未注册 → 抛原 404 (方法名问题, 非形态)
+        except Exception:
+            # 应用层 error (result.ok=false): 路由已接受请求 — 该形态
+            # 本身有效, 缓存后让业务错误穿透 (不吞不换)。
+            _wire_form = alt
+            raise
+        _wire_form = alt
+        return value
+
+
+async def dsh_api(method: str, payload: dict) -> dict:
+    """模块级公共入口: 无 backend 实件的调用方 (rt_gateway 镜像同化,
+    seatB-cut3-3) 复用同一 wire 形态自适配 — 单点防两处演化分叉。"""
+    return await _wire_dsh_api(method, payload, DshBackend._dsh_api_call)
 
 
 def _report_phase2_death(task: asyncio.Task) -> None:
@@ -224,22 +408,39 @@ class DshBackend:
     # ---- liaison-session delivery (all head tools → one agent's turn) ----
 
     async def _dsh_api(self, method: str, payload: dict) -> dict:
-        """POST one RPC to the dsh web host loopback API."""
+        """POST one RPC to the dsh web host loopback API.
 
-        def _call() -> dict:
-            wire = {"type": "client-request", "rpcId": str(uuid.uuid4()),
-                    "method": method, "payload": payload}
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{os.environ.get('DSH_PORT', '3080')}/api/{method}",
-                data=json.dumps(wire).encode(),
-                headers={"content-type": "application/json"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read())["result"]
-            if not result.get("ok"):
-                raise RuntimeError(f"{method}: {result.get('error')}")
-            return result["value"]
+        seatB-cut3-2 wire 形态自适配: 调用点零改动 (点号/斜杠传入均经
+        _to_wire_method 归一), 适配层与模块级公共入口 dsh_api 共用
+        (seatB-cut3-3 同化) — 设计依据与安全边界见 _WIRE_* 块注释。
+        payload 语义零改动 (mode:'queue' 等原样透传)。
+        """
+        return await _wire_dsh_api(method, payload, self._dsh_api_call)
 
-        return await asyncio.to_thread(_call)
+    @staticmethod
+    def _dsh_api_call(method: str, payload: dict, form: str,
+                      cookie: str | None) -> dict:
+        """单次 RPC 出站 (原 _dsh_api 内联 _call 的提取; staticmethod —
+        零实例态, 供模块级 dsh_api 公共入口共用)。form=_WIRE_SLASH 时按
+        NEW 实测契约 (探针节 2/3/4): payload 包一层 {args:{request:...}},
+        附 cookie 头 (适配层已铸); dot 形态逐字节保持 OLD 语义 (cut3-4 ①)。
+        payload 包装在出站层完成 — 适配层/调用点始终传业务原形。"""
+        if form == _WIRE_SLASH:
+            payload = {"args": {"request": payload}}
+        headers = {"content-type": "application/json"}
+        if form == _WIRE_SLASH:
+            headers["cookie"] = cookie or ""
+        wire = {"type": "client-request", "rpcId": str(uuid.uuid4()),
+                "method": method, "payload": payload}
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{os.environ.get('DSH_PORT', '3080')}/api/{method}",
+            data=json.dumps(wire).encode(),
+            headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())["result"]
+        if not result.get("ok"):
+            raise RuntimeError(f"{method}: {result.get('error')}")
+        return result["value"]
 
     def _liaison_sid(self) -> str:
         """Resolve the configured liaison target to a full sessionId."""
